@@ -71,6 +71,9 @@ def upload_via_cli(
                 "licenses": [{"name": "CC0-1.0"}],
                 "resources": []
             }
+        
+        # Garantir que o ID do dataset esteja correto (obrigatório para version)
+        metadata["id"] = dataset
 
         # Adicionar arquivo se não existe
         existing_files = {r["path"] for r in metadata.get("resources", [])}
@@ -84,6 +87,7 @@ def upload_via_cli(
             print(f"[INFO] {model_name} já está no metadata")
 
         # Salvar metadata atualizado
+        metadata["id"] = dataset  # Garantir ID correto
         with open(metadata_file, "w") as f:
             json.dump(metadata, f, indent=2)
 
