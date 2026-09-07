@@ -53,9 +53,15 @@ def download_model(
             print(f"[WARN] Tamanho inválido ({size_gb:.2f} GB), removendo e rebaixando")
             model_path.unlink()
 
-    # Obter token
+    # Obter token (Colab Secrets via userdata + fallback env)
     if token is None:
         token = os.environ.get("CIVITAI_TOKEN") or os.environ.get("CIVITAI_API_KEY")
+    if not token:
+        try:
+            from google.colab import userdata
+            token = userdata.get('CIVITAI_TOKEN')
+        except (ImportError, userdata.NotebookAccessError):
+            pass
     if not token:
         raise ValueError("CIVITAI_TOKEN não configurado nas variáveis de ambiente/Secrets")
 
