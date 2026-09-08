@@ -4,6 +4,7 @@ Detecção de GPU no Kaggle Notebook.
 Uso: python gpu_detect.py
 """
 
+import os
 import subprocess
 import sys
 
@@ -112,7 +113,6 @@ def recommend_batch_size(vram_gb: float) -> dict:
 
 
 def main():
-    import os
     import argparse
 
     parser = argparse.ArgumentParser(description="Detectar GPU no Kaggle Notebook")
