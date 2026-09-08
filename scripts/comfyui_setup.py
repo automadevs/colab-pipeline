@@ -62,13 +62,26 @@ def setup_comfyui(comfyui_dir=DEFAULT_COMFYUI_DIR, repo_url=DEFAULT_REPO_URL, cu
     else:
         output_dir = Path(output_dir)
     
-    output_dir.mkdir(parents=True, exist_ok=True)
     gpu_info = detect_gpu()
 
-    if (comfyui_dir / "main.py").exists():
+    # Verificar estado do diretório ComfyUI
+    is_git_repo = (comfyui_dir / ".git").exists()
+    has_main = (comfyui_dir / "main.py").exists()
+
+    if not comfyui_dir.exists():
+        # Caso 1: Diretório não existe → git clone
+        _run(["git", "clone", "--depth", "1", repo_url, str(comfyui_dir)], timeout=900)
+    elif is_git_repo:
+        # Caso 2: Diretório existe e é um repo Git válido → git pull --ff-only
         _run(["git", "pull", "--ff-only"], cwd=comfyui_dir, timeout=300, check=False)
     else:
-        _run(["git", "clone", "--depth", "1", repo_url, str(comfyui_dir)], timeout=900)
+        # Caso 3: Diretório existe mas NÃO é um checkout Git válido
+        raise RuntimeError(
+            f"Diretório {comfyui_dir} existe mas não é um checkout Git válido do ComfyUI "
+            f"(falta .git ou main.py). Remova ou renomeie este diretório antes de executar o setup."
+        )
+    # Criar output_dir APÓS o bootstrap do repositório para evitar conflitos
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     req = comfyui_dir / "requirements.txt"
     if req.exists():
