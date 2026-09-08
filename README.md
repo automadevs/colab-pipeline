@@ -15,7 +15,7 @@ Arquitetura definitiva para transferência e execução de modelos ComfyUI.
                                                          ▼
                                                 ┌─────────────────────┐
                                                 │   SELEÇÃO MANUAL    │
-                                                │  (ipywidgets 05/08) │
+                                                │  (input() 05/07/08) │
                                                 └─────────────────────┘
                                                          │
                                                          ▼
@@ -116,7 +116,7 @@ O `08_master_pipeline.ipynb`:
 2. Detecta e valida GPU NVIDIA e VRAM disponível.
 3. Testa conexão com o Google Drive para persistência/backup.
 4. Instala ComfyUI e custom nodes com output configurado no SSD local (`/kaggle/working/ComfyUI/output`).
-5. Abre interface interativa (`ipywidgets.SelectMultiple`) mostrando nome, categoria e tamanho formatado de cada modelo.
+5. Lista os modelos com nome, categoria/path e tamanho e aguarda uma seleção síncrona via `input()`.
 6. Baixa somente os modelos selecionados para o SSD local.
 7. Inicia ComfyUI em background gerando no SSD local e valida via health check (`:8188/system_stats`).
 8. Oferece push inicial condicional de outputs/logs se já existirem arquivos locais.

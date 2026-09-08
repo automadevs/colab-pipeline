@@ -22,6 +22,88 @@ MODEL_CATEGORIES = [
 ]
 
 
+def parse_model_selection(selection: str, candidate_paths: list[str]) -> list[str]:
+    """Converte ``1``, ``1,3-5`` ou ``all`` em paths exatos do Dataset."""
+    raw = str(selection or "").strip().lower()
+    if not raw:
+        raise ValueError("Entrada vazia. Informe números, ranges ou 'all'.")
+    if not candidate_paths:
+        raise ValueError("Nenhum candidato disponível para seleção.")
+    if raw == "all":
+        return list(candidate_paths)
+
+    indexes: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError("Sintaxe inválida: use números separados por vírgula.")
+        if "-" in token:
+            parts = token.split("-")
+            if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+                raise ValueError(f"Range inválido: {token}")
+            start, end = (int(part.strip()) for part in parts)
+            if start > end:
+                raise ValueError(f"Range invertido: {token}")
+            indexes.extend(range(start, end + 1))
+        elif token.isdigit():
+            indexes.append(int(token))
+        else:
+            raise ValueError(f"Índice inválido: {token}")
+
+    if len(indexes) != len(set(indexes)):
+        raise ValueError("Seleção contém índices duplicados.")
+    if any(index < 1 or index > len(candidate_paths) for index in indexes):
+        raise ValueError(f"Índice fora do intervalo: escolha entre 1 e {len(candidate_paths)}.")
+    return [candidate_paths[index - 1] for index in indexes]
+
+
+def select_dataset_files(
+    dataset: str = DEFAULT_DATASET,
+    preselected_categories: list[str] | None = None,
+    auto_select_single: bool = True,
+    input_fn=input,
+) -> list[str]:
+    """Lista modelos e aguarda seleção síncrona via stdin/input()."""
+    try:
+        details = get_dataset_files_details(dataset)
+    except Exception as exc:
+        print(f"[WARN] Falha ao obter detalhes dos arquivos: {exc}")
+        details = []
+
+    if details:
+        candidates = [
+            item for item in details
+            if not preselected_categories or item["category"] in preselected_categories
+        ] or details
+        entries = [(item["path"], item["name"], item["category"], item["size"]) for item in candidates]
+    else:
+        raw_files = get_dataset_files(dataset)
+        candidates = filter_dataset_files(raw_files, categories=preselected_categories) or raw_files
+        entries = [(path, Path(path).name, _category_for_path(path), "N/A") for path in candidates]
+
+    if not entries:
+        raise ValueError("Nenhum arquivo candidato encontrado no Dataset.")
+
+    print(f"\nModelos disponíveis em {dataset}:\n")
+    for index, (path, name, category, size) in enumerate(entries, 1):
+        print(f"[{index}] {name}")
+        print(f"    {path}")
+        print(f"    {category}/ | {size}")
+
+    candidate_paths = [entry[0] for entry in entries]
+    if len(candidate_paths) == 1 and auto_select_single:
+        print("\nApenas um arquivo disponível. Selecionando automaticamente.")
+        return candidate_paths
+
+    print("\nSelecione os arquivos pelo número.")
+    print("Exemplos: 1 | 1,3,5 | 1-4 | all")
+    while True:
+        try:
+            return parse_model_selection(input_fn("\n> Seleção: "), candidate_paths)
+        except ValueError as exc:
+            print(f"[WARN] {exc}")
+
+
 def calculate_sha256(filepath: Path) -> str:
     h = hashlib.sha256()
     with open(filepath, "rb") as f:

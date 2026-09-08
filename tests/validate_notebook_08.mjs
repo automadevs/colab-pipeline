@@ -14,10 +14,7 @@ const requiredMarkers = [
   "test_drive_connection",
   "CUSTOM_NODES = [",
   "setup_comfyui(",
-  "async def choose_dataset_files",
-  "selection_future = loop.create_future()",
-  "return await selection_future",
-  "SELECTED_FILES = await choose_dataset_files",
+  "SELECTED_FILES = select_dataset_files(",
   "sync_dataset_to_local(",
   "selected_files=SELECTED_FILES",
   "start_comfyui_runtime(",
@@ -42,12 +39,20 @@ if (source.includes('"ltdrdata/ComfyUI-Manager"')) {
   throw new Error("Notebook 08 must not install ComfyUI-Manager as a custom node");
 }
 
-if (/while\s+True|time\.sleep\([^)]*\)/.test(source)) {
-  throw new Error("Notebook selection must not use blocking sleep or infinite polling");
+if (/await\s+choose_dataset_files|selector\.value|asyncio\.Future|asyncio\.Event/.test(source)) {
+  throw new Error("Notebook 08 must not use widget/async selection");
 }
 
-if (!source.includes("get_dataset_files_details(dataset)") || !source.includes("sync_dataset_to_local(")) {
-  throw new Error("Notebook 08 must list and sync only explicitly selected dataset files");
+const syncSource = fs.readFileSync("scripts/kaggle_sync.py", "utf8");
+for (const marker of [
+  "def parse_model_selection(",
+  "def select_dataset_files(",
+  "input_fn=input",
+  "parse_model_selection(input_fn(\"\\n> Seleção: \"), candidate_paths)",
+]) {
+  if (!syncSource.includes(marker)) {
+    throw new Error(`kaggle_sync.py missing synchronous selection marker: ${marker}`);
+  }
 }
 
 if (
