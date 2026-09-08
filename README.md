@@ -60,7 +60,8 @@ colab_pipeline/
 │   ├── 01_inspecao.ipynb     # Verifica auth, dataset, staging
 │   ├── 02_download.ipynb     # Civitai → /content/kaggle_staging
 │   ├── 03_upload_kaggle.ipynb # Staging → Kaggle Dataset (CLI)
-│   └── 04_upload_kagglehub.ipynb # Fallback upload via kagglehub
+│   ├── 04_upload_kagglehub.ipynb # Fallback upload via kagglehub
+│   └── 05_dataset_manager.ipynb # Administração independente do Dataset
 │
 ├── kaggle_runtime/           # Notebooks para rodar no KAGGLE NOTEBOOK
 │   ├── 05_download_to_local.ipynb  # Seleção manual de modelos do Dataset → SSD
@@ -72,6 +73,7 @@ colab_pipeline/
 ├── scripts/                  # Scripts Python compartilhados
 │   ├── civitai_download.py   # Download robusto da Civitai
 │   ├── kaggle_upload.py      # Upload para Kaggle Dataset (CLI + kagglehub)
+│   ├── kaggle_dataset_manager.py # Estado completo, preview e publicação do Dataset
 │   ├── kaggle_sync.py        # Sync seletivo com exibição de tamanho formatado
 │   ├── kaggle_drive_sync.py  # Sincronização idempotente streaming SHA-256 com Drive
 │   ├── comfyui_setup.py      # Instalação ComfyUI e start com output local no SSD
@@ -104,6 +106,8 @@ colab_pipeline/
 
 ## Fluxo 2: Iniciar ComfyUI e Gerar (Kaggle Notebook)
 
+O runtime Kaggle é somente consumidor: `Kaggle Dataset → SSD → ComfyUI`. Ele não cria versões, remove arquivos ou administra o catálogo.
+
 **Executar no Kaggle Notebook (com GPU):**
 
 ```bash
@@ -120,6 +124,18 @@ O `08_master_pipeline.ipynb`:
 6. Baixa somente os modelos selecionados para o SSD local.
 7. Inicia ComfyUI em background gerando no SSD local e valida via health check (`:8188/system_stats`).
 8. Oferece push inicial condicional de outputs/logs se já existirem arquivos locais.
+
+## Fluxo independente: Administração do Dataset
+
+Para adicionar arquivos Civitai, remover, mover/renomear, revisar o estado completo e publicar uma nova versão de `automamermaid/comfydocs`, use no Colab:
+
+```text
+colab_transfer/05_dataset_manager.ipynb
+```
+
+Esse fluxo usa `Civitai → staging → Kaggle Dataset version`. Consulta o estado atual, preserva arquivos necessários via downloads seletivos, gera `dataset-manifest.json` e `dataset-metadata.json`, mostra `CURRENT STATE`, `DESIRED` e `CHANGES`, e só publica após confirmação explícita.
+
+O manager não é importado por `05_download_to_local.ipynb`, `07_sync_robust.ipynb` ou `08_master_pipeline.ipynb`. Esses notebooks continuam apenas consumindo paths selecionados do Dataset.
 
 ---
 
