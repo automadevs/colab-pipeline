@@ -13,32 +13,42 @@ Arquitetura definitiva para transferência e execução de modelos ComfyUI.
 └─────────────────┘     └──────────────────┘     └─────────────────────┘
                                                          │
                                                          ▼
+                                                ┌─────────────────────┐
+                                                │   SELEÇÃO MANUAL    │
+                                                │  (ipywidgets 05/08) │
+                                                └─────────────────────┘
+                                                         │
+                                                         ▼
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│   GOOGLE DRIVE  │◀───▶│  KAGGLE NOTEBOOK │◀───▶│   KAGGLE DATASET    │
-│  (Outputs/Logs) │     │   (Compute/GPU)  │     │  (Modelos Core)     │
-└─────────────────┘     └──────────────────┘     └─────────────────────┘
-                               │
-                               ▼
-                         ┌───────────────┐
-                         │   COMFYUI     │
-                         │  (SSD Local)  │
-                         └───────────────┘
+│   GOOGLE DRIVE  │◀───▶│  KAGGLE NOTEBOOK │◀───▶│    KAGGLE SSD       │
+│ (Persistência & │     │   (Compute/GPU)  │     │   (/kaggle/working/ │
+│  Backup Manual) │     └──────────────────┘     │   ComfyUI/models)   │
+└─────────────────┘               │              └─────────────────────┘
+                                  ▼
+                         ┌─────────────────┐
+                         │     COMFYUI     │
+                         │   (SSD Local)   │
+                         │  output:        │
+                         │  /kaggle/       │
+                         │  working/       │
+                         │  ComfyUI/output │
+                         └─────────────────┘
 ```
 
 **Separação de responsabilidades:**
 - **Civitai** → Origem dos modelos
 - **Google Colab** → Estação de transferência (Civitai → Kaggle Dataset)
 - **Kaggle Dataset** → Armazenamento persistente de modelos core (`automamermaid/comfydocs`) — checkpoints, LoRAs, VAEs, text_encoders, controlnet, etc.
-- **GitHub** → Código (ComfyUI, custom nodes, scripts deste repo)
-- **Google Drive** → Outputs (imagens geradas), logs, workflows salvos, metadata — arquivos leves, muitos, não vão pro GitHub
-- **Kaggle Notebook** → Compute/GPU, executa ComfyUI, sincroniza modelos do Dataset para SSD local, envia outputs para Drive
-
-**Separação de responsabilidades:**
-- **Civitai** → Origem dos modelos
-- **Google Colab** → Estação de transferência (Civitai → Kaggle Dataset)
-- **Kaggle Dataset** → Armazenamento persistente de modelos (`automamermaid/comfydocs`)
-- **GitHub** → Código (ComfyUI, custom nodes, scripts)
-- **Kaggle Notebook** → Compute/GPU, executa ComfyUI, sincroniza modelos do Dataset para SSD local
+- **GitHub** → Código e scripts (`automadevs/colab-pipeline`) — clonado e atualizado dinamicamente no runtime
+- **Kaggle Notebook (SSD Local)** → Runtime e geração:
+  - Modelos selecionados manualmente vão para `/kaggle/working/ComfyUI/models`
+  - Geração do ComfyUI ocorre **exclusivamente no SSD local**: `/kaggle/working/ComfyUI/output`
+- **Google Drive** → Camada de **persistência, backup e sincronização sob demanda**:
+  - `Automa/ComfyUI/outputs/`
+  - `Automa/ComfyUI/workflows/`
+  - `Automa/ComfyUI/logs/`
+  - `Automa/ComfyUI/metadata/`
+  - **O Google Drive NÃO fica no caminho crítico da geração e nunca é passado como `--output-directory` do ComfyUI.**
 
 ---
 
@@ -53,19 +63,19 @@ colab_pipeline/
 │   └── 04_upload_kagglehub.ipynb # Fallback upload via kagglehub
 │
 ├── kaggle_runtime/           # Notebooks para rodar no KAGGLE NOTEBOOK
-│   ├── 05_download_to_local.ipynb  # Dataset → /kaggle/working/ComfyUI/models/
+│   ├── 05_download_to_local.ipynb  # Seleção manual de modelos do Dataset → SSD
 │   ├── 06_comfyui_setup.ipynb      # GitHub → ComfyUI local + custom nodes
-│   ├── 07_sync_robust.ipynb        # Sync modelos Dataset → SSD (idempotente)
-│   ├── 08_master_pipeline.ipynb    # Orquestrador completo (inicialização total)
-│   └── 09_sync_outputs.ipynb       # Sync outputs/workflows ↔ Google Drive
+│   ├── 07_sync_robust.ipynb        # Sync seletivo Dataset → SSD (idempotente)
+│   ├── 08_master_pipeline.ipynb    # Orquestrador completo (clone, GPU, ComfyUI SSD local, seleção de modelos, health check)
+│   └── 09_sync_outputs.ipynb       # Painel de sincronização manual com Google Drive
 │
 ├── scripts/                  # Scripts Python compartilhados
 │   ├── civitai_download.py   # Download robusto da Civitai
 │   ├── kaggle_upload.py      # Upload para Kaggle Dataset (CLI + kagglehub)
-│   ├── kaggle_sync.py        # Sync Dataset → SSD local (idempotente, seletivo)
-│   ├── kaggle_drive_sync.py  # Sync outputs/workflows ↔ Google Drive
-│   ├── comfyui_setup.py      # Instala/atualiza ComfyUI + custom nodes
-│   └── gpu_detect.py         # Detecção de GPU
+│   ├── kaggle_sync.py        # Sync seletivo com exibição de tamanho formatado
+│   ├── kaggle_drive_sync.py  # Sincronização idempotente streaming SHA-256 com Drive
+│   ├── comfyui_setup.py      # Instalação ComfyUI e start com output local no SSD
+│   └── gpu_detect.py         # Detecção e validação de GPU NVIDIA
 │
 └── README.md                 # Esta documentação
 ```
@@ -92,23 +102,45 @@ colab_pipeline/
 
 ---
 
-## Fluxo 2: Iniciar ComfyUI (Kaggle Notebook)
+## Fluxo 2: Iniciar ComfyUI e Gerar (Kaggle Notebook)
 
 **Executar no Kaggle Notebook (com GPU):**
 
 ```bash
-# Opção A: Pipeline completo (recomendado na primeira vez)
+# Pipeline completo automatizado (recomendado):
 kaggle_runtime/08_master_pipeline.ipynb
-
-# Opção B: Passo a passo
-kaggle_runtime/05_download_to_local.ipynb  # Sync modelos
-kaggle_runtime/06_comfyui_setup.ipynb      # Instala ComfyUI + custom nodes
-# Depois inicie manualmente:
-cd /kaggle/working/ComfyUI && python main.py --listen 0.0.0.0 --port 8188
-
-# Opção C: Sync diário (operação cotidiana)
-kaggle_runtime/07_sync_robust.ipynb
 ```
+
+O `08_master_pipeline.ipynb`:
+1. Clona/atualiza `automadevs/colab-pipeline` diretamente do GitHub.
+2. Detecta e valida GPU NVIDIA e VRAM disponível.
+3. Testa conexão com o Google Drive para persistência/backup.
+4. Instala ComfyUI e custom nodes com output configurado no SSD local (`/kaggle/working/ComfyUI/output`).
+5. Abre interface interativa (`ipywidgets.SelectMultiple`) mostrando nome, categoria e tamanho formatado de cada modelo.
+6. Baixa somente os modelos selecionados para o SSD local.
+7. Inicia ComfyUI em background gerando no SSD local e valida via health check (`:8188/system_stats`).
+8. Oferece push inicial condicional de outputs/logs se já existirem arquivos locais.
+
+---
+
+## Fluxo 3: Sincronização Manual com Google Drive
+
+Para fazer backup ou restaurar arquivos entre o SSD local e o Google Drive, abra o painel manual:
+
+```bash
+kaggle_runtime/09_sync_outputs.ipynb
+```
+
+O notebook disponibiliza células independentes para:
+- **Testar Conexão** com o Drive
+- **Push Outputs**: `/kaggle/working/ComfyUI/output` → Drive `outputs/`
+- **Push Workflows**: Workflows `.json` locais → Drive `workflows/`
+- **Push Logs**: Logs locais (`comfyui.log`) → Drive `logs/`
+- **Push Metadata**: Metadados (se existirem) → Drive `metadata/`
+- **Pull Workflows**: Drive `workflows/` → local
+- **Pull Outputs** (opcional): Drive `outputs/` → local
+- **Pull Logs** (opcional): Drive `logs/` → local
+- **Pull Metadata** (opcional): Drive `metadata/` → local
 
 ---
 
@@ -118,42 +150,25 @@ Todos os notebooks usam scripts em `scripts/` para lógica reutilizável:
 
 ```bash
 # Download Civitai
-python scripts/civitai_download.py \
-  --model-name "lustifyNSFWCheckpoint_v10Krea2.safetensors" \
-  --staging-dir /content/kaggle_staging
+python scripts/civitai_download.py   --model-name "lustifyNSFWCheckpoint_v10Krea2.safetensors"   --staging-dir /content/kaggle_staging
 
 # Upload Kaggle Dataset
-python scripts/kaggle_upload.py \
-  --model-name "lustifyNSFWCheckpoint_v10Krea2.safetensors" \
-  --dataset "automamermaid/comfydocs" \
-  --method cli  # ou kagglehub
+python scripts/kaggle_upload.py   --model-name "lustifyNSFWCheckpoint_v10Krea2.safetensors"   --dataset "automamermaid/comfydocs"   --method cli  # ou kagglehub
 
-# Sync Kaggle → Local (Kaggle Notebook)
-python scripts/kaggle_sync.py \
-  --dataset "automamermaid/comfydocs" \
-  --target-dir /kaggle/working/ComfyUI/models \
-  --categories checkpoints loras vae
+# Sync seletivo Kaggle Dataset → SSD Local (apenas modelos desejados)
+python scripts/kaggle_sync.py   --dataset "automamermaid/comfydocs"   --target-dir /kaggle/working/ComfyUI/models   --categories checkpoints loras vae
 
-# Setup ComfyUI (Kaggle Notebook)
-python scripts/comfyui_setup.py \
-  --comfyui-dir /kaggle/working/ComfyUI \
-  --custom-nodes "ltdrdata/ComfyUI-Manager" "cubiq/ComfyUI_essentials" \
-  --start --health-check
+# Setup ComfyUI (SSD Local)
+python scripts/comfyui_setup.py   --comfyui-dir /kaggle/working/ComfyUI   --output-dir /kaggle/working/ComfyUI/output   --custom-nodes "ltdrdata/ComfyUI-Manager" "cubiq/ComfyUI_essentials"   --start --health-check
 
 # Detectar GPU
 python scripts/gpu_detect.py --recommend
 
-# Sync Outputs ↔ Google Drive (Kaggle Notebook)
-python scripts/kaggle_drive_sync.py \
-  --action push \
-  --drive-base "Automa/ComfyUI" \
-  --env kaggle
+# Sync com Google Drive (idempotente via streaming SHA-256)
+python scripts/kaggle_drive_sync.py   --action push   --categories outputs workflows logs   --drive-base "Automa/ComfyUI"   --env kaggle
 
 # Pull workflows do Drive
-python scripts/kaggle_drive_sync.py \
-  --action pull \
-  --drive-base "Automa/ComfyUI" \
-  --env kaggle
+python scripts/kaggle_drive_sync.py   --action pull   --categories workflows   --drive-base "Automa/ComfyUI"   --env kaggle
 ```
 
 ---
@@ -172,56 +187,35 @@ python scripts/kaggle_drive_sync.py \
 ### Kaggle Notebook (Runtime)
 
 1. Crie novo Notebook no Kaggle
-2. Ative **GPU** (Settings → Accelerator → GPU)
+2. Ative **GPU** (Settings → Accelerator → GPU T4 x2 ou P100)
 3. Configure **Secrets** (ícone de chave):
-   - `KAGGLE_USERNAME` + `KAGGLE_KEY` (mesmo do Colab)
-   - `GDRIVE_SERVICE_ACCOUNT_JSON`: Service Account JSON com acesso ao Google Drive (para sync de outputs)
-4. Faça upload dos arquivos:
-   - Arraste pasta `scripts/` para `/kaggle/working/scripts/`
-   - Arraste notebooks de `kaggle_runtime/` para o notebook
-5. Execute `08_master_pipeline.ipynb`
+   - `KAGGLE_USERNAME` + `KAGGLE_KEY` (para listar e baixar modelos do dataset)
+   - `GDRIVE_SERVICE_ACCOUNT_JSON`: Service Account JSON com acesso ao Google Drive (para sync e backup)
+4. Execute `08_master_pipeline.ipynb` (o repositório será clonado automaticamente)
 
-### Google Drive (Outputs & Logs)
+### Google Drive (Persistência & Backup)
 
 **Estrutura no Drive:**
 ```
 /Meu Drive/Automa/ComfyUI/
-├── outputs/          # Imagens geradas (organizadas por data/sessão)
+├── outputs/          # Imagens e vídeos gerados (sincronizados sob demanda)
 ├── workflows/        # Workflows salvos (.json)
-├── logs/             # Logs do ComfyUI
-└── metadata/         # CSVs/JSONs com metadados de geração
+├── logs/             # Logs de execução do ComfyUI
+└── metadata/         # Metadados e registros estruturados
 ```
 
 **Configuração do Service Account (Kaggle):**
 1. No Google Cloud Console: crie Service Account → Role: Editor → Create Key (JSON)
-2. Compartilhe a pasta `Automa/ComfyUI` no Drive com o email do Service Account (Editor)
+2. Compartilhe a pasta `Automa/ComfyUI` no Google Drive com o email do Service Account (Editor)
 3. No Kaggle: Secrets → `GDRIVE_SERVICE_ACCOUNT_JSON` = conteúdo do JSON
 
 **No Colab:** Usa `google.colab.drive.mount()` nativo (sem service account).
-
-**Sync manual:** Execute `kaggle_runtime/09_sync_outputs.ipynb` para push/pull.
-
----
-
-## Modelo Atual
-
-| Campo | Valor |
-|-------|-------|
-| **Dataset** | `automamermaid/comfydocs` |
-| **Modelo** | `lustifyNSFWCheckpoint_v10Krea2.safetensors` |
-| **Civitai Version ID** | `3112728` |
-| **Civitai File ID** | `2997637` |
-| **Formato** | FP8 |
-| **Tamanho** | ~11.94 GB |
-| **Download URL** | `https://civitai.com/api/download/models/3112728?fileId=2997637` |
-
-**Nome ANTIGO (não usar):** `lustify-v10-krea-turbo-fp8.safetensors`
 
 ---
 
 ## Categorias de Modelos Suportadas
 
-O Dataset `automamermaid/comfydocs` deve armazenar:
+O Dataset `automamermaid/comfydocs` armazena os modelos por categoria:
 
 ```
 checkpoints/           # Checkpoints principais (.safetensors, .ckpt)
@@ -238,56 +232,20 @@ embeddings/            # Textual inversions / embeddings
 
 ---
 
-## Comandos Rápidos
-
-### Sync Diário (Kaggle Notebook)
-```bash
-# No terminal do Kaggle Notebook ou via notebook 07_sync_robust.ipynb
-python /kaggle/working/scripts/kaggle_sync.py \
-  --dataset automamermaid/comfydocs \
-  --target-dir /kaggle/working/ComfyUI/models \
-  --categories checkpoints loras vae controlnet
-```
-
-### Adicionar Novo Modelo (Colab)
-```bash
-# 1. Baixar para staging
-python scripts/civitai_download.py \
-  --model-name "novo_modelo.safetensors" \
-  --model-version-id "XXXXXX" \
-  --file-id "YYYYYY" \
-  --staging-dir /content/kaggle_staging
-
-# 2. Upload para Dataset
-python scripts/kaggle_upload.py \
-  --model-name "novo_modelo.safetensors" \
-  --dataset "automamermaid/comfydocs" \
-  --version-notes "Add novo_modelo"
-```
-
-### Iniciar ComfyUI Manualmente
-```bash
-cd /kaggle/working/ComfyUI
-python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header
-```
-
----
-
 ## Troubleshooting
 
 | Problema | Causa | Solução |
-|----------|-------|---------|
+|---|---|---|
 | Kaggle 403 no upload | Sem permissão de edição | Verifique se é owner/colaborador do dataset `automamermaid/comfydocs` |
 | Download 0 bytes | Token Civitai inválido | Verifique `CIVITAI_TOKEN` nos Secrets |
 | Modelo não encontrado no dataset | Upload anterior falhou | Re-execute upload (03 ou 04) |
 | Tamanho divergente | Download parcial | Delete staging e rebaixe |
-| kagglehub sem dataset_upload | Versão antiga | `pip install -U kagglehub` |
 | ComfyUI não inicia | Dependências faltando | Execute `06_comfyui_setup.ipynb` novamente |
 | VRAM insuficiente | Modelo muito grande | Use `--lowvram` ou `--cpu` no ComfyUI |
 | Drive não monta (Kaggle) | Service Account inválido | Verifique `GDRIVE_SERVICE_ACCOUNT_JSON` nos Secrets |
-| Drive permission denied | Pasta não compartilhada | Compartilhe `Automa/ComfyUI` com email do Service Account (Editor) |
-| rclone não encontrado | Não instalado | `pip install rclone` ou instale via apt |
-| Outputs não aparecem no Drive | Output dir incorreto | Verifique `--output-directory` no ComfyUI |
+| Drive permission denied | Pasta não compartilhada | Compartilhe `Automa/ComfyUI` com o email do Service Account (Editor) |
+| rclone não encontrado | Pacote ausente | Instale via apt ou pip |
+| Sync Drive pulou arquivo | Arquivo já idêntico | Comportamento correto: mesmo tamanho e hash SHA-256 são preservados |
 
 ---
 
@@ -300,35 +258,21 @@ python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header
 - [ ] `CIVITAI_TOKEN` nos Secrets
 - [ ] Dataset `automamermaid/comfydocs` acessível
 - [ ] Permissão de edição no dataset
-- [ ] Modelo `lustifyNSFWCheckpoint_v10Krea2.safetensors` (~11.94 GB)
 - [ ] Upload cria nova versão no Kaggle (sem erro 403)
 
 ### Kaggle Runtime
 - [ ] GPU ativada (T4, P100, ou A100)
 - [ ] `kaggle.json` nos Secrets
 - [ ] `GDRIVE_SERVICE_ACCOUNT_JSON` nos Secrets
-- [ ] Scripts em `/kaggle/working/scripts/`
-- [ ] ComfyUI clonado do GitHub
-- [ ] Custom nodes instalados
-- [ ] Modelos sincronizados do Dataset → SSD
-- [ ] Google Drive montado (`/kaggle/working/gdrive/Automa/ComfyUI`)
-- [ ] ComfyUI inicia com `--output-directory` no Drive
-- [ ] ComfyUI responde em `:8188`
-- [ ] Modelo principal aparece no "Load Checkpoint"
-- [ ] Imagem gerada aparece no Drive (`Automa/ComfyUI/outputs/`)
-
----
-
-## Próximos Passos / Melhorias
-
-- [ ] Automação via GitHub Actions para sync programado
-- [ ] Suporte a múltiplos datasets (ex: modelos NSFW separados)
-- [ ] Cache de modelos entre runs do Kaggle Notebook
-- [ ] Integração com ComfyUI-Manager para auto-install de missing nodes
-- [ ] Monitoring de uso de VRAM/disk
+- [ ] Repositório clonado e scripts atualizados
+- [ ] ComfyUI instalado no SSD local
+- [ ] Modelos selecionados sincronizados do Dataset → SSD
+- [ ] ComfyUI inicia gerando em `/kaggle/working/ComfyUI/output`
+- [ ] ComfyUI responde em `:8188` ao health check
+- [ ] Sync com Google Drive executado sob demanda via `09_sync_outputs.ipynb`
 
 ---
 
 ## Licença
 
-Uso interno - Automa / Vitor Ramos
+Uso interno - Automa / Vitor Ramos\n

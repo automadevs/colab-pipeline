@@ -55,15 +55,10 @@ def setup_comfyui(comfyui_dir=DEFAULT_COMFYUI_DIR, repo_url=DEFAULT_REPO_URL, cu
     comfyui_dir = Path(comfyui_dir)
     models_dir = Path(models_dir) if models_dir else comfyui_dir / "models"
     
-    # Configurar output_dir no Google Drive se não especificado
+    # O output do ComfyUI deve ser SEMPRE local no SSD (ex: /kaggle/working/ComfyUI/output).
+    # O Google Drive NÃO fica no caminho crítico da geração e é usado apenas para persistência/sync.
     if output_dir is None:
-        env = "colab" if Path("/content").exists() else ("kaggle" if Path("/kaggle").exists() else "unknown")
-        if env == "colab":
-            output_dir = Path("/content/drive/MyDrive") / drive_base / "outputs"
-        elif env == "kaggle":
-            output_dir = Path("/kaggle/working/gdrive") / drive_base / "outputs"
-        else:
-            output_dir = comfyui_dir / "output"
+        output_dir = comfyui_dir / "output"
     else:
         output_dir = Path(output_dir)
     
@@ -121,9 +116,13 @@ def start_comfyui(comfyui_dir=DEFAULT_COMFYUI_DIR, host="0.0.0.0", port=8188, ex
     if not main_py.exists():
         raise FileNotFoundError(f"ComfyUI não encontrado em {comfyui_dir}")
     
-    cmd = [sys.executable, "main.py", "--listen", host, "--port", str(port)]
-    if output_dir:
-        cmd.extend(["--output-directory", str(output_dir)])
+    if output_dir is None:
+        output_dir = Path(comfyui_dir) / "output"
+    else:
+        output_dir = Path(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "main.py", "--listen", host, "--port", str(port), "--output-directory", str(output_dir)]
     if extra_args:
         cmd.extend(extra_args)
     
@@ -131,8 +130,7 @@ def start_comfyui(comfyui_dir=DEFAULT_COMFYUI_DIR, host="0.0.0.0", port=8188, ex
     log = open(log_path, "a", buffering=1)
     proc = subprocess.Popen(cmd, cwd=comfyui_dir, stdout=log, stderr=subprocess.STDOUT, text=True)
     print(f"[INFO] ComfyUI iniciado PID={proc.pid}; log={log_path}")
-    if output_dir:
-        print(f"[INFO] Output directory: {output_dir}")
+    print(f"[INFO] Output directory (SSD local): {output_dir}")
     return proc
 
 
@@ -158,7 +156,7 @@ def main():
     parser.add_argument("--repo-url", default=DEFAULT_REPO_URL)
     parser.add_argument("--custom-nodes", nargs="*")
     parser.add_argument("--models-dir")
-    parser.add_argument("--output-dir", help="Diretório de outputs (padrão: Google Drive/Automa/ComfyUI/outputs)")
+    parser.add_argument("--output-dir", help="Diretório de outputs (padrão: ComfyUI/output no SSD local)")
     parser.add_argument("--drive-base", default=DEFAULT_DRIVE_BASE, help="Pasta base no Google Drive")
     parser.add_argument("--start", action="store_true")
     parser.add_argument("--host", default="0.0.0.0")

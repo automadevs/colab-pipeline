@@ -35,13 +35,43 @@ def _parse_kaggle_files_output(stdout: str) -> list[str]:
     files = []
     for raw in stdout.splitlines():
         line = raw.strip()
-        if not line or line.lower().startswith("name"):
+        if not line or line.startswith("-") or line.lower().startswith("name") or line.lower() == "files":
             continue
         # A saída tabular do CLI começa pelo nome/path do arquivo.
-        name = line.split()[0]
-        if name not in {"File", "Name"}:
-            files.append(name)
+        parts = line.split()
+        if parts and parts[0] not in {"File", "Name", "files"}:
+            files.append(parts[0])
     return files
+
+
+def _parse_kaggle_files_detailed(stdout: str) -> list[dict]:
+    """Extrai informações detalhadas (path, size, category) da saída do CLI."""
+    items = []
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("-") or line.lower().startswith("name") or line.lower() == "files":
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] not in {"File", "Name", "files"}:
+            path = parts[0]
+            size = parts[1]
+            cat = _category_for_path(path)
+            items.append({
+                "path": path,
+                "name": Path(path).name,
+                "category": cat,
+                "size": size,
+            })
+        elif len(parts) == 1 and parts[0] not in {"File", "Name", "files"}:
+            path = parts[0]
+            cat = _category_for_path(path)
+            items.append({
+                "path": path,
+                "name": Path(path).name,
+                "category": cat,
+                "size": "N/A",
+            })
+    return items
 
 
 def get_dataset_files(dataset: str = DEFAULT_DATASET) -> list[str]:
@@ -52,6 +82,17 @@ def get_dataset_files(dataset: str = DEFAULT_DATASET) -> list[str]:
     if result.returncode != 0:
         raise RuntimeError(f"Falha ao listar dataset: {result.stderr.strip()}")
     return _parse_kaggle_files_output(result.stdout)
+
+
+def get_dataset_files_details(dataset: str = DEFAULT_DATASET) -> list[dict]:
+    """Retorna lista de dicionários com path, name, category e size formatado."""
+    result = subprocess.run(
+        ["kaggle", "datasets", "files", dataset],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Falha ao listar dataset: {result.stderr.strip()}")
+    return _parse_kaggle_files_detailed(result.stdout)
 
 
 def _category_for_path(rel_path: str) -> str:
