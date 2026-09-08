@@ -398,6 +398,7 @@ def start_comfyui_runtime(
     enable_ngrok: bool = True,
     health_timeout: int = 90,
     health_host: str = "127.0.0.1",
+    reuse_existing: bool = True,
 ) -> dict[str, Any]:
     """
     Ordem obrigatória: start → health → ngrok.
@@ -409,31 +410,41 @@ def start_comfyui_runtime(
         "ok": False,
         "proc": None,
         "public_url": None,
+        "local_url": f"http://{health_host}:{port}",
         "log_path": str(log_path),
         "health": False,
         "ngrok_started": False,
+        "reused_existing": False,
     }
 
-    proc = start_comfyui(
-        comfyui_dir=comfyui_dir,
-        host=host,
-        port=port,
-        extra_args=extra_args,
-        output_dir=output_dir,
-        cuda_device=cuda_device,
-        enable_manager=enable_manager,
-    )
-    result["proc"] = proc
+    if reuse_existing and health_check(health_host, port, timeout=2):
+        print(f"[INFO] ComfyUI já está saudável em {result['local_url']}; reutilizando processo existente")
+        result["health"] = True
+        result["ok"] = True
+        result["reused_existing"] = True
+    else:
+        proc = start_comfyui(
+            comfyui_dir=comfyui_dir,
+            host=host,
+            port=port,
+            extra_args=extra_args,
+            output_dir=output_dir,
+            cuda_device=cuda_device,
+            enable_manager=enable_manager,
+        )
+        result["proc"] = proc
 
-    healthy = health_check(health_host, port, timeout=health_timeout)
-    result["health"] = healthy
-    if not healthy:
-        print(f"[ERROR] ComfyUI falhou no health check. Log: {log_path}")
-        print("======== ÚLTIMAS LINHAS DO LOG ========")
-        print(tail_log_file(log_path, n=50))
-        print("=======================================")
-        print("[INFO] ngrok NÃO será iniciado (health check falhou)")
-        return result
+        healthy = health_check(health_host, port, timeout=health_timeout)
+        result["health"] = healthy
+        if not healthy:
+            print(f"[ERROR] ComfyUI falhou no health check. Log: {log_path}")
+            print("======== ÚLTIMAS LINHAS DO LOG ========")
+            print(tail_log_file(log_path, n=50))
+            print("=======================================")
+            print("[INFO] ngrok NÃO será iniciado (health check falhou)")
+            return result
+
+        result["ok"] = True
 
     if enable_ngrok:
         try:
@@ -456,7 +467,12 @@ def start_comfyui_runtime(
     else:
         print("[INFO] ngrok desabilitado (enable_ngrok=False)")
 
-    result["ok"] = True
+    print("=" * 60)
+    print("COMFYUI READY")
+    print(f"Local : {result['local_url']}")
+    print(f"Public: {result['public_url'] or '(ngrok desabilitado)'}")
+    print(f"Output: {output_dir or comfyui_dir / 'output'}")
+    print("=" * 60)
     return result
 
 

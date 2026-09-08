@@ -109,6 +109,7 @@ class RuntimeContractTests(unittest.TestCase):
             result = comfyui_setup.start_comfyui_runtime(
                 comfyui_dir=Path(tempfile.mkdtemp()),
                 enable_ngrok=True,
+                reuse_existing=False,
             )
 
         self.assertEqual(events, ["start", "health", "ngrok"])
@@ -126,10 +127,27 @@ class RuntimeContractTests(unittest.TestCase):
                 comfyui_dir=Path(tempfile.mkdtemp()),
                 enable_ngrok=True,
                 health_timeout=1,
+                reuse_existing=False,
             )
 
         self.assertFalse(result["health"])
         fake_ngrok.start_ngrok_tunnel.assert_not_called()
+
+    def test_ngrok_disabled_keeps_local_runtime_only(self):
+        process = MagicMock(pid=123)
+        with patch.object(comfyui_setup, "start_comfyui", return_value=process), patch.object(
+            comfyui_setup, "health_check", return_value=True
+        ), patch("ngrok_tunnel.start_ngrok_tunnel") as start_tunnel:
+            result = comfyui_setup.start_comfyui_runtime(
+                comfyui_dir=Path(tempfile.mkdtemp()),
+                enable_ngrok=False,
+                reuse_existing=False,
+            )
+
+        self.assertTrue(result["health"])
+        self.assertIsNone(result["public_url"])
+        self.assertEqual(result["local_url"], "http://127.0.0.1:8188")
+        start_tunnel.assert_not_called()
 
     def test_ngrok_restarts_tunnel_without_logging_token(self):
         token = "secret-token-value"
