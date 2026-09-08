@@ -158,8 +158,8 @@ python scripts/kaggle_upload.py   --model-name "lustifyNSFWCheckpoint_v10Krea2.s
 # Sync seletivo Kaggle Dataset → SSD Local (apenas modelos desejados)
 python scripts/kaggle_sync.py   --dataset "automamermaid/comfydocs"   --target-dir /kaggle/working/ComfyUI/models   --categories checkpoints loras vae
 
-# Setup ComfyUI (SSD Local)
-python scripts/comfyui_setup.py   --comfyui-dir /kaggle/working/ComfyUI   --output-dir /kaggle/working/ComfyUI/output   --custom-nodes "ltdrdata/ComfyUI-Manager" "cubiq/ComfyUI_essentials"   --start --health-check
+# Setup ComfyUI (SSD Local) + Manager integrado + ngrok após health check
+python scripts/comfyui_setup.py   --comfyui-dir /kaggle/working/ComfyUI   --output-dir /kaggle/working/ComfyUI/output   --custom-nodes "cubiq/ComfyUI_essentials" "lbouaraba/comfyui-krea2edit"   --start --health-check --ngrok
 
 # Detectar GPU
 python scripts/gpu_detect.py --recommend
@@ -190,7 +190,8 @@ python scripts/kaggle_drive_sync.py   --action pull   --categories workflows   -
 2. Ative **GPU** (Settings → Accelerator → GPU T4 x2 ou P100)
 3. Configure **Secrets** (ícone de chave):
    - `KAGGLE_USERNAME` + `KAGGLE_KEY` (para listar e baixar modelos do dataset)
-   - `GDRIVE_SERVICE_ACCOUNT_JSON`: Service Account JSON com acesso ao Google Drive (para sync e backup)
+  - `GDRIVE_SERVICE_ACCOUNT_JSON`: Service Account JSON com acesso ao Google Drive (opcional, para sync e backup)
+  - `NGROK_AUTHTOKEN`: token do ngrok (opcional, para URL pública)
 4. Execute `08_master_pipeline.ipynb` (o repositório será clonado automaticamente)
 
 ### Google Drive (Persistência & Backup)
@@ -208,6 +209,14 @@ python scripts/kaggle_drive_sync.py   --action pull   --categories workflows   -
 1. No Google Cloud Console: crie Service Account → Role: Editor → Create Key (JSON)
 2. Compartilhe a pasta `Automa/ComfyUI` no Google Drive com o email do Service Account (Editor)
 3. No Kaggle: Secrets → `GDRIVE_SERVICE_ACCOUNT_JSON` = conteúdo do JSON
+
+### Ngrok e GPU
+
+O runtime instala `pyngrok` quando necessário, lê `NGROK_AUTHTOKEN` pelos Secrets/env sem usar `getpass`, executa `ngrok.kill()` antes de criar um túnel e só o inicia depois do health check do ComfyUI. Sem o Secret, o Drive e o ComfyUI continuam funcionando localmente.
+
+O Manager é o integrado ao ComfyUI: o setup instala `ComfyUI/manager_requirements.txt` e inicia com `--enable-manager`. `ComfyUI-Manager` não é clonado como custom node. A lista padrão contém somente `cubiq/ComfyUI_essentials` e `lbouaraba/comfyui-krea2edit`, com atualização idempotente.
+
+`COMFYUI_CUDA_DEVICE=0` é o padrão; altere para `1` para escolher a segunda GPU. Em Kaggle T4x2, cada placa mantém sua própria VRAM: ela não é somada e a GPU 1 fica disponível para workflows especializados. Nodes como `SelectModelDevice`, `SelectCLIPDevice`, `SelectVAEDevice` e `MultiGPU CFG Split`, quando fornecidos pelo ComfyUI, não são adicionados automaticamente ao pipeline básico.
 
 **No Colab:** Usa `google.colab.drive.mount()` nativo (sem service account).
 
@@ -241,11 +250,28 @@ embeddings/            # Textual inversions / embeddings
 | Modelo não encontrado no dataset | Upload anterior falhou | Re-execute upload (03 ou 04) |
 | Tamanho divergente | Download parcial | Delete staging e rebaixe |
 | ComfyUI não inicia | Dependências faltando | Execute `06_comfyui_setup.ipynb` novamente |
-| VRAM insuficiente | Modelo muito grande | Use `--lowvram` ou `--cpu` no ComfyUI |
+| VRAM insuficiente | Modelo muito grande | O padrão usa DynamicVRAM e offload assíncrono; selecione `COMFYUI_CUDA_DEVICE=1` ou ajuste o workflow |
 | Drive não monta (Kaggle) | Service Account inválido | Verifique `GDRIVE_SERVICE_ACCOUNT_JSON` nos Secrets |
 | Drive permission denied | Pasta não compartilhada | Compartilhe `Automa/ComfyUI` com o email do Service Account (Editor) |
 | rclone não encontrado | Pacote ausente | Instale via apt ou pip |
 | Sync Drive pulou arquivo | Arquivo já idêntico | Comportamento correto: mesmo tamanho e hash SHA-256 são preservados |
+
+## Validação
+
+### Testado localmente
+
+- Parser de todas as GPUs e VRAM individual
+- `COMFYUI_CUDA_DEVICE`, comando de start, Manager, nodes e output local
+- Instalação/atualização idempotente do krea2edit
+- Redação do token ngrok e ordem `health → ngrok`
+- JSON e metadata dos notebooks, `git diff --check` e scans de secrets/paths
+
+### Precisa ser testado no Kaggle
+
+- GPU T4x2 real (`gpu_count=2`), CUDA/driver e VRAM disponível
+- Instalação real do ComfyUI e `manager_requirements.txt`
+- Túnel ngrok real com o Secret `NGROK_AUTHTOKEN`
+- Sync do Dataset e sincronização opcional com Google Drive
 
 ---
 
