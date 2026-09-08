@@ -1,301 +1,188 @@
 #!/usr/bin/env python3
-"""
-Setup do ComfyUI no Kaggle Notebook (SSD local).
-Uso: python comfyui_setup.py [--comfyui-dir DIR] [--repo-url URL] [--custom-nodes LIST]
-"""
-
+"""Setup do ComfyUI no Kaggle Notebook (SSD local)."""
+import os
 import subprocess
 import sys
-import os
-import json
+import time
 from pathlib import Path
 
 DEFAULT_COMFYUI_DIR = Path("/kaggle/working/ComfyUI")
 DEFAULT_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
+DEFAULT_DRIVE_BASE = "Automa/ComfyUI"
+MODEL_CATEGORIES = ["checkpoints", "diffusion_models", "loras", "vae", "text_encoders", "clip", "controlnet", "upscale_models", "video_models", "embeddings"]
 
 
 def detect_gpu() -> dict:
-    """Detecta GPU disponível."""
     info = {"has_gpu": False, "gpu_name": "Unknown", "vram_gb": 0}
-
     try:
         import torch
         if torch.cuda.is_available():
             info["has_gpu"] = True
             info["gpu_name"] = torch.cuda.get_device_name(0)
-            info["vram_gb"] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            info["vram_gb"] = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             print(f"[INFO] GPU detectada: {info['gpu_name']} ({info['vram_gb']:.1f} GB VRAM)")
-        else:
-            print("[WARN] CUDA não disponível")
-    except ImportError:
-        print("[INFO] PyTorch não instalado, tentando nvidia-smi...")
-        try:
-            result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], 
-                                  capture_output=True, text=True)
-            if result.returncode == 0:
-                line = result.stdout.strip()
-                name, mem = line.split(", ")
-                info["has_gpu"] = True
-                info["gpu_name"] = name
-                info["vram_gb"] = int(mem.replace(" MiB", "")) / 1024
-                print(f"[INFO] GPU detectada via nvidia-smi: {info['gpu_name']} ({info['vram_gb']:.1f} GB VRAM)")
-        except Exception:
-            print("[WARN] Não foi possível detectar GPU")
-
+            return info
+    except Exception as exc:
+        print(f"[WARN] PyTorch GPU detection falhou: {exc}")
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True, check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            line = result.stdout.strip().splitlines()[0]
+            name, mem = [x.strip() for x in line.split(",", 1)]
+            info["has_gpu"] = True
+            info["gpu_name"] = name
+            info["vram_gb"] = int(mem.split()[0]) / 1024
+            print(f"[INFO] GPU detectada via nvidia-smi: {name} ({info['vram_gb']:.1f} GB VRAM)")
+    except Exception as exc:
+        print(f"[WARN] nvidia-smi indisponível: {exc}")
     return info
 
 
-def setup_comfyui(
-    comfyui_dir: Path = DEFAULT_COMFYUI_DIR,
-    repo_url: str = DEFAULT_REPO_URL,
-    custom_nodes: list = None,
-    models_dir: Path = None,
-) -> Path:
-    """
-    Instala/atualiza ComfyUI e configura diretórios.
-    Retorna o caminho do diretório ComfyUI.
-    """
-    print(f"[INFO] === SETUP COMFYUI ===")
-    print(f"[INFO] Diretório: {comfyui_dir}")
+def _run(cmd, cwd=None, timeout=900, check=True):
+    print("[CMD]", " ".join(map(str, cmd)))
+    result = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+    if result.stdout:
+        print(result.stdout[-4000:])
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr[-4000:])
+        if check:
+            raise RuntimeError(f"Comando falhou ({result.returncode}): {' '.join(map(str, cmd))}")
+    return result
 
-    # Detectar GPU
+
+def setup_comfyui(comfyui_dir=DEFAULT_COMFYUI_DIR, repo_url=DEFAULT_REPO_URL, custom_nodes=None, models_dir=None, output_dir=None, drive_base=DEFAULT_DRIVE_BASE):
+    comfyui_dir = Path(comfyui_dir)
+    models_dir = Path(models_dir) if models_dir else comfyui_dir / "models"
+    
+    # Configurar output_dir no Google Drive se não especificado
+    if output_dir is None:
+        env = "colab" if Path("/content").exists() else ("kaggle" if Path("/kaggle").exists() else "unknown")
+        if env == "colab":
+            output_dir = Path("/content/drive/MyDrive") / drive_base / "outputs"
+        elif env == "kaggle":
+            output_dir = Path("/kaggle/working/gdrive") / drive_base / "outputs"
+        else:
+            output_dir = comfyui_dir / "output"
+    else:
+        output_dir = Path(output_dir)
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
     gpu_info = detect_gpu()
 
-    # Clonar ou atualizar repositório
-    main_py = comfyui_dir / "main.py"
-    if main_py.exists():
-        print("[INFO] ComfyUI já instalado, atualizando...")
-        result = subprocess.run(
-            ["git", "-C", str(comfyui_dir), "pull"],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print(f"[WARN] Git pull falhou: {result.stderr}")
+    if (comfyui_dir / "main.py").exists():
+        _run(["git", "pull", "--ff-only"], cwd=comfyui_dir, timeout=300, check=False)
     else:
-        print("[INFO] Clonando ComfyUI...")
-        result = subprocess.run(
-            ["git", "clone", repo_url, str(comfyui_dir)],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Falha ao clonar ComfyUI: {result.stderr}")
-        print("[INFO] ✅ ComfyUI clonado")
+        _run(["git", "clone", "--depth", "1", repo_url, str(comfyui_dir)], timeout=900)
 
-    # Instalar dependências
-    requirements = comfyui_dir / "requirements.txt"
-    if requirements.exists():
-        print("[INFO] Instalando dependências Python...")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "-r", str(requirements)],
-            capture_output=True, text=True, timeout=600
-        )
-        if result.returncode != 0:
-            print(f"[WARN] Pip install teve avisos: {result.stderr}")
-        print("[INFO] ✅ Dependências instaladas")
+    req = comfyui_dir / "requirements.txt"
+    if req.exists():
+        _run([sys.executable, "-m", "pip", "install", "-q", "-r", str(req)], timeout=900)
 
-    # Criar estrutura de diretórios de modelos
-    if models_dir is None:
-        models_dir = comfyui_dir / "models"
-
-    print("[INFO] Criando estrutura de diretórios de modelos...")
-    for cat in [
-        "checkpoints", "diffusion_models", "loras", "vae", 
-        "text_encoders", "clip", "controlnet", "upscale_models", 
-        "video_models", "embeddings"
-    ]:
+    for cat in MODEL_CATEGORIES:
         (models_dir / cat).mkdir(parents=True, exist_ok=True)
 
-    # Instalar custom nodes se especificados
     if custom_nodes:
-        custom_nodes_dir = comfyui_dir / "custom_nodes"
-        custom_nodes_dir.mkdir(parents=True, exist_ok=True)
-
-        for node_spec in custom_nodes:
-            # Formato: "repo_url" ou "repo_url@branch" ou "user/repo@branch"
-            if "@" in node_spec:
-                repo_part, branch = node_spec.rsplit("@", 1)
+        custom_dir = comfyui_dir / "custom_nodes"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        for spec in custom_nodes:
+            if "@" in spec:
+                repo_part, branch = spec.rsplit("@", 1)
             else:
-                repo_part = node_spec
-                branch = "main"
-
-            # Converter user/repo para URL GitHub se necessário
-            if not repo_part.startswith("http"):
-                if repo_part.startswith("github.com/"):
-                    repo_url = f"https://{repo_part}.git"
-                else:
-                    repo_url = f"https://github.com/{repo_part}.git"
-            else:
-                repo_url = repo_part
-
-            node_name = repo_url.split("/")[-1].replace(".git", "")
-            node_path = custom_nodes_dir / node_name
-
+                repo_part, branch = spec, "main"
+            repo = repo_part if repo_part.startswith("http") else f"https://github.com/{repo_part}.git"
+            node_name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
+            node_path = custom_dir / node_name
             if node_path.exists():
-                print(f"[INFO] Atualizando custom node: {node_name}...")
-                result = subprocess.run(
-                    ["git", "-C", str(node_path), "pull"],
-                    capture_output=True, text=True
-                )
+                _run(["git", "pull", "--ff-only"], cwd=node_path, timeout=300, check=False)
             else:
-                print(f"[INFO] Instalando custom node: {node_name}...")
-                result = subprocess.run(
-                    ["git", "clone", "--branch", branch, repo_url, str(node_path)],
-                    capture_output=True, text=True
-                )
+                _run(["git", "clone", "--depth", "1", "--branch", branch, repo, str(node_path)], timeout=900)
+            node_req = node_path / "requirements.txt"
+            if node_req.exists():
+                _run([sys.executable, "-m", "pip", "install", "-q", "-r", str(node_req)], timeout=900, check=False)
 
-            if result.returncode != 0:
-                print(f"[WARN] Falha ao instalar {node_name}: {result.stderr}")
-            else:
-                # Instalar requirements do custom node se existir
-                node_req = node_path / "requirements.txt"
-                if node_req.exists():
-                    subprocess.run(
-                        [sys.executable, "-m", "pip", "install", "-q", "-r", str(node_req)],
-                        capture_output=True, text=True
-                    )
-                print(f"[INFO] ✅ Custom node: {node_name}")
-
-    # Configurar extra_model_paths.yaml para apontar para models_dir externo
+    # ComfyUI espera um mapping YAML, não uma lista de mappings.
     extra_paths = comfyui_dir / "extra_model_paths.yaml"
     if not extra_paths.exists():
-        print("[INFO] Criando extra_model_paths.yaml...")
-        config = [{
-            "base_path": str(models_dir),
-            "checkpoints": "checkpoints",
-            "loras": "loras",
-            "vae": "vae",
-            "controlnet": "controlnet",
-            "embeddings": "embeddings",
-            "upscale_models": "upscale_models",
-        }]
-        with open(extra_paths, "w") as f:
-            import yaml
-            yaml.dump(config, f)
+        lines = ["kaggle_models:", f"  base_path: {models_dir}"]
+        for cat in MODEL_CATEGORIES:
+            lines.append(f"  {cat}: {cat}")
+        extra_paths.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"[INFO] Criado {extra_paths}")
 
-    print(f"[INFO] ✅ ComfyUI pronto em {comfyui_dir}")
-    print(f"[INFO] Modelos em {models_dir}")
+    print(f"[INFO] ComfyUI: {comfyui_dir}")
+    print(f"[INFO] Models: {models_dir}")
     print(f"[INFO] GPU: {gpu_info['gpu_name'] if gpu_info['has_gpu'] else 'CPU only'}")
-
     return comfyui_dir
 
 
-def start_comfyui(
-    comfyui_dir: Path = DEFAULT_COMFYUI_DIR,
-    host: str = "0.0.0.0",
-    port: int = 8188,
-    extra_args: list = None,
-) -> subprocess.Popen:
-    """
-    Inicia ComfyUI em background.
-    Retorna o processo Popen.
-    """
-    main_py = comfyui_dir / "main.py"
+def start_comfyui(comfyui_dir=DEFAULT_COMFYUI_DIR, host="0.0.0.0", port=8188, extra_args=None, output_dir=None):
+    main_py = Path(comfyui_dir) / "main.py"
     if not main_py.exists():
         raise FileNotFoundError(f"ComfyUI não encontrado em {comfyui_dir}")
-
+    
     cmd = [sys.executable, "main.py", "--listen", host, "--port", str(port)]
+    if output_dir:
+        cmd.extend(["--output-directory", str(output_dir)])
     if extra_args:
         cmd.extend(extra_args)
-
-    print(f"[INFO] Iniciando ComfyUI: {' '.join(cmd)}")
-    print(f"[INFO] Diretório de trabalho: {comfyui_dir}")
-
-    # Mudar para diretório do ComfyUI
-    os.chdir(comfyui_dir)
-
-    # Iniciar em background
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    print(f"[INFO] ComfyUI iniciado (PID: {proc.pid})")
-    print(f"[INFO] Acesse: http://{host}:{port}")
-
+    
+    log_path = Path(comfyui_dir) / "comfyui.log"
+    log = open(log_path, "a", buffering=1)
+    proc = subprocess.Popen(cmd, cwd=comfyui_dir, stdout=log, stderr=subprocess.STDOUT, text=True)
+    print(f"[INFO] ComfyUI iniciado PID={proc.pid}; log={log_path}")
+    if output_dir:
+        print(f"[INFO] Output directory: {output_dir}")
     return proc
 
 
-def health_check(host: str = "127.0.0.1", port: int = 8188, timeout: int = 60) -> bool:
-    """Verifica se ComfyUI está respondendo."""
+def health_check(host="127.0.0.1", port=8188, timeout=60):
     import urllib.request
-    import time
-
-    url = f"http://{host}:{port}/system_stats"
-    print(f"[INFO] Verificando health check em {url}...")
-
     start = time.time()
+    url = f"http://{host}:{port}/system_stats"
     while time.time() - start < timeout:
         try:
-            req = urllib.request.Request(url)
-            response = urllib.request.urlopen(req, timeout=5)
-            if response.status == 200:
-                print(f"[INFO] ✅ ComfyUI respondendo (status 200)")
-                return True
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    print("[INFO] Health check OK")
+                    return True
         except Exception:
-            pass
-        time.sleep(2)
-
-    print(f"[ERROR] Health check falhou após {timeout}s")
+            time.sleep(2)
     return False
 
 
 def main():
     import argparse
-
-    parser = argparse.ArgumentParser(description="Setup ComfyUI no Kaggle Notebook")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--comfyui-dir", default=str(DEFAULT_COMFYUI_DIR))
     parser.add_argument("--repo-url", default=DEFAULT_REPO_URL)
-    parser.add_argument("--custom-nodes", nargs="*", help="Lista de custom nodes (repo_url[@branch])")
-    parser.add_argument("--models-dir", help="Diretório externo de modelos")
-    parser.add_argument("--start", action="store_true", help="Iniciar ComfyUI após setup")
+    parser.add_argument("--custom-nodes", nargs="*")
+    parser.add_argument("--models-dir")
+    parser.add_argument("--output-dir", help="Diretório de outputs (padrão: Google Drive/Automa/ComfyUI/outputs)")
+    parser.add_argument("--drive-base", default=DEFAULT_DRIVE_BASE, help="Pasta base no Google Drive")
+    parser.add_argument("--start", action="store_true")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8188)
-    parser.add_argument("--health-check", action="store_true", help="Fazer health check após iniciar")
-
+    parser.add_argument("--health-check", action="store_true")
     args = parser.parse_args()
-
-    try:
-        models_dir = Path(args.models_dir) if args.models_dir else None
-        comfyui_dir = setup_comfyui(
-            comfyui_dir=Path(args.comfyui_dir),
-            repo_url=args.repo_url,
-            custom_nodes=args.custom_nodes,
-            models_dir=models_dir,
-        )
-
-        if args.start:
-            proc = start_comfyui(
-                comfyui_dir=comfyui_dir,
-                host=args.host,
-                port=args.port,
-            )
-
-            if args.health_check:
-                import time
-                time.sleep(5)  # Dar tempo para iniciar
-                if health_check(args.host, args.port):
-                    print("[INFO] ✅ ComfyUI pronto e respondendo!")
-                else:
-                    print("[WARN] ComfyUI iniciou mas health check falhou")
-
-            # Manter processo vivo se for o caso
-            print("[INFO] Pressione Ctrl+C para parar")
-            try:
-                proc.wait()
-            except KeyboardInterrupt:
-                print("[INFO] Parando ComfyUI...")
-                proc.terminate()
-                proc.wait()
-
-        print("\n[SUCCESS] Setup concluído")
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
-
+    
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    comfyui = setup_comfyui(
+        Path(args.comfyui_dir), 
+        args.repo_url, 
+        args.custom_nodes, 
+        Path(args.models_dir) if args.models_dir else None,
+        output_dir=output_dir,
+        drive_base=args.drive_base
+    )
+    if args.start:
+        proc = start_comfyui(comfyui, args.host, args.port, output_dir=output_dir)
+        if args.health_check and not health_check("127.0.0.1", args.port, 90):
+            raise RuntimeError("Health check falhou")
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
 
 if __name__ == "__main__":
     main()
