@@ -3,6 +3,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from kaggle_dataset_manager import (
     DatasetFile,
     build_dataset_path,
     compare_states,
+    download_input_queue,
     format_size,
     manifest_payload,
     parse_current_files,
@@ -22,6 +24,9 @@ from kaggle_dataset_manager import (
     parse_size,
     publish,
     render_preview,
+    retry,
+    validate_air,
+    validate_civitai_url,
     _expected_sha256,
     download_with_civitai_cli,
 )
@@ -171,18 +176,161 @@ class DatasetManagerTests(unittest.TestCase):
             self.assertIn(marker, preview)
 
     def test_publish_requires_explicit_call_and_writes_metadata(self):
+        class FakePopen:
+            def __init__(self, command, **kwargs):
+                self.command = command
+                self.stdout = iter(["version 7\n"])
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("kaggle_dataset_manager.subprocess.run") as run:
-                run.return_value.returncode = 0
-                run.return_value.stdout = "version 7"
+            with patch("kaggle_dataset_manager.subprocess.run") as run, patch(
+                "kaggle_dataset_manager.subprocess.Popen", side_effect=lambda command, **kwargs: FakePopen(command)
+            ) as popen:
+                run.return_value.returncode = 1
+                run.return_value.stdout = ""
                 result = publish("automamermaid/comfydocs", Path(tmp), "test update")
                 self.assertEqual(result, "version 7")
                 metadata = json.loads((Path(tmp) / "dataset-metadata.json").read_text())
                 self.assertEqual(metadata["id"], "automamermaid/comfydocs")
-                command = run.call_args.args[0]
+                command = popen.call_args.args[0]
                 self.assertIn("version", command)
                 self.assertIn("-p", command)
                 self.assertNotIn("--delete-old-versions", command)
+
+    def test_validate_air(self):
+        parsed, error = validate_air("urn:air:krea2:lora:civitai:2761113@3139172+3019297")
+        self.assertIsNone(error)
+        self.assertEqual(parsed, {"model_id": 2761113, "version_id": 3139172})
+
+        parsed, error = validate_air("urn:air:krea2:lora:civitai:0@3139172")
+        self.assertIsNone(parsed)
+        self.assertIn("> 0", error)
+
+        parsed, error = validate_air("not-an-air")
+        self.assertIsNone(parsed)
+        self.assertIn("AIR inválido", error)
+
+    def test_validate_civitai_url(self):
+        self.assertIsNone(validate_civitai_url("https://civitai.com/models/2761113?modelVersionId=3139172"))
+        self.assertIsNone(validate_civitai_url("https://civitai.com/api/download/models/3139172?fileId=3019297"))
+        self.assertIsNotNone(validate_civitai_url("https://example.com/models/1"))
+        self.assertIsNotNone(validate_civitai_url("https://civitai.com/user/foo"))
+        self.assertIsNotNone(validate_civitai_url("not-a-url"))
+
+    def test_retry_recovers_from_transient_errors(self):
+        calls = []
+
+        @retry(max_attempts=3, delay=2, backoff=2)
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise urllib.error.URLError("boom")
+            return "ok"
+
+        with patch("kaggle_dataset_manager.time.sleep") as sleep:
+            self.assertEqual(flaky(), "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+
+    def test_retry_gives_up_after_max_attempts(self):
+        calls = []
+
+        @retry(max_attempts=3, delay=2, backoff=2)
+        def always_fails():
+            calls.append(1)
+            raise ConnectionError("down")
+
+        with patch("kaggle_dataset_manager.time.sleep"):
+            with self.assertRaises(ConnectionError):
+                always_fails()
+        self.assertEqual(len(calls), 3)
+
+    def test_retry_does_not_catch_permanent_errors(self):
+        calls = []
+
+        @retry(max_attempts=3, delay=2, backoff=2)
+        def bad_input():
+            calls.append(1)
+            raise ValueError("permanent")
+
+        with patch("kaggle_dataset_manager.time.sleep"):
+            with self.assertRaises(ValueError):
+                bad_input()
+        self.assertEqual(len(calls), 1)
+
+    def _fake_info(self, value):
+        return {
+            "model": {"type": "lora", "name": "m"},
+            "version": {"id": 2, "name": "v", "baseModel": "krea2"},
+            "file": {"id": 5, "name": "f.safetensors"},
+            "model_id": "1",
+            "air": {"air": value, "type": "lora", "base_model": "krea2"},
+        }
+
+    def test_queue_collects_all_entries_before_downloading(self):
+        events = []
+        entries = ["urn:air:krea2:lora:civitai:1@2", "https://civitai.com/models/3?modelVersionId=4"]
+        inputs = iter([*entries, "done"])
+
+        def fake_input(prompt=""):
+            self.assertEqual(events, [], "resolução/download não pode ocorrer durante a coleta")
+            return next(inputs)
+
+        def fake_resolve(value, token, input_fn):
+            events.append(f"resolve:{value}")
+            return [self._fake_info(value)]
+
+        def fake_download(info, category, staging_dir, token, source_url=None, air=None):
+            events.append(f"download:{source_url}")
+            return DatasetFile(f"loras/{len(events)}.safetensors", 1, f"hash{len(events)}")
+
+        with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=fake_resolve), patch.object(
+            kaggle_dataset_manager, "download_civitai_file", side_effect=fake_download
+        ), patch.object(kaggle_dataset_manager, "classify_civitai_type", return_value="loras"):
+            queue = download_input_queue(Path("/tmp"), "token", input_fn=fake_input)
+
+        self.assertEqual(len(queue), 2)
+        self.assertEqual(
+            events,
+            [
+                f"resolve:{entries[0]}",
+                f"download:{entries[0]}",
+                f"resolve:{entries[1]}",
+                f"download:{entries[1]}",
+            ],
+        )
+
+    def test_queue_skips_invalid_entries(self):
+        inputs = iter(["not-an-air", "urn:air:x:lora:civitai:0@1", "done"])
+        with patch.object(kaggle_dataset_manager, "resolve_civitai_input") as resolve:
+            queue = download_input_queue(Path("/tmp"), "token", input_fn=lambda prompt="": next(inputs))
+        self.assertEqual(queue, [])
+        resolve.assert_not_called()
+
+    def test_queue_continues_after_item_failure(self):
+        entries = ["urn:air:krea2:lora:civitai:1@2", "urn:air:krea2:lora:civitai:3@4"]
+        inputs = iter([*entries, "done"])
+
+        def fake_resolve(value, token, input_fn):
+            if value == entries[0]:
+                raise RuntimeError("falha permanente")
+            return [self._fake_info(value)]
+
+        def fake_download(info, category, staging_dir, token, source_url=None, air=None):
+            return DatasetFile("loras/ok.safetensors", 1, "hash")
+
+        with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=fake_resolve), patch.object(
+            kaggle_dataset_manager, "download_civitai_file", side_effect=fake_download
+        ), patch.object(kaggle_dataset_manager, "classify_civitai_type", return_value="loras"):
+            queue = download_input_queue(Path("/tmp"), "token", input_fn=lambda prompt="": next(inputs))
+
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0].path, "loras/ok.safetensors")
 
 
 if __name__ == "__main__":

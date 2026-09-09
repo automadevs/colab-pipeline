@@ -2,6 +2,7 @@
 """Independent Colab tool for building and publishing complete Kaggle Dataset state."""
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -9,6 +10,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -48,6 +51,36 @@ CATEGORY_ALIASES = {
     "upscale_models": "upscale_models",
     "motion_module": "video_models",
 }
+
+RETRIABLE_ERRORS = (
+    urllib.error.HTTPError,
+    urllib.error.URLError,
+    TimeoutError,
+    ConnectionError,
+    subprocess.TimeoutExpired,
+)
+
+
+def retry(max_attempts: int = 3, delay: float = 2, backoff: float = 2) -> Callable:
+    """Re-tenta erros transitórios de rede com backoff exponencial."""
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            wait = delay
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except RETRIABLE_ERRORS as exc:
+                    if attempt >= max_attempts:
+                        raise
+                    print(f"[WARN] {func.__name__}: {exc} (tentativa {attempt}/{max_attempts}); nova tentativa em {wait:.0f}s")
+                    time.sleep(wait)
+                    wait *= backoff
+
+        return wrapper
+
+    return decorator
 
 
 @dataclass(frozen=True)
@@ -125,6 +158,30 @@ def parse_air(value: str) -> dict[str, Any]:
     }
 
 
+def validate_air(value: str) -> tuple[Optional[dict[str, int]], Optional[str]]:
+    """Valida um AIR: retorna ({"model_id", "version_id"}, None) ou (None, erro)."""
+    try:
+        parsed = parse_air(value)
+    except ValueError as exc:
+        return None, str(exc)
+    model_id = int(parsed["model_id"])
+    version_id = int(parsed["version_id"])
+    if model_id <= 0 or version_id <= 0:
+        return None, "AIR inválido: model_id e version_id devem ser inteiros > 0"
+    return {"model_id": model_id, "version_id": version_id}, None
+
+
+def validate_civitai_url(value: str) -> Optional[str]:
+    """Retorna mensagem de erro quando a URL Civitai é inválida; None se válida."""
+    parsed = urllib.parse.urlparse(str(value or "").strip())
+    host = parsed.netloc.lower()
+    if parsed.scheme not in {"http", "https"} or not (host == "civitai.com" or host.endswith(".civitai.com")):
+        return "URL inválida: use https://civitai.com/models/<id> ou um link de download Civitai"
+    if not (re.search(r"/models/\d+", parsed.path) or "/api/download/models/" in parsed.path):
+        return "URL Civitai deve conter /models/<id> ou /api/download/models/<id>"
+    return None
+
+
 def classify_civitai_type(resource_type: str, input_fn=input) -> str:
     resource_type = str(resource_type or "").lower()
     if resource_type in {"lora", "locon", "dora"}:
@@ -190,6 +247,7 @@ def ensure_civitai_cli() -> str:
     return executable
 
 
+@retry()
 def download_with_civitai_cli(
     version_id: str,
     file_id: str,
@@ -346,6 +404,7 @@ def render_preview(dataset: str, current: dict[str, DatasetFile], desired: dict[
     return "\n".join(lines)
 
 
+@retry()
 def resolve_civitai_url(url: str, token: str) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
     match = re.search(r"/models/(\d+)", parsed.path)
@@ -469,36 +528,57 @@ def download_input_queue(
         if not value:
             print("[WARN] Entrada vazia")
             continue
+        if value.lower().startswith("urn:air:"):
+            _, error = validate_air(value)
+        else:
+            error = validate_civitai_url(value)
+        if error:
+            print(f"[WARN] Entrada inválida: {error}")
+            continue
         pending.append(value)
 
     print(f"[INFO] Lista fechada com {len(pending)} item(ns). Iniciando downloads...")
     queue: list[DatasetFile] = []
+    failures = 0
     total = len(pending)
     for index, value in enumerate(pending, start=1):
         print(f"--- [{index}/{total}] {value} ---")
-        for info in resolve_civitai_input(value, token, input_fn):
-            air = info.get("air") or {}
-            resource_type = air.get("type") or info["model"].get("type", "unknown")
-            category = classify_civitai_type(resource_type, input_fn)
-            file_info = info["file"]
-            base_model = air.get("base_model") or info["version"].get("baseModel") or info["model"].get("baseModel")
-            manifest_input = {
-                **air,
-                "air": air.get("air") or (value if value.lower().startswith("urn:air:") else None),
-                "base_model": base_model,
-            }
-            print(
-                f"Modelo: {info['model'].get('name', 'N/A')} | "
-                f"versão: {info['version'].get('name', info['version'].get('id'))} | "
-                f"arquivo: {file_info.get('name', 'N/A')} | "
-                f"tipo: {resource_type} | base model: {base_model or 'N/A'}"
-            )
-            item = download_civitai_file(info, category, staging_dir, token, source_url=value, air=manifest_input)
-            if any(existing.path == item.path and existing.size == item.size and existing.sha256 == item.sha256 for existing in queue):
-                print(f"[SKIP] já presente na fila e idêntico: {item.path}")
+        try:
+            infos = resolve_civitai_input(value, token, input_fn)
+        except Exception as exc:
+            failures += 1
+            print(f"[ERROR] Falha ao resolver [{index}/{total}] {value}: {exc}")
+            continue
+        for info in infos:
+            try:
+                air = info.get("air") or {}
+                resource_type = air.get("type") or info["model"].get("type", "unknown")
+                category = classify_civitai_type(resource_type, input_fn)
+                file_info = info["file"]
+                base_model = air.get("base_model") or info["version"].get("baseModel") or info["model"].get("baseModel")
+                manifest_input = {
+                    **air,
+                    "air": air.get("air") or (value if value.lower().startswith("urn:air:") else None),
+                    "base_model": base_model,
+                }
+                print(
+                    f"Modelo: {info['model'].get('name', 'N/A')} | "
+                    f"versão: {info['version'].get('name', info['version'].get('id'))} | "
+                    f"arquivo: {file_info.get('name', 'N/A')} | "
+                    f"tipo: {resource_type} | base model: {base_model or 'N/A'}"
+                )
+                item = download_civitai_file(info, category, staging_dir, token, source_url=value, air=manifest_input)
+                if any(existing.path == item.path and existing.size == item.size and existing.sha256 == item.sha256 for existing in queue):
+                    print(f"[SKIP] já presente na fila e idêntico: {item.path}")
+                    continue
+                queue.append(item)
+                print(f"[{len(queue)}] Download concluído: {item.path}")
+            except Exception as exc:
+                failures += 1
+                print(f"[ERROR] Download falhou para [{index}/{total}] {value}: {exc}")
                 continue
-            queue.append(item)
-            print(f"[{len(queue)}] Download concluído: {item.path}")
+    if failures:
+        print(f"[WARN] Lote concluído com {failures} falha(s); {len(queue)} arquivo(s) na fila.")
     return queue
 
 

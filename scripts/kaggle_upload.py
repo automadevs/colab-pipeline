@@ -101,21 +101,35 @@ def upload_via_cli(
         ]
         print(f"[INFO] Comando: {' '.join(cmd)}")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        output: list[str] = []
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                text = line.rstrip()
+                output.append(text)
+                print(f"[kaggle] {text}", flush=True)
+            return_code = process.wait(timeout=3600)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise TimeoutError("Timeout publicando nova versão Kaggle")
 
-        print(f"[INFO] Return code: {result.returncode}")
-        print(f"[INFO] STDOUT:\n{result.stdout}")
-        if result.stderr:
-            print(f"[INFO] STDERR:\n{result.stderr}")
-
-        if result.returncode == 0:
+        print(f"[INFO] Return code: {return_code}")
+        combined_output = "\n".join(output)
+        if return_code == 0:
             print("[INFO] ✅ SUCESSO: Nova versão criada via Kaggle CLI")
             return True
-        elif "403" in (result.stdout + result.stderr):
+        elif "403" in combined_output:
             print("[ERROR] ❌ ERRO 403 DETECTADO")
             raise PermissionError("CLI retornou 403")
         else:
-            raise RuntimeError(f"Falha no upload: {result.stderr}")
+            raise RuntimeError(f"Falha no upload (exit {return_code}): {combined_output[-2000:]}")
 
 
 def upload_via_kagglehub(
@@ -147,8 +161,8 @@ def upload_via_kagglehub(
 
         print(f"[INFO] Enviando via kagglehub.dataset_upload...")
         result = kagglehub.dataset_upload(
-            dataset=dataset,
-            path=str(tmpdir),
+            handle=dataset,
+            local_dataset_dir=str(tmpdir),
             version_notes=version_notes
         )
         print(f"[INFO] ✅ Upload via kagglehub bem-sucedido: {result}")

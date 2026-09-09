@@ -57,10 +57,7 @@ Arquitetura definitiva para transferência e execução de modelos ComfyUI.
 ```
 colab_pipeline/
 ├── colab_transfer/           # Notebooks para rodar no GOOGLE COLAB
-│   ├── 01_inspecao.ipynb     # Verifica auth, dataset, staging
-│   ├── 02_download.ipynb     # Civitai → /content/kaggle_staging
-│   ├── 03_upload_kaggle.ipynb # Staging → Kaggle Dataset (CLI)
-│   ├── 04_upload_kagglehub.ipynb # Fallback upload via kagglehub
+│   ├── 00_master_pipeline.ipynb # ÚNICA célula: setup, inspeção, download sequencial e publicação
 │
 ├── kaggle_runtime/           # Notebooks para rodar no KAGGLE NOTEBOOK
 │   ├── 05_download_to_local.ipynb  # Seleção manual de modelos do Dataset → SSD
@@ -70,9 +67,10 @@ colab_pipeline/
 │   └── 09_sync_outputs.ipynb       # Painel de sincronização manual com Google Drive
 │
 ├── scripts/                  # Scripts Python compartilhados
+│   ├── master_pipeline.py    # Orquestrador Colab: setup repo, inspeção, download, publicação (exit 0/1)
 │   ├── civitai_download.py   # Download robusto da Civitai
 │   ├── kaggle_upload.py      # Upload para Kaggle Dataset (CLI + kagglehub)
-│   ├── kaggle_dataset_manager.py # Helpers AIR, staging, manifest e publicação do Dataset
+│   ├── kaggle_dataset_manager.py # Helpers AIR, staging, manifest, retry e publicação do Dataset
 │   ├── kaggle_sync.py        # Sync seletivo com exibição de tamanho formatado
 │   ├── kaggle_drive_sync.py  # Sincronização idempotente streaming SHA-256 com Drive
 │   ├── comfyui_setup.py      # Instalação ComfyUI e start com output local no SSD
@@ -92,11 +90,11 @@ colab_pipeline/
 #    CIVITAI_TOKEN = seu token da Civitai
 #    KAGGLE_USERNAME + KAGGLE_KEY = credenciais Kaggle
 
-# 2. Execute em ordem:
-#    colab_transfer/01_inspecao.ipynb      # Verifica ambiente
-#    colab_transfer/02_download.ipynb      # Baixa da Civitai (~12GB)
-#    colab_transfer/03_upload_kaggle.ipynb # Sobe para Kaggle Dataset
-#    # Se der 403: colab_transfer/04_upload_kagglehub.ipynb
+# 2. Abra colab_transfer/00_master_pipeline.ipynb e execute a ÚNICA célula.
+#    Ela roda: setup do repo (clone/pull) → inspeção do ambiente →
+#    download sequencial Civitai (fila AIR/URL com validação + retry) →
+#    publicação no Kaggle Dataset (CLI com fallback automático kagglehub).
+#    Código de saída: 0 = sucesso, 1 = falha crítica (ex: token ausente).
 ```
 
 **O PC do usuário NÃO participa da transferência.** Tudo roda na nuvem.
@@ -126,11 +124,12 @@ O `08_master_pipeline.ipynb`:
 
 ## Administração integrada ao fluxo Colab
 
-Não existe um notebook separado de Dataset Manager. As células existentes permanecem o fluxo operacional:
+Não existe um notebook separado de Dataset Manager. O fluxo operacional é o orquestrador único:
 
-- `02_download.ipynb`: recebe AIR Civitai (ou URL), classifica pelo tipo do recurso, baixa sequencialmente para `/content/kaggle_staging/` e gera o manifest.
-- `03_upload_kaggle.ipynb`: consulta o estado atual, permite `remove`/`move`, monta o estado completo, mostra preview e publica somente após confirmação.
-- `04_upload_kagglehub.ipynb`: permanece como fallback de upload existente.
+- `colab_transfer/00_master_pipeline.ipynb`: célula única que executa `scripts/master_pipeline.py`.
+- `scripts/master_pipeline.py`: faz o setup do repositório (`git pull --ff-only` ou clone `--depth 1`), inspeciona o ambiente (Python, Kaggle CLI, Civitai CLI, secrets), executa a fila de downloads e publica.
+- `download_input_queue()` (em `kaggle_dataset_manager.py`): coleta todos os AIRs/URLs primeiro (validando cada entrada com `validate_air`/`validate_civitai_url`, sem interromper o loop em caso de erro), e só depois baixa sequencialmente — um arquivo por vez, com retry automático (`@retry`, 3 tentativas, backoff 2s→4s) em erros transitórios de rede. Falha permanente em um item é logada e o lote continua.
+- `publish_staged_state()`: consulta o estado atual, permite `remove`/`move`, monta o estado completo, mostra preview e publica somente após confirmação. Se a CLI falhar, o orquestrador faz fallback automático para `kagglehub.dataset_upload`.
 
 `scripts/kaggle_dataset_manager.py` fornece somente os helpers compartilhados de AIR, Civitai, SHA256, manifest, preview e publicação. Ele não é importado por nenhum runtime Kaggle.
 
@@ -260,7 +259,7 @@ embeddings/            # Textual inversions / embeddings
 |---|---|---|
 | Kaggle 403 no upload | Sem permissão de edição | Verifique se é owner/colaborador do dataset `automamermaid/comfydocs` |
 | Download 0 bytes | Token Civitai inválido | Verifique `CIVITAI_TOKEN` nos Secrets |
-| Modelo não encontrado no dataset | Upload anterior falhou | Re-execute upload (03 ou 04) |
+| Modelo não encontrado no dataset | Upload anterior falhou | Re-execute `00_master_pipeline.ipynb` |
 | Tamanho divergente | Download parcial | Delete staging e rebaixe |
 | ComfyUI não inicia | Dependências faltando | Execute `06_comfyui_setup.ipynb` novamente |
 | VRAM insuficiente | Modelo muito grande | O padrão usa DynamicVRAM e offload assíncrono; selecione `COMFYUI_CUDA_DEVICE=1` ou ajuste o workflow |
