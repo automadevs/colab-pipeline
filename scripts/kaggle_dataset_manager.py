@@ -23,6 +23,7 @@ CATEGORIES = (
 )
 MANIFEST_NAME = "dataset-manifest.json"
 METADATA_NAME = "dataset-metadata.json"
+CIVITAI_CLI_PACKAGE = "@civitai/cli@0.1.104"
 CATEGORY_ALIASES = {
     "checkpoint": "checkpoints",
     "checkpoints": "checkpoints",
@@ -156,6 +157,103 @@ def _expected_sha256(file_info: dict[str, Any]) -> Optional[str]:
             if str(key).lower() in {"sha256", "sha-256"} and value:
                 return str(value).lower()
     return None
+
+
+def ensure_civitai_cli() -> str:
+    """Retorna o CLI oficial, instalando uma versão estável se necessário."""
+    executable = shutil.which("civitai")
+    if not executable:
+        npm = shutil.which("npm")
+        if not npm:
+            raise RuntimeError("CLI civitai não encontrado e npm não está disponível")
+        subprocess.run(
+            [npm, "install", "--global", CIVITAI_CLI_PACKAGE],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        executable = shutil.which("civitai")
+    if not executable:
+        raise RuntimeError("civitai CLI não ficou disponível após a instalação")
+    version = subprocess.run(
+        [executable, "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    version_text = (version.stdout or version.stderr or "").strip()
+    if not version_text:
+        raise RuntimeError("civitai --version não retornou uma versão")
+    print(f"Civitai CLI:\n{version_text}")
+    return executable
+
+
+def download_with_civitai_cli(
+    version_id: str,
+    file_id: str,
+    destination: Path,
+    token: str,
+    expected_size: int = 0,
+    expected_sha256: Optional[str] = None,
+) -> Path:
+    """Baixa por version/file id e valida o destino final promovido pelo CLI."""
+    if not version_id or not file_id:
+        raise ValueError("version_id e file_id são obrigatórios para o download")
+    if not token:
+        raise ValueError("CIVITAI_TOKEN é obrigatório para o download")
+
+    cli = ensure_civitai_cli()
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.stat().st_size > 0:
+        actual_size = destination.stat().st_size
+        actual_hash = sha256_file(destination)
+        if (not expected_size or actual_size == expected_size) and (not expected_sha256 or actual_hash.lower() == expected_sha256.lower()):
+            print(f"[SKIP] arquivo válido já existe: {destination}")
+            return destination
+
+    environment = os.environ.copy()
+    environment["CIVITAI_TOKEN"] = token
+    environment["CIVITAI_NO_UPDATE_CHECK"] = "1"
+    command = [
+        cli,
+        "download",
+        str(version_id),
+        "--file",
+        str(file_id),
+        "--out",
+        str(destination),
+        "--force",
+        "--no-update-check",
+    ]
+    print(f"Version ID: {version_id}")
+    print(f"File ID: {file_id}")
+    print(f"Destination: {destination}")
+    result = subprocess.run(
+        command,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=7200,
+    )
+    if result.returncode != 0:
+        error_output = (result.stderr or "").replace(token, "***REDACTED***")
+        raise RuntimeError(
+            f"civitai download falhou ({result.returncode}): "
+            f"{error_output[-2000:]}"
+        )
+    if not destination.exists() or destination.stat().st_size == 0:
+        raise RuntimeError(f"civitai download não produziu o arquivo final: {destination}")
+
+    actual_size = destination.stat().st_size
+    if expected_size and actual_size != expected_size:
+        raise RuntimeError(f"Tamanho inválido: {actual_size}; esperado {expected_size}")
+    actual_hash = sha256_file(destination)
+    if expected_sha256 and actual_hash.lower() != expected_sha256.lower():
+        raise RuntimeError("SHA256 inválido para o arquivo baixado")
+    return destination
 
 
 def parse_current_files(details: Iterable[dict[str, Any]]) -> dict[str, DatasetFile]:
@@ -332,24 +430,15 @@ def download_civitai_file(
     if destination.exists() and destination.stat().st_size > 0 and (not expected_size or destination.stat().st_size == expected_size) and (not expected_hash or sha256_file(destination) == expected_hash):
         print(f"[SKIP] já presente no staging e com tamanho válido: {dataset_path}")
     else:
-        url = file_info.get("downloadUrl") or f"https://civitai.com/api/download/models/{info['version']['id']}?fileId={file_info['id']}"
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": "colab-pipeline-dataset-manager"})
-        partial = destination.with_name(destination.name + ".part")
         print(f"Download: {filename} -> {dataset_path}")
-        if partial.exists():
-            partial.unlink()
-        with urllib.request.urlopen(request, timeout=7200) as response, partial.open("wb") as output:
-            shutil.copyfileobj(response, output, length=1024 * 1024)
-        if partial.stat().st_size == 0:
-            partial.unlink()
-            raise RuntimeError(f"Download vazio para {dataset_path}")
-        if expected_size and partial.stat().st_size != expected_size:
-            partial.unlink()
-            raise RuntimeError(f"Tamanho inválido para {dataset_path}: {partial.stat().st_size} bytes; esperado {expected_size}")
-        if expected_hash and sha256_file(partial) != expected_hash:
-            partial.unlink()
-            raise RuntimeError(f"SHA256 inválido para {dataset_path}")
-        partial.replace(destination)
+        download_with_civitai_cli(
+            version_id=str(info["version"]["id"]),
+            file_id=str(file_info["id"]),
+            destination=destination,
+            token=token,
+            expected_size=expected_size,
+            expected_sha256=expected_hash,
+        )
     actual_size = destination.stat().st_size
     if actual_size == 0 or (expected_size and actual_size != expected_size):
         raise RuntimeError(f"Tamanho inválido para {dataset_path}: {actual_size} bytes; esperado {expected_size}")

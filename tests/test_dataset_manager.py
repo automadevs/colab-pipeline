@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -22,7 +23,9 @@ from kaggle_dataset_manager import (
     publish,
     render_preview,
     _expected_sha256,
+    download_with_civitai_cli,
 )
+import kaggle_dataset_manager
 
 
 class DatasetManagerTests(unittest.TestCase):
@@ -57,6 +60,70 @@ class DatasetManagerTests(unittest.TestCase):
     def test_file_hash_metadata(self):
         self.assertEqual(_expected_sha256({"hashes": {"SHA256": "ABC123"}}), "abc123")
         self.assertIsNone(_expected_sha256({"hashes": {"CRC32": "x"}}))
+
+    def test_civitai_cli_download_command_and_atomic_validation(self):
+        payload = b"abc"
+        expected_hash = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "loras" / "model.safetensors"
+
+            def fake_run(command, env, **kwargs):
+                output = Path(command[command.index("--out") + 1])
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(payload)
+                self.assertEqual(env["CIVITAI_TOKEN"], "secret-token")
+                return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+            with patch("kaggle_dataset_manager.ensure_civitai_cli", return_value="civitai") as ensure, patch(
+                "kaggle_dataset_manager.subprocess.run", side_effect=fake_run
+            ) as run:
+                result = download_with_civitai_cli(
+                    "3139172",
+                    "3019297",
+                    destination,
+                    "secret-token",
+                    expected_size=len(payload),
+                    expected_sha256=expected_hash,
+                )
+
+            self.assertEqual(result, destination)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertFalse(destination.with_name(destination.name + ".part").exists())
+            ensure.assert_called_once_with()
+            command = run.call_args.args[0]
+            self.assertEqual(command[0:4], ["civitai", "download", "3139172", "--file"])
+            self.assertIn("3019297", command)
+            self.assertIn("--out", command)
+            self.assertEqual(Path(command[command.index("--out") + 1]), destination)
+            self.assertNotIn(".part", command[command.index("--out") + 1])
+
+    def test_civitai_cli_error_redacts_token_and_removes_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "model.safetensors"
+
+            def fake_run(*args, **kwargs):
+                partial = destination.with_name(destination.name + ".part")
+                partial.write_bytes(b"partial")
+                return type("Result", (), {"returncode": 1, "stderr": "bad secret-token", "stdout": ""})()
+
+            with patch("kaggle_dataset_manager.ensure_civitai_cli", return_value="civitai"), patch(
+                "kaggle_dataset_manager.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(RuntimeError) as context:
+                    download_with_civitai_cli("1", "2", destination, "secret-token")
+
+            self.assertIn("bad ***REDACTED***", str(context.exception))
+            self.assertNotIn("secret-token", str(context.exception))
+            self.assertTrue(destination.with_name(destination.name + ".part").exists())
+
+    def test_cli_version_is_validated_and_reported(self):
+        with patch("kaggle_dataset_manager.shutil.which", return_value="civitai"), patch(
+            "kaggle_dataset_manager.subprocess.run"
+        ) as run:
+            run.return_value = type("Result", (), {"returncode": 0, "stdout": "civitai v0.1.104", "stderr": ""})()
+            self.assertEqual(kaggle_dataset_manager.ensure_civitai_cli(), "civitai")
+
+        self.assertEqual(run.call_args.args[0], ["civitai", "--version"])
 
     def test_shared_module_has_no_manager_cli_entrypoint(self):
         import kaggle_dataset_manager
