@@ -461,14 +461,21 @@ def download_input_queue(
     input_fn=input,
 ) -> list[DatasetFile]:
     """Fila síncrona AIR/URL para o notebook 02."""
-    queue: list[DatasetFile] = []
+    pending: list[str] = []
     while True:
         value = input_fn("\nAIR/URL (done para finalizar): ").strip()
         if value.lower() == "done":
-            return queue
+            break
         if not value:
             print("[WARN] Entrada vazia")
             continue
+        pending.append(value)
+
+    print(f"[INFO] Lista fechada com {len(pending)} item(ns). Iniciando downloads...")
+    queue: list[DatasetFile] = []
+    total = len(pending)
+    for index, value in enumerate(pending, start=1):
+        print(f"--- [{index}/{total}] {value} ---")
         for info in resolve_civitai_input(value, token, input_fn):
             air = info.get("air") or {}
             resource_type = air.get("type") or info["model"].get("type", "unknown")
@@ -492,6 +499,7 @@ def download_input_queue(
                 continue
             queue.append(item)
             print(f"[{len(queue)}] Download concluído: {item.path}")
+    return queue
 
 
 def kaggle_files(dataset: str) -> list[dict[str, Any]]:
@@ -502,7 +510,7 @@ def kaggle_files(dataset: str) -> list[dict[str, Any]]:
     for line in result.stdout.splitlines():
         parts = line.strip().split()
         if len(parts) >= 2 and parts[0].lower() not in {"name", "file", "files"} and not parts[0].startswith("-"):
-            size = " ".join(parts[1:3]) if len(parts) >= 3 else parts[1]
+            size = parts[1]
             items.append({"path": parts[0], "name": Path(parts[0]).name, "size": size})
     return items
 
@@ -513,9 +521,23 @@ def materialize_dataset_file(dataset: str, dataset_file: str, staging_dir: Path,
     if not destination.exists():
         cache_dir.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Preservando arquivo existente via download seletivo: {dataset_file}")
-        result = subprocess.run(["kaggle", "datasets", "download", dataset, "-f", dataset_file, "-p", str(cache_dir), "--unzip"], capture_output=True, text=True, timeout=7200)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or f"Falha ao preservar {dataset_file}")
+        process = subprocess.Popen(
+            ["kaggle", "datasets", "download", dataset, "-f", dataset_file, "-p", str(cache_dir), "--unzip"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(f"[kaggle] {line.rstrip()}", flush=True)
+            return_code = process.wait(timeout=7200)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise TimeoutError(f"Timeout preservando {dataset_file}")
+        if return_code != 0:
+            raise RuntimeError(f"Falha ao preservar {dataset_file} (exit {return_code})")
         matches = list(cache_dir.rglob(Path(dataset_file).name))
         if len(matches) != 1:
             raise FileNotFoundError(f"Arquivo preservado não localizado: {dataset_file}")
@@ -558,10 +580,27 @@ def publish(dataset: str, staging_dir: Path, notes: str, delete_old_versions: bo
     command = ["kaggle", "datasets", "version", "-p", str(staging_dir), "-m", notes, "-r", "zip"]
     if delete_old_versions:
         command.append("--delete-old-versions")
-    result = subprocess.run(command, capture_output=True, text=True, timeout=7200)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Falha ao publicar Dataset")
-    return result.stdout.strip()
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output: list[str] = []
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            text = line.rstrip()
+            output.append(text)
+            print(f"[kaggle] {text}", flush=True)
+        return_code = process.wait(timeout=7200)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise TimeoutError("Timeout publicando Dataset")
+    if return_code != 0:
+        raise RuntimeError(f"Falha ao publicar Dataset (exit {return_code})")
+    return "\n".join(output).strip()
 
 
 def publish_staged_state(
