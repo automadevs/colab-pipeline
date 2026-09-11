@@ -18,7 +18,35 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-DEFAULT_DATASET = "automamermaid/comfydocs"
+
+def resolve_dataset_name(override: Optional[str] = None) -> str:
+    """Resolve o dataset Kaggle a partir de secrets/env ou override explícito.
+
+    Prioridade:
+    1. ``override`` se fornecido (CLI/parâmetro)
+    2. Montagem dinâmica: f"{KAGGLE_USERNAME}/{KAGGLE_DATASET_NAME}"
+
+    Raises:
+        ValueError: Se nem override nem as variáveis de ambiente estiverem configuradas.
+    """
+    if override:
+        return override
+
+    username = os.environ.get("KAGGLE_USERNAME")
+    dataset_name = os.environ.get("KAGGLE_DATASET_NAME")
+
+    if not username or not dataset_name:
+        raise ValueError(
+            "Dataset Kaggle não resolvido. Configure os secrets/env:\n"
+            "  - KAGGLE_USERNAME: seu username Kaggle\n"
+            "  - KAGGLE_DATASET_NAME: nome do dataset (ex: comfydocs)\n"
+            "Ou passe o dataset explicitamente via --dataset \"owner/nome\"."
+        )
+
+    return f"{username}/{dataset_name}"
+
+
+DEFAULT_DATASET = resolve_dataset_name()
 DEFAULT_STAGING = Path("/content/kaggle_dataset_manager")
 CATEGORIES = (
     "checkpoints", "diffusion_models", "loras", "vae", "text_encoders",

@@ -15,10 +15,38 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def resolve_dataset_name(override: str | None = None) -> str:
+    """Resolve o dataset Kaggle a partir de secrets/env ou override explícito.
+
+    Prioridade:
+    1. ``override`` se fornecido (CLI/parâmetro)
+    2. Montagem dinâmica: f"{KAGGLE_USERNAME}/{KAGGLE_DATASET_NAME}"
+
+    Raises:
+        ValueError: Se nem override nem as variáveis de ambiente estiverem configuradas.
+    """
+    if override:
+        return override
+
+    username = os.environ.get("KAGGLE_USERNAME")
+    dataset_name = os.environ.get("KAGGLE_DATASET_NAME")
+
+    if not username or not dataset_name:
+        raise ValueError(
+            "Dataset Kaggle não resolvido. Configure os secrets/env:\n"
+            "  - KAGGLE_USERNAME: seu username Kaggle\n"
+            "  - KAGGLE_DATASET_NAME: nome do dataset (ex: comfydocs)\n"
+            "Ou passe o dataset explicitamente via --dataset \"owner/nome\"."
+        )
+
+    return f"{username}/{dataset_name}"
+
+
 REPO_URL = "https://github.com/automadevs/colab-pipeline.git"
 REPO_DIR = Path("/content/colab-pipeline")
 SCRIPTS_DIR = REPO_DIR / "scripts"
-DATASET = "automamermaid/comfydocs"
+DATASET = resolve_dataset_name()
 STAGING_DIR = Path("/content/kaggle_staging")
 
 
