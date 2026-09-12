@@ -210,7 +210,12 @@ def validate_civitai_url(value: str) -> Optional[str]:
     return None
 
 
-def classify_civitai_type(resource_type: str, input_fn=input) -> str:
+def classify_civitai_type(resource_type: str, input_fn=input, checkpoint_destination: Optional[str] = None) -> str:
+    """Mapeia o resource_type Civitai para a categoria do dataset.
+
+    Para ``checkpoint``, ``checkpoint_destination`` pré-respondido evita o prompt
+    interativo, permitindo decidir o destino uma única vez por lote.
+    """
     resource_type = str(resource_type or "").lower()
     if resource_type in {"lora", "locon", "dora"}:
         return "loras"
@@ -229,6 +234,8 @@ def classify_civitai_type(resource_type: str, input_fn=input) -> str:
     if resource_type in {"motion_module", "video", "video_model"}:
         return "video_models"
     if resource_type == "checkpoint":
+        if checkpoint_destination:
+            return normalize_category(checkpoint_destination)
         choice = input_fn("Checkpoint: 1=checkpoints/ 2=diffusion_models/: ").strip().lower()
         return normalize_category({"1": "checkpoints", "2": "diffusion_models"}.get(choice, choice))
     print(f"[WARN] Tipo Civitai desconhecido: {resource_type}")
@@ -542,12 +549,8 @@ def download_civitai_file(
     )
 
 
-def download_input_queue(
-    staging_dir: Path,
-    token: str,
-    input_fn=input,
-) -> list[DatasetFile]:
-    """Fila síncrona AIR/URL para o notebook 02."""
+def collect_input_queue(input_fn=input) -> list[str]:
+    """Coleta pura da fila AIR/URL: valida cada entrada até o usuário digitar 'done'."""
     pending: list[str] = []
     while True:
         value = input_fn("\nAIR/URL (done para finalizar): ").strip()
@@ -564,13 +567,22 @@ def download_input_queue(
             print(f"[WARN] Entrada inválida: {error}")
             continue
         pending.append(value)
+    print(f"[INFO] Lista fechada com {len(pending)} item(ns).")
+    return pending
 
-    print(f"[INFO] Lista fechada com {len(pending)} item(ns). Iniciando downloads...")
-    queue: list[DatasetFile] = []
+
+def resolve_queue_metadata(pending: list[str], token: str, input_fn=input) -> list[dict[str, Any]]:
+    """Resolve os metadados Civitai de cada item da fila sem baixar nada.
+
+    Retorna uma entrada por arquivo resolvido, preservando o ``info`` retornado por
+    resolve_civitai_input junto com o ``resource_type``, para que a fase de download
+    não precise chamar a API da Civitai novamente.
+    """
+    resolved: list[dict[str, Any]] = []
     failures = 0
     total = len(pending)
     for index, value in enumerate(pending, start=1):
-        print(f"--- [{index}/{total}] {value} ---")
+        print(f"[INFO] Resolvendo metadados [{index}/{total}]: {value}")
         try:
             infos = resolve_civitai_input(value, token, input_fn)
         except Exception as exc:
@@ -578,36 +590,93 @@ def download_input_queue(
             print(f"[ERROR] Falha ao resolver [{index}/{total}] {value}: {exc}")
             continue
         for info in infos:
-            try:
-                air = info.get("air") or {}
-                resource_type = air.get("type") or info["model"].get("type", "unknown")
-                category = classify_civitai_type(resource_type, input_fn)
-                file_info = info["file"]
-                base_model = air.get("base_model") or info["version"].get("baseModel") or info["model"].get("baseModel")
-                manifest_input = {
-                    **air,
-                    "air": air.get("air") or (value if value.lower().startswith("urn:air:") else None),
-                    "base_model": base_model,
-                }
-                print(
-                    f"Modelo: {info['model'].get('name', 'N/A')} | "
-                    f"versão: {info['version'].get('name', info['version'].get('id'))} | "
-                    f"arquivo: {file_info.get('name', 'N/A')} | "
-                    f"tipo: {resource_type} | base model: {base_model or 'N/A'}"
-                )
-                item = download_civitai_file(info, category, staging_dir, token, source_url=value, air=manifest_input)
-                if any(existing.path == item.path and existing.size == item.size and existing.sha256 == item.sha256 for existing in queue):
-                    print(f"[SKIP] já presente na fila e idêntico: {item.path}")
-                    continue
-                queue.append(item)
-                print(f"[{len(queue)}] Download concluído: {item.path}")
-            except Exception as exc:
-                failures += 1
-                print(f"[ERROR] Download falhou para [{index}/{total}] {value}: {exc}")
+            air = info.get("air") or {}
+            resource_type = air.get("type") or info["model"].get("type", "unknown")
+            resolved.append({
+                "value": value,
+                "index": index,
+                "total": total,
+                "info": info,
+                "resource_type": resource_type,
+            })
+    if failures:
+        print(f"[WARN] Resolução concluída com {failures} falha(s); {len(resolved)} arquivo(s) resolvido(s).")
+    return resolved
+
+
+def queue_contains_checkpoint(resolved: list[dict[str, Any]]) -> bool:
+    """Detecta se há pelo menos um resource_type 'checkpoint' no lote inteiro resolvido."""
+    return any(str(entry.get("resource_type") or "").strip().lower() == "checkpoint" for entry in resolved)
+
+
+def download_resolved_queue(
+    resolved: list[dict[str, Any]],
+    staging_dir: Path,
+    token: str,
+    input_fn=input,
+    checkpoint_destination: Optional[str] = None,
+) -> list[DatasetFile]:
+    """Executa os downloads da fila já resolvida, sem nenhum prompt intermediário.
+
+    ``checkpoint_destination`` é a resposta única do lote para itens do tipo
+    checkpoint; quando None, classify_civitai_type mantém o comportamento
+    interativo por item (compatibilidade).
+    """
+    print("[INFO] Iniciando downloads...")
+    queue: list[DatasetFile] = []
+    failures = 0
+    last_value: Optional[str] = None
+    for entry in resolved:
+        value = entry["value"]
+        if value != last_value:
+            print(f"--- [{entry['index']}/{entry['total']}] {value} ---")
+            last_value = value
+        info = entry["info"]
+        try:
+            air = info.get("air") or {}
+            resource_type = entry["resource_type"]
+            category = classify_civitai_type(resource_type, input_fn, checkpoint_destination=checkpoint_destination)
+            file_info = info["file"]
+            base_model = air.get("base_model") or info["version"].get("baseModel") or info["model"].get("baseModel")
+            manifest_input = {
+                **air,
+                "air": air.get("air") or (value if value.lower().startswith("urn:air:") else None),
+                "base_model": base_model,
+            }
+            print(
+                f"Modelo: {info['model'].get('name', 'N/A')} | "
+                f"versão: {info['version'].get('name', info['version'].get('id'))} | "
+                f"arquivo: {file_info.get('name', 'N/A')} | "
+                f"tipo: {resource_type} | base model: {base_model or 'N/A'}"
+            )
+            item = download_civitai_file(info, category, staging_dir, token, source_url=value, air=manifest_input)
+            if any(existing.path == item.path and existing.size == item.size and existing.sha256 == item.sha256 for existing in queue):
+                print(f"[SKIP] já presente na fila e idêntico: {item.path}")
                 continue
+            queue.append(item)
+            print(f"[{len(queue)}] Download concluído: {item.path}")
+        except Exception as exc:
+            failures += 1
+            print(f"[ERROR] Download falhou para [{entry['index']}/{entry['total']}] {value}: {exc}")
+            continue
     if failures:
         print(f"[WARN] Lote concluído com {failures} falha(s); {len(queue)} arquivo(s) na fila.")
     return queue
+
+
+def download_input_queue(
+    staging_dir: Path,
+    token: str,
+    input_fn=input,
+) -> list[DatasetFile]:
+    """Fila síncrona AIR/URL: encadeia coleta -> resolução -> download.
+
+    Mantida como atalho público equivalente; o orquestrador chama as etapas
+    separadamente para antecipar todas as perguntas interativas.
+    """
+    pending = collect_input_queue(input_fn)
+    resolved = resolve_queue_metadata(pending, token, input_fn)
+    return download_resolved_queue(resolved, staging_dir, token, input_fn)
 
 
 def kaggle_files(dataset: str) -> list[dict[str, Any]]:
@@ -711,12 +780,48 @@ def publish(dataset: str, staging_dir: Path, notes: str, delete_old_versions: bo
     return "\n".join(output).strip()
 
 
+def collect_dataset_edits(dataset: str, input_fn=input) -> list[tuple[str, ...]]:
+    """Coleta edições remove/move sobre o estado atual do dataset remoto, sem aplicá-las.
+
+    Mostra apenas a listagem "DATASET CURRENT" como contexto (os arquivos novos
+    ainda não foram baixados neste ponto) e retorna as operações na ordem digitada:
+    ("remove", path) ou ("move", old, new).
+    """
+    current = parse_current_files(kaggle_files(dataset))
+    print("\nDATASET CURRENT")
+    for item in current.values():
+        print(f"= {item.path} ({format_size(item.size)})")
+
+    edits: list[tuple[str, ...]] = []
+    if input_fn("Você deseja modificar arquivos existentes? [s/N] ").strip().lower() in {"s", "sim", "y", "yes"}:
+        while True:
+            command = input_fn("Comando remove <path>, move <old> <new> ou done: ").strip()
+            if command.lower() == "done":
+                break
+            parts = command.split()
+            if len(parts) == 2 and parts[0].lower() == "remove":
+                edits.append(("remove", parts[1]))
+                print(f"[REMOVE] marcado: {parts[1]}")
+            elif len(parts) == 3 and parts[0].lower() == "move":
+                edits.append(("move", parts[1], parts[2]))
+                print(f"[MOVE] {parts[1]} -> {parts[2]}")
+            else:
+                print("[WARN] Comando inválido")
+    return edits
+
+
 def publish_staged_state(
     dataset: str,
     staging_dir: Path,
     input_fn=input,
+    pending_edits: Iterable[tuple[str, ...]] = (),
 ) -> Optional[str]:
-    """Constrói o estado completo a partir do staging e publica após preview."""
+    """Constrói o estado completo a partir do staging e publica após preview.
+
+    ``pending_edits`` são as operações remove/move coletadas antecipadamente por
+    collect_dataset_edits; são aplicadas aqui sobre o estado desejado já montado
+    (staging + manifest), sem nenhum prompt adicional.
+    """
     staging_dir = Path(staging_dir)
     current = parse_current_files(kaggle_files(dataset))
     desired = dict(current)
@@ -729,36 +834,27 @@ def publish_staged_state(
             file_path = staging_dir / path
             desired[path] = DatasetFile(path, file_path.stat().st_size, sha256_file(file_path))
 
+    for edit in pending_edits:
+        if len(edit) == 2 and edit[0].lower() == "remove":
+            desired.pop(edit[1], None)
+        elif len(edit) == 3 and edit[0].lower() == "move":
+            old, new = edit[1], edit[2]
+            if old not in desired:
+                print(f"[WARN] path inexistente: {old}")
+                continue
+            item = desired.pop(old)
+            desired[new] = DatasetFile(new, item.size, item.sha256, item.source, item.civitai_model_id, item.civitai_version_id, item.civitai_file_id, item.air, item.base_model)
+            source, target = staging_dir / old, staging_dir / new
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source.exists() and not target.exists():
+                shutil.move(str(source), str(target))
+
     print("\nDATASET CURRENT")
     for item in current.values():
         print(f"= {item.path} ({format_size(item.size)})")
     print("\nNEW STAGED FILES")
     for path in sorted(set(desired) - set(current)):
         print(f"+ {path} ({format_size(desired[path].size)})")
-
-    if input_fn("Você deseja modificar arquivos existentes? [s/N] ").strip().lower() in {"s", "sim", "y", "yes"}:
-        while True:
-            command = input_fn("Comando remove <path>, move <old> <new> ou done: ").strip()
-            if command.lower() == "done":
-                break
-            parts = command.split()
-            if len(parts) == 2 and parts[0].lower() == "remove":
-                desired.pop(parts[1], None)
-                print(f"[REMOVE] marcado: {parts[1]}")
-            elif len(parts) == 3 and parts[0].lower() == "move":
-                old, new = parts[1], parts[2]
-                if old not in desired:
-                    print(f"[WARN] path inexistente: {old}")
-                    continue
-                item = desired.pop(old)
-                desired[new] = DatasetFile(new, item.size, item.sha256, item.source, item.civitai_model_id, item.civitai_version_id, item.civitai_file_id, item.air, item.base_model)
-                source, target = staging_dir / old, staging_dir / new
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if source.exists() and not target.exists():
-                    shutil.move(str(source), str(target))
-                print(f"[MOVE] {old} -> {new}")
-            else:
-                print("[WARN] Comando inválido")
 
     for path in list(desired):
         if not (staging_dir / path).exists():

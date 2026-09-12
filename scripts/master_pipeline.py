@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Orquestrador único Colab: setup do repositório -> inspeção -> download sequencial -> publicação.
+"""Orquestrador único Colab: setup do repositório -> inspeção -> coleta/resolução de inputs -> download sequencial -> publicação.
+
+Todas as perguntas interativas (fila AIR/URL, destino único de checkpoints,
+edições remove/move do dataset) acontecem antes de qualquer download; depois o
+pipeline roda sem pausa até o preview final, notas da versão e confirmação de
+publicação.
 
 Uso no Colab (célula única, ver colab_transfer/00_master_pipeline.ipynb):
     !python /content/colab-pipeline/scripts/master_pipeline.py
@@ -104,7 +109,7 @@ def main() -> int:
     print("MASTER PIPELINE: CIVITAI -> KAGGLE DATASET")
     print("=" * 60)
 
-    print("\n[1/4] SETUP DO REPOSITÓRIO")
+    print("\n[1/5] SETUP DO REPOSITÓRIO")
     try:
         setup_repo()
     except Exception as exc:
@@ -112,13 +117,17 @@ def main() -> int:
         return 1
 
     from kaggle_dataset_manager import (
-        download_input_queue,
+        collect_dataset_edits,
+        collect_input_queue,
+        download_resolved_queue,
         get_secret,
         publish_staged_state,
+        queue_contains_checkpoint,
+        resolve_queue_metadata,
         write_manifest,
     )
 
-    print("\n[2/4] INSPEÇÃO DO AMBIENTE")
+    print("\n[2/5] INSPEÇÃO DO AMBIENTE")
     inspect_environment()
     token = get_secret("CIVITAI_TOKEN") or get_secret("CIVITAI_API_KEY")
     if not token:
@@ -130,18 +139,37 @@ def main() -> int:
         return 1
     print("Kaggle auth: configurado")
 
-    print("\n[3/4] DOWNLOAD SEQUENCIAL (Civitai)")
+    print("\n[3/5] COLETA E RESOLUÇÃO DE INPUTS")
+    pending = collect_input_queue()
+    resolved = resolve_queue_metadata(pending, token)
+    if not resolved:
+        print("[ERROR] Nenhum item válido resolvido; nada a publicar.")
+        return 1
+
+    checkpoint_destination = None
+    if queue_contains_checkpoint(resolved):
+        choice = input("Checkpoint: 1=checkpoints/ 2=diffusion_models/: ").strip().lower()
+        checkpoint_destination = {"1": "checkpoints", "2": "diffusion_models"}.get(choice, choice)
+        print(f"[INFO] Destino de checkpoints do lote: {checkpoint_destination}")
+
+    try:
+        pending_edits = collect_dataset_edits(DATASET)
+    except Exception as exc:
+        print(f"[WARN] Não foi possível consultar o dataset remoto para edições: {exc}")
+        pending_edits = []
+
+    print("\n[4/5] DOWNLOAD SEQUENCIAL (Civitai)")
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    items = download_input_queue(STAGING_DIR, token)
+    items = download_resolved_queue(resolved, STAGING_DIR, token, checkpoint_destination=checkpoint_destination)
     if not items:
         print("[ERROR] Nenhum arquivo novo no staging; nada a publicar.")
         return 1
     write_manifest(STAGING_DIR / "dataset-manifest.json", DATASET, {item.path: item for item in items})
     print(f"[INFO] {len(items)} arquivo(s) prontos no staging: {STAGING_DIR}")
 
-    print("\n[4/4] PUBLICAÇÃO NO KAGGLE")
+    print("\n[5/5] PUBLICAÇÃO NO KAGGLE")
     try:
-        result = publish_staged_state(DATASET, STAGING_DIR)
+        result = publish_staged_state(DATASET, STAGING_DIR, pending_edits=pending_edits)
     except Exception as exc:
         print(f"[WARN] Publicação via Kaggle CLI falhou: {exc}")
         print("[INFO] Tentando fallback via kagglehub...")

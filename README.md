@@ -127,9 +127,9 @@ O `08_master_pipeline.ipynb`:
 Não existe um notebook separado de Dataset Manager. O fluxo operacional é o orquestrador único:
 
 - `colab_transfer/00_master_pipeline.ipynb`: célula única que executa `scripts/master_pipeline.py`.
-- `scripts/master_pipeline.py`: faz o setup do repositório (`git pull --ff-only` ou clone `--depth 1`), inspeciona o ambiente (Python, Kaggle CLI, Civitai CLI, secrets), executa a fila de downloads e publica.
-- `download_input_queue()` (em `kaggle_dataset_manager.py`): coleta todos os AIRs/URLs primeiro (validando cada entrada com `validate_air`/`validate_civitai_url`, sem interromper o loop em caso de erro), e só depois baixa sequencialmente — um arquivo por vez, com retry automático (`@retry`, 3 tentativas, backoff 2s→4s) em erros transitórios de rede. Falha permanente em um item é logada e o lote continua.
-- `publish_staged_state()`: consulta o estado atual, permite `remove`/`move`, monta o estado completo, mostra preview e publica somente após confirmação. Se a CLI falhar, o orquestrador faz fallback automático para `kagglehub.dataset_upload`.
+- `scripts/master_pipeline.py`: faz o setup do repositório (`git pull --ff-only` ou clone `--depth 1`), inspeciona o ambiente (Python, Kaggle CLI, Civitai CLI, secrets), coleta e resolve todos os inputs (com todas as perguntas interativas antecipadas), executa a fila de downloads sem pausas e publica.
+- `collect_input_queue()` + `resolve_queue_metadata()` + `download_resolved_queue()` (em `kaggle_dataset_manager.py`): coletam todos os AIRs/URLs primeiro (validando cada entrada com `validate_air`/`validate_civitai_url`, sem interromper o loop em caso de erro), resolvem os metadados Civitai de todo o lote (o destino de checkpoints é perguntado uma única vez por lote, se houver algum) e só depois baixam sequencialmente — um arquivo por vez, com retry automático (`@retry`, 3 tentativas, backoff 2s→4s) em erros transitórios de rede. Falha permanente em um item é logada e o lote continua.
+- `collect_dataset_edits()` + `publish_staged_state()`: as edições `remove`/`move` sobre o estado atual do dataset são coletadas antes dos downloads; `publish_staged_state()` aplica as edições coletadas, monta o estado completo, mostra o preview e publica somente após confirmação. Se a CLI falhar, o orquestrador faz fallback automático para `kagglehub.dataset_upload`.
 
 `scripts/kaggle_dataset_manager.py` fornece somente os helpers compartilhados de AIR, Civitai, SHA256, manifest, preview e publicação. Ele não é importado por nenhum runtime Kaggle.
 

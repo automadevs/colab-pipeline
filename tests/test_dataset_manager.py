@@ -13,8 +13,10 @@ from kaggle_dataset_manager import (
     CATEGORIES,
     DatasetFile,
     build_dataset_path,
+    collect_dataset_edits,
     compare_states,
     download_input_queue,
+    download_resolved_queue,
     format_size,
     manifest_payload,
     parse_current_files,
@@ -23,6 +25,8 @@ from kaggle_dataset_manager import (
     classify_civitai_type,
     parse_size,
     publish,
+    publish_staged_state,
+    queue_contains_checkpoint,
     render_preview,
     retry,
     validate_air,
@@ -299,8 +303,8 @@ class DatasetManagerTests(unittest.TestCase):
             events,
             [
                 f"resolve:{entries[0]}",
-                f"download:{entries[0]}",
                 f"resolve:{entries[1]}",
+                f"download:{entries[0]}",
                 f"download:{entries[1]}",
             ],
         )
@@ -331,6 +335,112 @@ class DatasetManagerTests(unittest.TestCase):
 
         self.assertEqual(len(queue), 1)
         self.assertEqual(queue[0].path, "loras/ok.safetensors")
+
+    def test_classify_checkpoint_with_preset_destination_skips_prompt(self):
+        def boom(prompt=""):
+            raise AssertionError(f"input_fn não deve ser chamado: {prompt}")
+
+        self.assertEqual(
+            classify_civitai_type("checkpoint", input_fn=boom, checkpoint_destination="diffusion_models"),
+            "diffusion_models",
+        )
+        self.assertEqual(
+            classify_civitai_type("checkpoint", input_fn=boom, checkpoint_destination="checkpoints"),
+            "checkpoints",
+        )
+
+    def test_queue_contains_checkpoint(self):
+        self.assertTrue(queue_contains_checkpoint([{"resource_type": "lora"}, {"resource_type": "Checkpoint"}]))
+        self.assertTrue(queue_contains_checkpoint([{"resource_type": "checkpoint"}]))
+        self.assertFalse(queue_contains_checkpoint([{"resource_type": "lora"}]))
+        self.assertFalse(queue_contains_checkpoint([]))
+
+    def test_download_resolved_queue_with_preset_checkpoint_has_no_prompts(self):
+        entry = {
+            "value": "urn:air:sdxl:checkpoint:civitai:1@2",
+            "index": 1,
+            "total": 1,
+            "info": {
+                "model": {"type": "Checkpoint", "name": "m"},
+                "version": {"id": 2, "name": "v", "baseModel": "sdxl"},
+                "file": {"id": 5, "name": "f.safetensors"},
+                "model_id": "1",
+                "air": {"air": "urn:air:sdxl:checkpoint:civitai:1@2", "type": "checkpoint", "base_model": "sdxl"},
+            },
+            "resource_type": "checkpoint",
+        }
+
+        def fake_download(info, category, staging_dir, token, source_url=None, air=None):
+            return DatasetFile(f"{category}/f.safetensors", 1, "hash")
+
+        def boom(prompt=""):
+            raise AssertionError(f"nenhum prompt pode ocorrer durante o download: {prompt}")
+
+        with patch.object(kaggle_dataset_manager, "download_civitai_file", side_effect=fake_download):
+            queue = download_resolved_queue(
+                [entry], Path("/tmp"), "token", input_fn=boom, checkpoint_destination="diffusion_models"
+            )
+
+        self.assertEqual([item.path for item in queue], ["diffusion_models/f.safetensors"])
+
+    def test_collect_dataset_edits_collects_without_applying(self):
+        inputs = iter(["s", "remove checkpoints/old.safetensors", "move a.safetensors b.safetensors", "bogus a b", "done"])
+        with patch.object(
+            kaggle_dataset_manager,
+            "kaggle_files",
+            return_value=[{"path": "checkpoints/old.safetensors", "size": "100 B"}],
+        ):
+            edits = collect_dataset_edits("owner/dataset", input_fn=lambda prompt="": next(inputs))
+        self.assertEqual(
+            edits,
+            [("remove", "checkpoints/old.safetensors"), ("move", "a.safetensors", "b.safetensors")],
+        )
+
+    def test_collect_dataset_edits_declined_returns_empty(self):
+        with patch.object(
+            kaggle_dataset_manager,
+            "kaggle_files",
+            return_value=[{"path": "checkpoints/old.safetensors", "size": "100 B"}],
+        ):
+            edits = collect_dataset_edits("owner/dataset", input_fn=lambda prompt="": "n")
+        self.assertEqual(edits, [])
+
+    def test_publish_applies_pending_edits_without_prompting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp)
+            new_file = staging / "loras" / "new.safetensors"
+            new_file.parent.mkdir(parents=True)
+            new_file.write_bytes(b"abc")
+            prompts = []
+
+            def fake_input(prompt=""):
+                prompts.append(prompt)
+                if "modificar" in prompt:
+                    raise AssertionError("pergunta de edição não deve ocorrer em publish_staged_state")
+                if "Publicar" in prompt:
+                    return "n"
+                return ""
+
+            edits = [
+                ("remove", "checkpoints/old.safetensors"),
+                ("move", "loras/new.safetensors", "loras/renamed.safetensors"),
+            ]
+            with patch.object(
+                kaggle_dataset_manager,
+                "kaggle_files",
+                return_value=[{"path": "checkpoints/old.safetensors", "size": "100 B"}],
+            ), patch.object(kaggle_dataset_manager, "publish", return_value="ok") as pub:
+                result = publish_staged_state("owner/dataset", staging, input_fn=fake_input, pending_edits=edits)
+
+            self.assertIsNone(result)
+            pub.assert_not_called()
+            self.assertFalse((staging / "loras" / "new.safetensors").exists())
+            self.assertTrue((staging / "loras" / "renamed.safetensors").exists())
+            manifest = json.loads((staging / "dataset-manifest.json").read_text())
+            paths = [entry["path"] for entry in manifest["files"]]
+            self.assertIn("loras/renamed.safetensors", paths)
+            self.assertNotIn("checkpoints/old.safetensors", paths)
+            self.assertFalse(any("modificar" in prompt for prompt in prompts))
 
 
 if __name__ == "__main__":
