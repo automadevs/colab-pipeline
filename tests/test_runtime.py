@@ -61,6 +61,9 @@ class RuntimeContractTests(unittest.TestCase):
                 self.assertEqual(node_path.name, "comfyui-krea2edit")
                 self.assertIn("clone", run.call_args.args[0])
 
+                node_path.mkdir(parents=True, exist_ok=True)
+                (node_path / ".git").mkdir()
+
                 run.reset_mock()
                 comfyui_setup.install_or_update_custom_node(
                     custom_dir, "lbouaraba/comfyui-krea2edit"
