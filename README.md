@@ -117,10 +117,9 @@ O `08_master_pipeline.ipynb`:
 2. Detecta e valida GPU NVIDIA e VRAM disponível.
 3. Testa conexão com o Google Drive para persistência/backup.
 4. Instala ComfyUI e custom nodes com output configurado no SSD local (`/kaggle/working/ComfyUI/output`).
-5. Lista os modelos com nome, categoria/path e tamanho e aguarda uma seleção síncrona via `input()`.
-6. Baixa somente os modelos selecionados para o SSD local.
-7. Inicia ComfyUI em background gerando no SSD local e valida via health check (`:8188/system_stats`).
-8. Oferece push inicial condicional de outputs/logs se já existirem arquivos locais.
+5. Valida que o Dataset `montesinha/backstage` está anexado como Input do notebook (`/kaggle/input/<slug>`) e registra esse caminho no `extra_model_paths.yaml` do ComfyUI — sem download.
+6. Inicia ComfyUI em background gerando no SSD local e valida via health check (`:8188/system_stats`).
+7. Oferece push inicial condicional de outputs/logs se já existirem arquivos locais.
 
 ## Administração integrada ao fluxo Colab
 

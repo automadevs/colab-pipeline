@@ -184,6 +184,35 @@ def install_manager_requirements(comfyui_dir: Path) -> bool:
     return True
 
 
+def build_extra_model_paths_yaml(models_dir: Path, additional_roots: Optional[list[tuple[str, Path]]] = None) -> str:
+    """Gera o conteúdo do extra_model_paths.yaml.
+    
+    Args:
+        models_dir: Diretório base local gravável (kaggle_models)
+        additional_roots: Lista de (nome_secao, caminho_raiz) para raízes adicionais
+                        (ex.: mount do Dataset em /kaggle/input/<slug>)
+    
+    Returns:
+        String YAML completa
+    """
+    lines = ["kaggle_models:", f"  base_path: {models_dir}"]
+    for cat in MODEL_CATEGORIES:
+        lines.append(f"  {cat}: {cat}")
+
+    if additional_roots:
+        for name, root in additional_roots:
+            root_path = Path(root)
+            if not root_path.is_dir():
+                print(f"[WARN] Raiz adicional '{name}' não existe ou não é diretório: {root}. Pulando.")
+                continue
+            lines.append(f"{name}:")
+            lines.append(f"  base_path: {root_path}")
+            for cat in MODEL_CATEGORIES:
+                lines.append(f"  {cat}: {cat}")
+
+    return "\n".join(lines) + "\n"
+
+
 def setup_comfyui(
     comfyui_dir=DEFAULT_COMFYUI_DIR,
     repo_url=DEFAULT_REPO_URL,
@@ -192,6 +221,7 @@ def setup_comfyui(
     output_dir=None,
     drive_base=DEFAULT_DRIVE_BASE,
     enable_manager: bool = True,
+    additional_model_roots: Optional[list[tuple[str, Path]]] = None,
 ):
     comfyui_dir = Path(comfyui_dir)
     models_dir = Path(models_dir) if models_dir else comfyui_dir / "models"
@@ -247,12 +277,9 @@ def setup_comfyui(
             install_or_update_custom_node(custom_dir, spec)
 
     extra_paths = comfyui_dir / "extra_model_paths.yaml"
-    if not extra_paths.exists():
-        lines = ["kaggle_models:", f"  base_path: {models_dir}"]
-        for cat in MODEL_CATEGORIES:
-            lines.append(f"  {cat}: {cat}")
-        extra_paths.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        print(f"[INFO] Criado {extra_paths}")
+    yaml_content = build_extra_model_paths_yaml(models_dir, additional_model_roots)
+    extra_paths.write_text(yaml_content, encoding="utf-8")
+    print(f"[INFO] (Re)escrito {extra_paths}")
 
     print(f"[INFO] ComfyUI: {comfyui_dir}")
     print(f"[INFO] Models: {models_dir}")
