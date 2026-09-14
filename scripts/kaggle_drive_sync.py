@@ -72,6 +72,8 @@ def setup_rclone_kaggle() -> bool:
 
     sa_path = Path("/root/gdrive_sa.json")
     sa_path.write_text(sa_json)
+    # Permissão restrita: só root pode ler
+    os.chmod(sa_path, 0o600)
 
     rclone_conf.parent.mkdir(parents=True, exist_ok=True)
     config_content = f"""[gdrive]
@@ -80,8 +82,25 @@ scope = drive
 service_account_file = {sa_path}
 """
     rclone_conf.write_text(config_content)
+    os.chmod(rclone_conf, 0o600)
     print("[INFO] rclone configurado com service account")
     return True
+
+
+def cleanup_rclone_credentials() -> None:
+    """
+    Apaga service account JSON e rclone config após o Drive ter sido montado.
+    Idempotente: não falha se os arquivos já não existirem.
+    SEGURANÇA: credenciais não devem permanecer em disco após uso.
+    """
+    sa_path = Path("/root/gdrive_sa.json")
+    rclone_conf = Path("/root/.config/rclone/rclone.conf")
+    for p in (sa_path, rclone_conf):
+        if p.exists():
+            p.unlink()
+            print(f"[SECURITY] Credencial removida: {p}")
+        else:
+            print(f"[INFO] Credencial já não existe: {p}")
 
 
 def mount_drive_colab(drive_base: str = DEFAULT_DRIVE_BASE) -> Path:
@@ -458,6 +477,17 @@ def sync_outputs(
         selected_categories = categories or ["workflows"]
     else:
         raise ValueError(f"Ação inválida: '{action}'. Use 'push' ou 'pull'.")
+
+    # GUARDRAIL DE SEGURANÇA: /dev/shm NUNCA deve ser sincronizado com o Drive.
+    # Imagens voláteis em tmpfs são zero-persistent por design — não devem ser copiadas.
+    _shm_dirs = [local_outputs, local_workflows, local_logs, local_metadata]
+    for _d in _shm_dirs:
+        if str(_d).startswith("/dev/shm"):
+            raise ValueError(
+                f"SECURITY: Tentativa de sincronizar {_d} (em /dev/shm) com Google Drive. "
+                "Diretórios tmpfs nunca devem ser sincronizados — passariam imagens "
+                "voláteis para persistência externa. Use os paths de /kaggle/working para Drive sync."
+            )
 
     print(f"[INFO] === SYNC GOOGLE DRIVE ({action.upper()}) ===")
     print(f"[INFO] Ambiente: {env or detect_env()}")

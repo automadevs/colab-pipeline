@@ -1,0 +1,101 @@
+# Evidências e dados sensíveis — NUNCA versionar
+provas/
+
+# Kiro Crew (ferramenta de desenvolvimento local)
+.kiro/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Logs
+*.log
+*.log.*
+
+# Secrets e credenciais — NUNCA versionar
+.env
+.env.*
+*.env
+kaggle.json
+gdrive_sa.json
+rclone.conf
+ngrok.yml
+ngrok.yaml
+service_account*.json
+*_credentials.json
+*_key.json
+cookies*.json
+*cookies*.json
+
+# Arquivos de sessão e tokens
+*.token
+*.access_token
+*.refresh_token
+authtoken*
+
+# Outputs de geração (imagens, vídeos) — nunca devem estar no repo
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.mp4
+*.webm
+*.avi
+*.mov
+
+# Archives e artefatos de download
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+output_secure.zip
+
+# Cache e temporários
+.cache/
+tmp/
+temp/
+*.tmp
+*.temp
+*.swp
+*~
+
+# Jupyter/IPython checkpoints
+.ipynb_checkpoints/
+
+# Modelos (binários grandes — não devem ser commitados)
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+
+# Datasets e staging locais
+kaggle_staging/
+/content/
+
+# Node modules (testes .mjs)
+node_modules/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
