@@ -89,6 +89,9 @@ def start_ngrok_tunnel(
 
     Sempre chama ngrok.kill() antes de conectar.
     Retorna public_url. Nunca imprime o token.
+
+    AVISO: ngrok cria exposição externa. O token vem de Kaggle Secrets.
+    Em SECURE_MODE, o pipeline garante que health_check() passou antes de chamar esta função.
     """
     token = authtoken or resolve_ngrok_authtoken()
     if not token:

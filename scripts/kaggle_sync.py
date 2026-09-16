@@ -48,6 +48,30 @@ MODEL_CATEGORIES = [
     "checkpoints", "diffusion_models", "loras", "vae", "text_encoders",
     "clip", "controlnet", "upscale_models", "video_models", "embeddings",
 ]
+SECURE_MODE = os.environ.get("SECURE_MODE", "0") == "1"
+
+SENSITIVE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+SENSITIVE_ARCHIVES = {".zip", ".7z", ".rar", ".tar", ".gz"}
+
+
+def _is_sensitive(filepath: Path) -> bool:
+    return filepath.suffix.lower() in SENSITIVE_EXTENSIONS | SENSITIVE_ARCHIVES
+
+
+def _shm_temp_dir(prefix: str = "kaggle_sync_") -> Path:
+    """Retorna /dev/shm para temp dir em SECURE_MODE, senão /tmp."""
+    if SECURE_MODE:
+        return Path("/dev/shm")
+    return Path(tempfile.gettempdir())
+
+
+def _validate_temp_path(path: Path, label: str = "temp") -> None:
+    """Valida que path temporário de imagem/archive está em /dev/shm."""
+    if SECURE_MODE and _is_sensitive(Path(path)):
+        if not str(path).startswith("/dev/shm"):
+            raise ValueError(
+                f"SECURITY: {label} com extensão sensível fora de /dev/shm: {path}"
+            )
 
 
 def parse_model_selection(selection: str, candidate_paths: list[str]) -> list[str]:
@@ -313,8 +337,10 @@ def sync_dataset_to_local(
                 stats["details"].append({"file": filename, "path": dataset_file, "status": "skipped", "size_gb": size_gb, "category": category})
                 continue
 
-            with tempfile.TemporaryDirectory(prefix="kaggle_sync_") as tmp:
+            tmp_base = _shm_temp_dir()
+            with tempfile.TemporaryDirectory(dir=str(tmp_base), prefix="kaggle_sync_") as tmp:
                 src = download_selected_file(dataset, dataset_file, Path(tmp))
+                _validate_temp_path(src, f"download/{filename}")
                 size_gb = src.stat().st_size / (1024 ** 3)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 print(f"[INFO] Baixando {filename} -> {category}/ ({size_gb:.2f} GB)")

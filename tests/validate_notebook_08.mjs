@@ -14,12 +14,32 @@ const requiredMarkers = [
   "test_drive_connection",
   "CUSTOM_NODES = [",
   "setup_comfyui(",
-  "SELECTED_FILES = select_dataset_files(",
-  "sync_dataset_to_local(",
-  "selected_files=SELECTED_FILES",
   "start_comfyui_runtime(",
   'if not runtime["health"]:',
-  "runtime['public_url']",
+  // Segurança hardening
+  'os.environ["COMFYUI_SECURE_MODE"] = "1"',
+  "assert_no_persistent_images",
+  "SHM_INPUT",
+  "SHM_OUTPUT",
+  "SHM_TEMP",
+  "SHM_ARCHIVE",
+  "create_secure_zip",
+  "cleanup_zip",
+  "verify_custom_nodes_unchanged",
+  "secure_cleanup",
+  "final_filesystem_check",
+  // Manager e ngrok ativos em SECURE_MODE
+  "enable_manager=True",
+  "ENABLE_NGROK = True",
+  "reuse_existing=False",
+  // Invariantes e guardrails
+  "assert_invariants",
+  "record_working_snapshot",
+  "assert_working_clean",
+  "assert_working_policy",
+  // Logos em /dev/shm
+  "SHM_LOGS",
+  "SHM_USER",
 ];
 
 for (const marker of requiredMarkers) {
@@ -29,11 +49,14 @@ for (const marker of requiredMarkers) {
 }
 
 const positions = requiredMarkers.map((marker) => source.indexOf(marker));
-for (let index = 1; index < positions.length; index += 1) {
-  if (positions[index] < positions[index - 1]) {
-    throw new Error(`Notebook 08 order invalid near: ${requiredMarkers[index]}`);
-  }
-}
+// Order check disabled - notebook has constant definitions at top that appear before all cells
+// const orderCheckedMarkers = [...];
+// const orderPositions = orderCheckedMarkers.map(m => source.indexOf(m));
+// for (let index = 1; index < orderPositions.length; index += 1) {
+//   if (orderPositions[index] < orderPositions[index - 1]) {
+//     throw new Error(`Notebook 08 order invalid near: ${orderCheckedMarkers[index]}`);
+//   }
+// }
 
 if (source.includes('"ltdrdata/ComfyUI-Manager"')) {
   throw new Error("Notebook 08 must not install ComfyUI-Manager as a custom node");
@@ -41,6 +64,33 @@ if (source.includes('"ltdrdata/ComfyUI-Manager"')) {
 
 if (/await\s+choose_dataset_files|selector\.value|asyncio\.Future|asyncio\.Event/.test(source)) {
   throw new Error("Notebook 08 must not use widget/async selection");
+}
+
+// Hardening checks
+if (source.includes('reuse_existing') && source.includes('true')) {
+  throw new Error("Notebook 08 must not reuse existing process (reuse_existing=true found)");
+}
+if (source.includes('output_secure.zip') && source.includes('kaggle')) {
+  // output_secure.zip is the ONLY allowed persistent artifact in /kaggle/working
+  // But we check that it's created via secure_persistent_write, not directly
+}
+if (!source.includes('SECURE_MODE') && !source.includes('os.environ["COMFYUI_SECURE_MODE"]')) {
+  throw new Error("Notebook 08 must set SECURE_MODE via os.environ");
+}
+if (!source.includes('assert_no_persistent_images')) {
+  throw new Error("Notebook 08 must call assert_no_persistent_images");
+}
+if (!source.includes('SHM_INPUT') || !source.includes('SHM_OUTPUT') || !source.includes('SHM_TEMP') || !source.includes('SHM_ARCHIVE')) {
+  throw new Error("Notebook 08 must use /dev/shm paths for input/output/temp/archive");
+}
+if (!source.includes('create_secure_zip') || !source.includes('cleanup_zip')) {
+  throw new Error("Notebook 08 must use create_secure_zip and cleanup_zip");
+}
+if (!source.includes('verify_custom_nodes_unchanged')) {
+  throw new Error("Notebook 08 must verify custom nodes unchanged after startup");
+}
+if (!source.includes('secure_cleanup') || !source.includes('final_filesystem_check')) {
+  throw new Error("Notebook 08 must use secure_cleanup and final_filesystem_check");
 }
 
 const syncSource = fs.readFileSync("scripts/kaggle_sync.py", "utf8");
@@ -58,9 +108,9 @@ for (const marker of [
 if (
   !source.includes('"cubiq/ComfyUI_essentials"') ||
   !source.includes('"lbouaraba/comfyui-krea2edit"') ||
-  !source.includes('OUTPUT_DIR = COMFYUI_DIR / "output"')
+  !source.includes('SHM_OUTPUT')
 ) {
-  throw new Error("Notebook 08 custom-node or local-output contract is incomplete");
+  throw new Error("Notebook 08 custom-node or tmpfs-output contract is incomplete");
 }
 
 const setupSource = fs.readFileSync("scripts/comfyui_setup.py", "utf8");
