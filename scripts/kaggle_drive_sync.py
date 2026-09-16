@@ -16,12 +16,28 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 DEFAULT_DRIVE_BASE = "Automa/ComfyUI"
-DEFAULT_LOCAL_OUTPUTS = Path("/kaggle/working/ComfyUI/output")
-DEFAULT_LOCAL_WORKFLOWS = Path("/kaggle/working/ComfyUI/user/default/workflows")
-DEFAULT_LOCAL_LOGS = Path("/kaggle/working/ComfyUI")
-DEFAULT_LOCAL_METADATA = Path("/kaggle/working/ComfyUI/metadata")
+DEFAULT_LOCAL_OUTPUTS = Path("/dev/shm/comfy_ui_output")
+DEFAULT_LOCAL_WORKFLOWS = Path("/dev/shm/comfy_ui_user/default/workflows")
+DEFAULT_LOCAL_LOGS = Path("/dev/shm/comfy_ui_logs")
+DEFAULT_LOCAL_METADATA = Path("/dev/shm/comfy_ui_user/metadata")
+
+# Drive mount point e cache em /dev/shm (tmpfs) — nunca em /kaggle/working
+DRIVE_MOUNT_POINT = Path("/dev/shm/gdrive")
+DRIVE_VFS_CACHE = Path("/dev/shm/rclone_vfs_cache")
 
 CHUNK_SIZE = 1024 * 1024  # 1 MB chunk streaming
+
+SECURE_MODE = os.environ.get("SECURE_MODE", "0") == "1"
+
+
+def _is_image_file(filepath: Path) -> bool:
+    """Verifica se o arquivo é uma imagem pela extensão."""
+    return filepath.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+
+
+def _is_zip_or_archive(filepath: Path) -> bool:
+    """Verifica se o arquivo é um ZIP/archive pela extensão."""
+    return filepath.suffix.lower() in {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2"}
 
 
 def detect_env() -> str:
@@ -66,12 +82,14 @@ def setup_rclone_kaggle() -> bool:
         sa_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
 
     if not sa_json:
-        print("[WARN] GDRIVE_SERVICE_ACCOUNT_JSON não encontrado nos Secrets/env")
+        print("[WARN] Credencial de service account não encontrada nos Secrets/env")
         print("       Configure no Kaggle: Secrets → GDRIVE_SERVICE_ACCOUNT_JSON")
         return False
 
     sa_path = Path("/root/gdrive_sa.json")
     sa_path.write_text(sa_json)
+    # Permissão restrita: só root pode ler
+    os.chmod(sa_path, 0o600)
 
     rclone_conf.parent.mkdir(parents=True, exist_ok=True)
     config_content = f"""[gdrive]
@@ -80,8 +98,25 @@ scope = drive
 service_account_file = {sa_path}
 """
     rclone_conf.write_text(config_content)
+    os.chmod(rclone_conf, 0o600)
     print("[INFO] rclone configurado com service account")
     return True
+
+
+def cleanup_rclone_credentials() -> None:
+    """
+    Apaga service account JSON e rclone config após o Drive ter sido montado.
+    Idempotente: não falha se os arquivos já não existirem.
+    SEGURANÇA: credenciais não devem permanecer em disco após uso.
+    """
+    sa_path = Path("/root/gdrive_sa.json")
+    rclone_conf = Path("/root/.config/rclone/rclone.conf")
+    for p in (sa_path, rclone_conf):
+        if p.exists():
+            p.unlink()
+            print("[SECURITY] Credencial removida")
+        else:
+            print("[INFO] Credencial já não existe")
 
 
 def mount_drive_colab(drive_base: str = DEFAULT_DRIVE_BASE) -> Path:
@@ -99,7 +134,7 @@ def mount_drive_colab(drive_base: str = DEFAULT_DRIVE_BASE) -> Path:
 
 def get_drive_path_kaggle(drive_base: str = DEFAULT_DRIVE_BASE) -> Path:
     """Retorna path montado via rclone no Kaggle."""
-    mount_point = Path("/kaggle/working/gdrive")
+    mount_point = DRIVE_MOUNT_POINT
     mount_point.mkdir(parents=True, exist_ok=True)
 
     # Verificar se já montado
@@ -196,6 +231,7 @@ def _sync_directory(
     dst_dir: Path,
     category: str,
     patterns: Optional[List[str]] = None,
+    block_images: bool = False,
 ) -> Dict[str, Any]:
     """
     Sincroniza arquivos de src_dir para dst_dir de forma estritamente idempotente.
@@ -229,6 +265,10 @@ def _sync_directory(
                     matched = any(item.match(p) for p in patterns)
                     if not matched:
                         continue
+                if block_images and (
+                    _is_image_file(item) or _is_zip_or_archive(item)
+                ):
+                    continue
                 files_to_process.append(item)
     except Exception as e:
         stats["errors"] += 1
@@ -359,7 +399,7 @@ def _resolve_paths(
         "outputs": {
             "local": local_outputs,
             "drive": drive_path / "outputs",
-            "patterns": ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.mp4", "*.webm", "*.gif", "*.json"],
+            "patterns": ["*.mp4", "*.webm", "*.json"],
         },
         "workflows": {
             "local": wf_local,
@@ -390,6 +430,7 @@ def sync_category(
     env: Optional[str] = None,
     patterns: Optional[List[str]] = None,
     drive_path: Optional[Path] = None,
+    block_images: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Sincroniza uma categoria individual em 'push' (local -> Drive) ou 'pull' (Drive -> local).
@@ -408,6 +449,11 @@ def sync_category(
     cat_cfg = mapping[category]
 
     use_patterns = patterns or cat_cfg["patterns"]
+
+    if block_images is None:
+        block_imgs = (action == "push" and category == "outputs")
+    else:
+        block_imgs = block_images
 
     if action == "push":
         src = cat_cfg["local"]
@@ -429,7 +475,7 @@ def sync_category(
             "message": f"Diretório de origem não existe: {src}",
         }
 
-    stats = _sync_directory(src, dst, category=category, patterns=use_patterns)
+    stats = _sync_directory(src, dst, category=category, patterns=use_patterns, block_images=block_imgs)
     stats["action"] = action
     return stats
 
@@ -459,6 +505,20 @@ def sync_outputs(
     else:
         raise ValueError(f"Ação inválida: '{action}'. Use 'push' ou 'pull'.")
 
+    if SECURE_MODE:
+        print("[SECURITY] SECURE_MODE=True: bloqueando sync de imagens/archives ZIP para Drive")
+
+    # GUARDRAIL DE SEGURANÇA: /dev/shm/comfy_ui_output NUNCA deve ser sincronizado
+    # com o Drive. Imagens voláteis em tmpfs são zero-persistent por design.
+    # Logs, workflows e metadata em /dev/shm são seguros para sync (não são imagens)
+    # pois o filtro block_images já bloqueia qualquer arquivo de imagem.
+    if str(local_outputs).startswith("/dev/shm"):
+        raise ValueError(
+            f"SECURITY: Tentativa de sincronizar outputs ({local_outputs}) em /dev/shm "
+            "com Google Drive. Outputs tmpfs nunca devem ser sincronizados — "
+            "passariam imagens voláteis para persistência externa."
+        )
+
     print(f"[INFO] === SYNC GOOGLE DRIVE ({action.upper()}) ===")
     print(f"[INFO] Ambiente: {env or detect_env()}")
     print(f"[INFO] Categorias selecionadas: {selected_categories}")
@@ -486,6 +546,7 @@ def sync_outputs(
             env=env,
             patterns=patterns,
             drive_path=drive_path,
+            block_images=SECURE_MODE,
         )
         total_stats["synced"] += res["synced"]
         total_stats["skipped"] += res["skipped"]
@@ -545,6 +606,8 @@ def main():
     except Exception as e:
         print(f"\n[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        cleanup_rclone_credentials()
 
 
 if __name__ == "__main__":

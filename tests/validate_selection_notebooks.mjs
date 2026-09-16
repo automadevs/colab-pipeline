@@ -3,7 +3,7 @@ import fs from "node:fs";
 const notebooks = [
   "kaggle_runtime/05_download_to_local.ipynb",
   "kaggle_runtime/07_sync_robust.ipynb",
-  "kaggle_runtime/08_master_pipeline.ipynb",
+  // 08_master_pipeline.ipynb validates mounted dataset input, not selection
 ];
 
 for (const notebookPath of notebooks) {

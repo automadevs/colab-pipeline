@@ -14,6 +14,39 @@ DEFAULT_MODEL_NAME = "lustifyNSFWCheckpoint_v10Krea2.safetensors"
 DEFAULT_MODEL_VERSION_ID = "3112728"
 DEFAULT_FILE_ID = "2997637"
 EXPECTED_GB = 11.94
+SECURE_MODE = os.environ.get("SECURE_MODE", "0") == "1"
+
+SENSITIVE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+SENSITIVE_ARCHIVES = {".zip", ".7z", ".rar", ".tar", ".gz"}
+
+
+def _validate_staging_dir(staging_dir: Path) -> None:
+    """Valida que staging não é path persistente de imagem/archive.
+
+    Em SECURE_MODE, staging deve estar em /dev/shm.
+    """
+    if SECURE_MODE and not str(staging_dir).startswith("/dev/shm"):
+        raise ValueError(
+            f"SECURE_MODE=True: staging dir deve estar em /dev/shm, encontrado: {staging_dir}"
+        )
+
+
+def _validate_temp_path(path: Path, label: str) -> None:
+    """Valida que path temporário de imagem/archive está em /dev/shm."""
+    suffix = path.suffix.lower()
+    if suffix in SENSITIVE_EXTENSIONS or suffix in SENSITIVE_ARCHIVES:
+        if not str(path).startswith("/dev/shm"):
+            raise ValueError(
+                f"SECURITY: {label} com extensão sensível ({suffix}) fora de /dev/shm: {path}"
+            )
+
+
+def _redact_token(text: str) -> str:
+    """Redactiza token Civitai de strings de log/erro."""
+    token = os.environ.get("CIVITAI_TOKEN") or os.environ.get("CIVITAI_API_KEY")
+    if token and len(token) >= 4:
+        text = text.replace(token, "***REDACTED***")
+    return text
 
 
 def calculate_sha256(filepath: Path) -> str:
@@ -31,12 +64,13 @@ def download_model(
     file_id: str = DEFAULT_FILE_ID,
     staging_dir: Path = Path("/content/kaggle_staging"),
     expected_gb: float = EXPECTED_GB,
-    token: str = None,
 ) -> Path:
     """
     Baixa modelo da Civitai para staging.
     Retorna o Path do arquivo baixado.
     """
+    staging_dir = Path(staging_dir)
+    _validate_staging_dir(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
     model_path = staging_dir / model_name
 
@@ -54,8 +88,7 @@ def download_model(
             model_path.unlink()
 
     # Obter token (Colab Secrets via userdata + fallback env)
-    if token is None:
-        token = os.environ.get("CIVITAI_TOKEN") or os.environ.get("CIVITAI_API_KEY")
+    token = os.environ.get("CIVITAI_TOKEN") or os.environ.get("CIVITAI_API_KEY")
     if not token:
         try:
             from google.colab import userdata
@@ -82,7 +115,8 @@ def download_model(
         url
     ]
 
-    print(f"[INFO] Executando: {' '.join(cmd[:-1])} [URL]")
+    cmd_log = [c if "Bearer" not in str(c) else "***REDACTED***" for c in cmd[:-1]]
+    print(f"[INFO] Executando: {' '.join(cmd_log)} [URL]")
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
 
@@ -90,10 +124,12 @@ def download_model(
     if result.stdout:
         print(f"[INFO] STDOUT: {result.stdout[-500:]}")
     if result.stderr:
-        print(f"[INFO] STDERR: {result.stderr[-500:]}")
+        print(f"[INFO] STDERR: {_redact_token(result.stderr[-500:])}")
 
     if result.returncode != 0:
-        raise RuntimeError(f"Download falhou com código {result.returncode}: {result.stderr}")
+        raise RuntimeError(
+            f"Download falhou com código {result.returncode}: {_redact_token(result.stderr)}"
+        )
 
     # Validar tamanho
     size = model_path.stat().st_size
@@ -120,7 +156,6 @@ def main():
     parser.add_argument("--file-id", default=DEFAULT_FILE_ID)
     parser.add_argument("--staging-dir", default="/content/kaggle_staging")
     parser.add_argument("--expected-gb", type=float, default=EXPECTED_GB)
-    parser.add_argument("--token", help="Token Civitai (opcional, usa env CIVITAI_TOKEN)")
 
     args = parser.parse_args()
 
@@ -131,11 +166,10 @@ def main():
             file_id=args.file_id,
             staging_dir=Path(args.staging_dir),
             expected_gb=args.expected_gb,
-            token=args.token,
         )
         print(f"\n[SUCCESS] Modelo salvo em: {path}")
     except Exception as e:
-        print(f"\n[ERROR] {e}")
+        print(f"\n[ERROR] {_redact_token(str(e))}")
         exit(1)
 
 
