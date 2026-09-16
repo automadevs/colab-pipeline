@@ -1730,9 +1730,9 @@ def build_comfyui_command(
         # Tentar isolamento real se disponível
         isolation_cmd = _get_isolation_wrapper(comfyui_dir, [input_dir, output_dir, temp_dir, user_dir, SHM_LOGS])
         if isolation_cmd:
-            return [isolation_cmd + cmd]
+            return isolation_cmd + cmd
 
-    return [cmd]
+    return cmd
 
 
 def _get_isolation_wrapper(comfyui_dir: Path, mutable_paths: List[Path]) -> Optional[List[str]]:
