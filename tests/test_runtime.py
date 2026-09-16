@@ -1509,5 +1509,192 @@ class TestT_AssertOnlyAllowedPersistentArtifactAllowsStaticFiles(unittest.TestCa
                 comfyui_setup._WORKING_SNAPSHOT = original_snapshot
 
 
+# ---------------------------------------------------------------------------
+# U — Git-based working directory audit (abordagem B)
+# Verifica que um clone limpo do ComfyUI passa, mas arquivos sensíveis
+# colocados manualmente continuam sendo detectados.
+# ---------------------------------------------------------------------------
+
+class TestU_GitBasedAudit(unittest.TestCase):
+    """Testa a checagem baseada em git (git ls-files / git status --porcelain)."""
+
+    def setUp(self):
+        """Limpa cache de git antes de cada teste."""
+        comfyui_setup._clear_git_cache()
+
+    def tearDown(self):
+        """Limpa cache de git após cada teste."""
+        comfyui_setup._clear_git_cache()
+
+    def _create_comfyui_git_repo(self, tmp: str):
+        """
+        Cria um mini-repo git em tmp/ComfyUI com alguns arquivos tracked
+        simulando o clone oficial do ComfyUI.
+        """
+        import subprocess
+        comfyui_dir = Path(tmp) / "ComfyUI"
+        comfyui_dir.mkdir(parents=True)
+
+        # Criar estrutura de diretórios do ComfyUI
+        (comfyui_dir / "comfy").mkdir(parents=True)
+        (comfyui_dir / "comfy" / "comfy_types" / "examples").mkdir(parents=True)
+        (comfyui_dir / "blueprints").mkdir(parents=True)
+        (comfyui_dir / "tests").mkdir(parents=True)
+        (comfyui_dir / "tests-unit").mkdir(parents=True)
+        (comfyui_dir / ".ci").mkdir(parents=True)
+        (comfyui_dir / "input").mkdir(parents=True)
+        (comfyui_dir / "output").mkdir(parents=True)
+        (comfyui_dir / "temp").mkdir(parents=True)
+        (comfyui_dir / "custom_nodes").mkdir(parents=True)
+
+        # Arquivos de fábrica (tracked)
+        (comfyui_dir / "main.py").write_text("# ComfyUI main")
+        (comfyui_dir / "requirements.txt").write_text("torch\n")
+        (comfyui_dir / "README.md").write_text("# ComfyUI")
+        (comfyui_dir / "comfy" / "__init__.py").write_text("")
+        (comfyui_dir / "comfy" / "sd.py").write_text("# diffusion code")
+        (comfyui_dir / "comfy" / "comfy_types" / "examples" / "required_hint.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        (comfyui_dir / "blueprints" / "default.json").write_text('{"nodes": []}')
+        (comfyui_dir / "tests" / "test_core.py").write_text("def test(): pass")
+        (comfyui_dir / "tests-unit" / "test_extra.py").write_text("def test(): pass")
+        (comfyui_dir / ".ci" / "install.ps1").write_text("echo install")
+        (comfyui_dir / "input" / "example.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        (comfyui_dir / "input" / "README.md").write_text("input dir")
+        (comfyui_dir / "output" / "README.md").write_text("output dir")
+        (comfyui_dir / "temp" / "README.md").write_text("temp dir")
+
+        # git init e commit
+        env = os.environ.copy()
+        env["GIT_AUTHOR_NAME"] = "Test"
+        env["GIT_AUTHOR_EMAIL"] = "test@test.com"
+        env["GIT_COMMITTER_NAME"] = "Test"
+        env["GIT_COMMITTER_EMAIL"] = "test@test.com"
+        subprocess.run(["git", "init"], cwd=str(comfyui_dir), capture_output=True, env=env, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=str(comfyui_dir), capture_output=True, env=env, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(comfyui_dir), capture_output=True, env=env, check=True)
+        return comfyui_dir
+
+    def test_clone_limpo_passa_assert_working_policy(self):
+        """Clone limpo do ComfyUI (sem arquivos gerados) deve passar assert_working_policy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                # Não deve levantar SecurityError
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_clone_limpo_passa_assert_no_persistent_images(self):
+        """Clone limpo do ComfyUI deve passar assert_no_persistent_images."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_clone_limpo_passa_final_filesystem_check(self):
+        """Clone limpo do ComfyUI deve passar final_filesystem_check com 0 violações."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+
+            result = comfyui_setup.final_filesystem_check(scan_root=Path(tmp), silent=True)
+            self.assertEqual(result["violations"], 0, f"Expected 0 violations, got: {result['report']}")
+            self.assertIn("PASS", result["report"])
+
+    def test_png_colocado_manualmente_e_detectado(self):
+        """Arquivo .png colado manualmente (untracked) deve ser detectado como violação."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            # Colar imagem manualmente (untracked)
+            leaked = Path(tmp) / "ComfyUI" / "output" / "leaked.png"
+            leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_safetensors_colocado_manualmente_e_detectado(self):
+        """Arquivo .safetensors colado manualmente deve ser detectado como violação."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            # Colar modelo manualmente (untracked)
+            model = Path(tmp) / "ComfyUI" / "models" / "checkpoints" / "model.safetensors"
+            model.parent.mkdir(parents=True)
+            model.write_bytes(b"\x00" * 100)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_arquivo_modificado_no_clone_e_violacao_na_politica_completa(self):
+        """Arquivo tracked modificado deve ser violação em assert_working_policy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui_dir = self._create_comfyui_git_repo(tmp)
+            # Modificar um arquivo tracked
+            (comfyui_dir / "requirements.txt").write_text("torch\ntransformers\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_arquivo_python_untracked_no_clone_e_violacao_na_politica_completa(self):
+        """Arquivo untracked sem extensão sensível também deve ser violação na política completa."""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui_dir = self._create_comfyui_git_repo(tmp)
+            (comfyui_dir / "unexpected.py").write_text("print('unexpected')\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_git_tracked_safetensors_e_bloqueado_por_camada_extra(self):
+        """Mesmo se .safetensors for tracked pelo git, deve ser bloqueado pela camada extra."""
+        with tempfile.TemporaryDirectory() as tmp:
+            import subprocess
+            comfyui_dir = self._create_comfyui_git_repo(tmp)
+
+            # Criar e commitar um .safetensors (simulação extrema)
+            model = comfyui_dir / "model.safetensors"
+            model.write_bytes(b"\x00" * 100)
+            env = os.environ.copy()
+            env["GIT_AUTHOR_NAME"] = "Test"
+            env["GIT_AUTHOR_EMAIL"] = "test@test.com"
+            env["GIT_COMMITTER_NAME"] = "Test"
+            env["GIT_COMMITTER_EMAIL"] = "test@test.com"
+            subprocess.run(["git", "add", "-A"], cwd=str(comfyui_dir), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "commit", "-m", "add model"], cwd=str(comfyui_dir), capture_output=True, env=env, check=True)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+
 if __name__ == "__main__":
     unittest.main()
