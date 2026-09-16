@@ -1737,7 +1737,8 @@ def build_comfyui_command(
 
 def _get_isolation_wrapper(comfyui_dir: Path, mutable_paths: List[Path]) -> Optional[List[str]]:
     """
-    Retorna prefixo de comando para isolamento (bubblewrap/unshare) se disponível.
+    Retorna prefixo de comando para isolamento (bubblewrap) se disponível.
+    Unshare NÃO é usado pois requer CAP_SYS_ADMIN (não disponível no Kaggle).
     """
     # 1. Bubblewrap (melhor isolamento)
     if shutil.which("bwrap"):
@@ -1758,13 +1759,7 @@ def _get_isolation_wrapper(comfyui_dir: Path, mutable_paths: List[Path]) -> Opti
             bwrap_cmd.extend(["--bind", str(p), str(p)])
         return bwrap_cmd
 
-    # 2. Unshare (mount namespace)
-    if shutil.which("unshare"):
-        print("[SECURITY] Usando unshare para isolamento de filesystem")
-        # Nota: unshare requer privilégios ou user namespaces habilitados
-        return ["unshare", "--mount", "--map-root-user"]
-
-    print("[SECURITY] Isolamento real (bwrap/unshare) não disponível. Usando apenas restrição de paths.")
+    print("[SECURITY] Isolamento real (bubblewrap) não disponível. Usando apenas restrição de paths via parâmetros do ComfyUI.")
     return None
 
 
