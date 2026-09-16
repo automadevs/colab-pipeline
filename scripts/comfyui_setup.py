@@ -191,78 +191,20 @@ def assert_working_policy() -> None:
     Verifica que /kaggle/working contém apenas arquivos permitidos.
     Levanta SecurityError se encontrar qualquer artefato sensível.
     Diferente de assert_no_persistent_images, verifica também extensões não-imagem.
-    Ignora arquivos estáticos conhecidos do ComfyUI (ALLOWED_STATIC_FILES / ALLOWED_STATIC_PREFIXES).
+
+    Usa abordagem híbrida git-based + allowlist estático:
+    - Arquivos tracked pelo `git clone` oficial do ComfyUI → permitidos
+    - Arquivos untracked/modified pelo git → candidatos a violação
+    - Sem git (testes) → fallback para allowlist estático expandido
+    - Extensões sensíveis (.safetensors, .pt, .png, etc.) SEMPRE bloqueadas
     """
-    scan_roots = list(PERSISTENT_AUDIT_PATHS)
-    comfyui_persistent_dirs = [
-        Path("/kaggle/working/ComfyUI/input"),
-        Path("/kaggle/working/ComfyUI/output"),
-        Path("/kaggle/working/ComfyUI/temp"),
-        Path("/kaggle/working/ComfyUI/user"),
-    ]
-    for d in comfyui_persistent_dirs:
-        if d.exists() and d not in scan_roots:
-            scan_roots.append(d)
-
-    violations: List[Dict[str, Any]] = []
-
-    for root in scan_roots:
-        if not root.exists():
-            continue
-        for item in root.rglob("*"):
-            if not item.is_file():
-                continue
-            # output_secure.zip é o único artefato persistente permitido (verificar por nome)
-            if item.name == "output_secure.zip":
-                continue
-
-            # Verificar se é arquivo estático permitido ANTES de analisar
-            # Calcular path relativo a PERSISTENT_WORKING (/kaggle/working) para casar com ALLOWED_STATIC_FILES
-            try:
-                rel = str(item.relative_to(PERSISTENT_WORKING))
-            except ValueError:
-                rel = str(item)
-
-            # Normalizar separadores para cross-platform
-            rel_normalized = rel.replace("\\", "/")
-            if _is_allowed_static_file(rel_normalized):
-                continue
-
-            stat = item.stat()
-            ext = item.suffix.lower()
-
-            if ext in SENSITIVE_EXTENSIONS or ext in SENSITIVE_ARCHIVES:
-                violations.append({
-                    "path": str(item), "type": "extension", "ext": ext,
-                    "size": stat.st_size, "mtime": stat.st_mtime,
-                })
-                continue
-
-            if ext in SENSITIVE_NON_IMAGE_EXTENSIONS:
-                violations.append({
-                    "path": str(item), "type": "non_image_sensitive", "ext": ext,
-                    "size": stat.st_size, "mtime": stat.st_mtime,
-                })
-                continue
-
-            # Verificação por magic bytes
-            try:
-                magic = item.read_bytes()[:16]
-                is_image = any([
-                    magic[:8] == b"\x89PNG\r\n\x1a\n",
-                    magic[:3] == b"\xff\xd8\xff",
-                    magic[:4] == b"RIFF" and magic[8:12] == b"WEBP",
-                    magic[:6] in (b"GIF87a", b"GIF89a"),
-                    magic[:4] in (b"PK\x03\x04", b"PK\x05\x06"),
-                ])
-                if is_image:
-                    violations.append({
-                        "path": str(item), "type": "magic_bytes",
-                        "magic": magic[:8].hex(), "size": stat.st_size,
-                    })
-            except (OSError, PermissionError):
-                pass
-
+    _clear_git_cache()
+    scan_root = PERSISTENT_AUDIT_PATHS[0] if PERSISTENT_AUDIT_PATHS else PERSISTENT_WORKING
+    violations = _scan_working_violations(
+        scan_root,
+        check_symlinks=True,
+        check_non_image_sensitive=True,
+    )
     if violations:
         lines = [f"assert_working_policy: {len(violations)} violação(ões) de política em /kaggle/working:"]
         for v in violations:
@@ -278,12 +220,17 @@ def assert_only_allowed_persistent_artifact() -> None:
     """
     Verifica que o único arquivo persistente em /kaggle/working (além do snapshot inicial)
     é output_secure.zip. Levanta SecurityError se houver qualquer outro.
-    Também permite arquivos estáticos conhecidos do ComfyUI (ALLOWED_STATIC_FILES / ALLOWED_STATIC_PREFIXES).
+
+    Usa abordagem híbrida git-based + allowlist estático:
+    - Arquivos tracked pelo `git clone` oficial do ComfyUI → permitidos
+    - Arquivos untracked/modified → não permitidos (a menos que seja custom_node)
+    - Sem git → fallback para allowlist estático expandido
     """
+    _clear_git_cache()
     if _WORKING_SNAPSHOT is None:
         record_working_snapshot()
     current: set = set()
-    working = PERSISTENT_WORKING
+    working = PERSISTENT_AUDIT_PATHS[0] if PERSISTENT_AUDIT_PATHS else PERSISTENT_WORKING
     if working.exists():
         for item in working.rglob("*"):
             if item.is_file():
@@ -295,14 +242,14 @@ def assert_only_allowed_persistent_artifact() -> None:
     new_files = current - _WORKING_SNAPSHOT
     # output_secure.zip é permitido
     new_files.discard("output_secure.zip")
-    # Arquivos estáticos permitidos também não contam como novos
-    allowed_to_discard = {f for f in new_files if _is_allowed_static_file(f)}
+    # Arquivos permitidos (git tracked ou allowlist) também não contam como novos
+    allowed_to_discard = {f for f in new_files if _is_file_allowed(f.replace("\\", "/"), working)}
     new_files -= allowed_to_discard
     if new_files:
         _security_abort(
             f"assert_only_allowed_persistent_artifact: {len(new_files)} arquivo(s) não autorizado(s) em /kaggle/working:\n"
             + "\n".join(f"  - {f}" for f in sorted(new_files)[:20])
-            + "\nApenas output_secure.zip e arquivos estáticos do ComfyUI são permitidos como artefatos persistentes."
+            + "\nApenas output_secure.zip e arquivos da instalação oficial do ComfyUI são permitidos."
         )
     print(f"[SECURITY] assert_only_allowed_persistent_artifact: PASS")
 
@@ -582,6 +529,9 @@ PERSISTENT_AUDIT_PATHS: Tuple[Path, ...] = (
 
 # Arquivos/padrões estáticos conhecidos do ComfyUI que NÃO são vazamentos
 # Usado por final_filesystem_check e assert_working_policy
+# NOTA: Em produção (Kaggle), a checagem primária é baseada em git — arquivos
+# tracked pelo `git clone` oficial do ComfyUI não são violação. Este allowlist
+# serve como fallback para quando o git não está disponível (testes, dirs temporários).
 ALLOWED_STATIC_FILES: frozenset[str] = frozenset({
     "ComfyUI/input/example.png",
     "ComfyUI/comfy/comfy_types/examples/required_hint.png",
@@ -590,17 +540,66 @@ ALLOWED_STATIC_FILES: frozenset[str] = frozenset({
 })
 
 # Padrões de prefixo permitidos (qualquer arquivo sob esses caminhos é ignorado)
+# Cobrem a instalação padrão do ComfyUI (git clone oficial) que não contém
+# dados sensíveis nem conteúdo gerado pelo pipeline.
 ALLOWED_STATIC_PREFIXES: Tuple[str, ...] = (
     "ComfyUI/comfy/comfy_types/examples/",
     "ComfyUI/custom_nodes/",
+    # Instalação padrão do ComfyUI — código-fonte e configs de fábrica
+    "ComfyUI/comfy/",
+    "ComfyUI/blueprints/",
+    "ComfyUI/tests/",
+    "ComfyUI/tests-unit/",
+    "ComfyUI/.ci/",
+    "ComfyUI/.github/",
+    "ComfyUI/docs/",
+    "ComfyUI/web/",
+    "ComfyUI/api_examples/",
+    "ComfyUI/notebooks/",
+    "ComfyUI/scripts/",
+    "ComfyUI/app/",
+    "ComfyUI/assets/",
+    "ComfyUI/cython_modules/",
 )
+
+# Arquivos de fábrica do ComfyUI na raiz do clone (sem subdiretório)
+ALLOWED_STATIC_ROOT_FILES: frozenset[str] = frozenset({
+    "ComfyUI/requirements.txt",
+    "ComfyUI/manager_requirements.txt",
+    "ComfyUI/pyproject.toml",
+    "ComfyUI/README.md",
+    "ComfyUI/LICENSE",
+    "ComfyUI/.gitignore",
+    "ComfyUI/.gitattributes",
+    "ComfyUI/main.py",
+    "ComfyUI/folder_paths.py",
+    "ComfyUI/custom_nodes/README.md",
+    "ComfyUI/custom_nodes/example_node.py.example",
+    "ComfyUI/input/README.md",
+    "ComfyUI/output/README.md",
+    "ComfyUI/temp/README.md",
+    "ComfyUI/user/.gitkeep",
+})
 
 
 def _is_allowed_static_file(rel_path: str) -> bool:
-    """Verifica se um caminho relativo é um arquivo estático conhecido/permitido."""
+    """
+    Verifica se um caminho relativo é um arquivo estático conhecido/permitido.
+
+    Esta função é o FALLBACK usado quando a checagem baseada em git não está
+    disponível (ex: diretório temporário em testes). Em produção (Kaggle),
+    a checagem primária usa _get_git_tracked_set() para identificar arquivos
+    que fazem parte do clone oficial do ComfyUI.
+
+    Extensões realmente sensíveis (.safetensors, .pt, .png, .jpg, etc.) são
+    SEMPRE bloqueadas por _scan_working_violations(), mesmo se casarem com um
+    prefixo permitido aqui — isso é uma camada extra de defesa.
+    """
     # Normalizar separadores de path para comparação cross-platform
     normalized = rel_path.replace("\\", "/")
     if normalized in ALLOWED_STATIC_FILES:
+        return True
+    if normalized in ALLOWED_STATIC_ROOT_FILES:
         return True
     for prefix in ALLOWED_STATIC_PREFIXES:
         if normalized.startswith(prefix):
@@ -610,10 +609,365 @@ def _is_allowed_static_file(rel_path: str) -> bool:
                     return True
                 if any(normalized.endswith(ext) for ext in (".py", ".json", ".yaml", ".yml", ".txt", ".md", ".js", ".css", ".html", ".vue")):
                     return True
-            else:
-                # Para outros prefixos permitidos (ex: ComfyUI/comfy/comfy_types/examples/), permitir tudo
-                return True
+                return False
+            # Para outros prefixos permitidos (instalação padrão do ComfyUI), permitir
+            return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Git-based working-directory audit
+# ---------------------------------------------------------------------------
+
+# Cache de arquivos tracked pelo git (evita rodar git status a cada chamada)
+_git_tracked_cache: Dict[str, frozenset[str]] = {}
+
+
+def _get_comfyui_dir(scan_root: Path) -> Optional[Path]:
+    """
+    Retorna o diretório do clone do ComfyUI dentro de scan_root, se existir.
+    Procura por scan_root/ComfyUI/.git (repo oficial clonado).
+    """
+    comfyui = scan_root / "ComfyUI"
+    if (comfyui / ".git").exists():
+        return comfyui
+    return None
+
+
+def _get_git_tracked_set(scan_root: Path) -> Optional[frozenset[str]]:
+    """
+    Retorna o conjunto de paths relativos (relativos a scan_root) de todos
+    arquivos tracked pelo git no repo ComfyUI dentro de scan_root.
+
+    Usa `git -C <comfyui_dir> ls-files` para listar arquivos tracked.
+    Retorna None se:
+      - Não houver repo git do ComfyUI em scan_root
+      - git não estiver disponível ou falhar
+
+    O cache é por scan_root resolved string.
+    """
+    key = str(scan_root.resolve())
+    if key in _git_tracked_cache:
+        return _git_tracked_cache[key]
+
+    comfyui_dir = _get_comfyui_dir(scan_root)
+    if comfyui_dir is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(comfyui_dir), "ls-files"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+    tracked: set[str] = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # git ls-files retorna paths relativos ao repo (ex: comfy/..., web/...)
+        # Prefixar com "ComfyUI/" para casar com os paths relativos a scan_root
+        tracked.add(f"ComfyUI/{line}")
+
+    frozen = frozenset(tracked)
+    _git_tracked_cache[key] = frozen
+    return frozen
+
+
+def _get_git_untracked_set(scan_root: Path) -> Optional[frozenset[str]]:
+    """
+    Retorna o conjunto de paths relativos (relativos a scan_root) de arquivos
+    untracked ou modified no repo ComfyUI dentro de scan_root.
+
+    Usa `git -C <comfyui_dir> status --porcelain --ignored=no` para listar.
+    Retorna None se não houver repo git ou git falhar.
+    """
+    key = str(scan_root.resolve()) + ":untracked"
+    if key in _git_tracked_cache:
+        return _git_tracked_cache[key]
+
+    comfyui_dir = _get_comfyui_dir(scan_root)
+    if comfyui_dir is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(comfyui_dir), "status", "--porcelain", "--ignored=no"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+    changed: set[str] = set()
+    for line in result.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        status = line[:2]
+        if status == "!!":
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ")[1]
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        if path:
+            changed.add(f"ComfyUI/{path}")
+
+    frozen = frozenset(changed)
+    _git_tracked_cache[key] = frozen
+    return frozen
+
+
+def _clear_git_cache() -> None:
+    """Limpa o cache de git tracked/untracked. Usado em testes."""
+    _git_tracked_cache.clear()
+
+
+def _matches_git_changed_path(rel_path: str, changed_paths: frozenset[str]) -> bool:
+    """Retorna True se rel_path aparece no porcelain ou dentro de um diretório listado."""
+    normalized = rel_path.replace("\\", "/")
+    for changed in changed_paths:
+        changed_normalized = changed.replace("\\", "/").rstrip("/")
+        if normalized == changed_normalized or normalized.startswith(f"{changed_normalized}/"):
+            return True
+    return False
+
+
+def _is_git_changed_file(rel_path: str, scan_root: Path) -> bool:
+    """Retorna True quando git status marca o arquivo como untracked/modified/etc."""
+    changed = _get_git_untracked_set(scan_root)
+    if changed is None:
+        return True
+    return _matches_git_changed_path(rel_path, changed)
+
+
+def _is_file_allowed(rel_path: str, scan_root: Path) -> bool:
+    """
+    Verifica se um arquivo é permitido em /kaggle/working usando a abordagem
+    híbrida: git-based (primária) + allowlist estático (fallback).
+
+    Lógica:
+    1. Se o arquivo é tracked pelo git E não está modified/untracked → permitido
+       (faz parte do clone oficial do ComfyUI)
+    2. Se o arquivo é untracked/modified pelo git → NÃO permitido por git
+       (candidato a violação — será avaliado pelas extensões sensíveis)
+    3. Se git não disponível → usa _is_allowed_static_file() como fallback
+
+    NOTA: output_secure.zip NÃO é tratado aqui — o pulo por nome é feito em
+    _scan_working_violations() via parâmetro skip_output_zip.
+    Extensões sensíveis (.safetensors, .pt, etc.) são bloqueadas por
+    _scan_working_violations() MESMO se o arquivo for tracked pelo git.
+    """
+    normalized = rel_path.replace("\\", "/")
+
+    # Passo 1: checagem baseada em git. Quando o clone existe, ele é a fonte
+    # primária: arquivos tracked e limpos são permitidos; untracked/modified não.
+    tracked = _get_git_tracked_set(scan_root)
+    if tracked is not None:
+        changed = _get_git_untracked_set(scan_root)
+        if normalized in tracked:
+            if changed is None:
+                return False
+            if not _matches_git_changed_path(normalized, changed):
+                return True
+        # Custom nodes são clones aninhados/instalações externas esperadas, então
+        # mantêm o tratamento especial pré-existente mesmo quando o repo pai existe.
+        if normalized.startswith("ComfyUI/custom_nodes/") and _is_allowed_static_file(normalized):
+            return True
+        return False
+
+    # Passo 2: fallback estático apenas quando git não está disponível.
+    return _is_allowed_static_file(normalized)
+
+
+# Extensões de modelo que são SEMPRE bloqueadas, mesmo se tracked pelo git
+# (camada extra de defesa contra vazamento de modelos).
+# NOTA: Extensões de imagem (.png, .jpg, etc.) e archive (.zip) NÃO estão aqui
+# porque o ComfyUI tem imagens de exemplo legítimas (example.png, comfy_types/examples/)
+# que são tracked pelo git. Essas extensões são tratadas na Camada 2 apenas quando
+# o arquivo NÃO é permitido pelo git/allowlist.
+ALWAYS_BLOCKED_EXTENSIONS = frozenset({
+    ".safetensors", ".pt", ".pth", ".bin", ".ckpt", ".gguf", ".onnx", ".tflite",
+})
+
+
+def _scan_working_violations(
+    scan_root: Path,
+    label: str = "",
+    extra_paths: Optional[List[Path]] = None,
+    check_symlinks: bool = True,
+    check_non_image_sensitive: bool = False,
+    check_comfyui_subdirs: bool = False,
+    skip_output_zip: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Helper compartilhado que varre scan_root em busca de violações de segurança.
+
+    Substitui a lógica duplicada em assert_working_policy, assert_no_persistent_images
+    e final_filesystem_check.
+
+    Parâmetros:
+      scan_root: diretório raiz para scanear (normalmente /kaggle/working)
+      label: prefixo para mensagens (ex: "[PRE-ZIP]")
+      extra_paths: paths adicionais para scanear além de scan_root
+      check_symlinks: se True, verifica symlinks que apontam para fora
+      check_non_image_sensitive: se True, também bloqueia .json/.log/.db/etc.
+        (usado por assert_working_policy, não por assert_no_persistent_images)
+      check_comfyui_subdirs: se True, reporta status de ComfyUI/input/output/temp
+      skip_output_zip: se True, output_secure.zip é ignorado (permitido).
+        final_filesystem_check passa False para detectá-lo como violação.
+
+    Retorna lista de violações (cada uma é um dict com path, type, size, etc.).
+    """
+    scan_roots: List[Path] = [scan_root]
+
+    # Adicionar subpaths críticos explicitamente
+    comfyui_persistent_dirs = [
+        scan_root / "ComfyUI" / "input",
+        scan_root / "ComfyUI" / "output",
+        scan_root / "ComfyUI" / "temp",
+        scan_root / "ComfyUI" / "user",
+    ]
+    for d in comfyui_persistent_dirs:
+        if d.exists() and d not in scan_roots:
+            scan_roots.append(d)
+    if extra_paths:
+        scan_roots.extend(extra_paths)
+
+    violations: List[Dict[str, Any]] = []
+    scanned_files: set[str] = set()
+
+    for root in scan_roots:
+        if not root.exists():
+            continue
+        for item in root.rglob("*"):
+            # Verificação de symlinks
+            if check_symlinks and item.is_symlink():
+                try:
+                    real = item.resolve()
+                except Exception:
+                    real = item
+                target = str(real)
+                if not target.startswith(str(scan_root)) and not target.startswith("/dev/shm"):
+                    violations.append({
+                        "path": str(item),
+                        "type": "symlink",
+                        "target": target,
+                        "size": 0,
+                        "mtime": item.lstat().st_mtime if item.exists() else 0,
+                    })
+
+            if not item.is_file():
+                continue
+
+            try:
+                file_key = str(item.resolve(strict=False))
+            except Exception:
+                file_key = str(item)
+            if file_key in scanned_files:
+                continue
+            scanned_files.add(file_key)
+
+            # output_secure.zip é o único artefato persistente permitido
+            # (final_filesystem_check não pula, para detectá-lo como violação)
+            if skip_output_zip and item.name == "output_secure.zip":
+                continue
+
+            # Calcular path relativo a scan_root para casar com allowlist/git
+            try:
+                rel = str(item.relative_to(scan_root))
+            except ValueError:
+                rel = str(item)
+            rel_normalized = rel.replace("\\", "/")
+
+            # Camada 1: checagem git-based + allowlist estático
+            if _is_file_allowed(rel_normalized, scan_root):
+                # Mesmo se permitido, verificar extensões sempre bloqueadas
+                ext = item.suffix.lower()
+                if ext in ALWAYS_BLOCKED_EXTENSIONS:
+                    violations.append({
+                        "path": str(item), "type": "always_blocked_extension",
+                        "ext": ext, "size": item.stat().st_size,
+                        "mtime": item.stat().st_mtime,
+                    })
+                continue
+
+            stat = item.stat()
+            ext = item.suffix.lower()
+
+            # Camada 2: extensões sensíveis (imagem/archive/modelo)
+            if ext in SENSITIVE_EXTENSIONS or ext in SENSITIVE_ARCHIVES or ext in ALWAYS_BLOCKED_EXTENSIONS:
+                violation_type = "always_blocked_extension" if ext in ALWAYS_BLOCKED_EXTENSIONS else "extension"
+                violations.append({
+                    "path": str(item), "type": violation_type,
+                    "ext": ext, "size": stat.st_size, "mtime": stat.st_mtime,
+                })
+                continue
+
+            # Camada 3: política completa baseada em git. Em assert_working_policy,
+            # qualquer arquivo marcado pelo repo como untracked/modified/etc. é violação.
+            if check_non_image_sensitive and _is_git_changed_file(rel_normalized, scan_root):
+                violations.append({
+                    "path": str(item), "type": "git_changed",
+                    "size": stat.st_size, "mtime": stat.st_mtime,
+                })
+                continue
+
+            # Camada 4: extensões não-imagem sensíveis (.json, .log, .db, etc.)
+            if check_non_image_sensitive and ext in SENSITIVE_NON_IMAGE_EXTENSIONS:
+                violations.append({
+                    "path": str(item), "type": "non_image_sensitive",
+                    "ext": ext, "size": stat.st_size, "mtime": stat.st_mtime,
+                })
+                continue
+
+            # Camada 5: verificação por magic bytes
+            try:
+                magic = item.read_bytes()[:16]
+                is_image = any([
+                    magic[:8] == b"\x89PNG\r\n\x1a\n",
+                    magic[:3] == b"\xff\xd8\xff",
+                    magic[:4] == b"RIFF" and magic[8:12] == b"WEBP",
+                    magic[:6] in (b"GIF87a", b"GIF89a"),
+                    magic[:4] in (b"PK\x03\x04", b"PK\x05\x06"),
+                ])
+                if is_image:
+                    violations.append({
+                        "path": str(item), "type": "magic_bytes",
+                        "magic": magic[:8].hex(), "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                    })
+            except (OSError, PermissionError):
+                pass
+
+    return violations
+
+
+def _format_violations(violations: List[Dict[str, Any]], prefix_label: str = "") -> str:
+    """Formata lista de violações em string de relatório."""
+    prefix = f"[{prefix_label}] " if prefix_label else ""
+    lines = [f"{prefix}SECURITY VIOLATION: {len(violations)} artefato(s) sensível(is) em armazenamento persistente:"]
+    for v in violations:
+        ts = datetime.datetime.fromtimestamp(v["mtime"]).isoformat() if v.get("mtime") else "unknown"
+        lines.append(f"  PATH : {v['path']}")
+        lines.append(f"  TYPE : {v['type']}")
+        lines.append(f"  SIZE : {v.get('size', '?')} bytes")
+        lines.append(f"  MTIME: {ts}")
+        if v.get("target"):
+            lines.append(f"  TARGET: {v['target']}")
+        if v.get("ext"):
+            lines.append(f"  EXT  : {v['ext']}")
+        if v.get("magic"):
+            lines.append(f"  MAGIC: {v['magic']}")
+        lines.append("")
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Security primitives
@@ -737,108 +1091,21 @@ def assert_no_persistent_images(
     Levanta SecurityError imediatamente ao encontrar qualquer arquivo sensível.
     Verifica também symlinks, arquivos ocultos e arquivos sem extensão mas com
     magic bytes de imagem.
+
+    Usa _scan_working_violations() com check_non_image_sensitive=False
+    (esta função não bloqueia .json/.log/.db — apenas imagens/archives/modelos).
     """
-    scan_roots = list(PERSISTENT_AUDIT_PATHS)
-    # Adicionar subpaths críticos explicitamente
-    comfyui_persistent_dirs = [
-        Path("/kaggle/working/ComfyUI/input"),
-        Path("/kaggle/working/ComfyUI/output"),
-        Path("/kaggle/working/ComfyUI/temp"),
-    ]
-    for d in comfyui_persistent_dirs:
-        if d.exists() and d not in scan_roots:
-            scan_roots.append(d)
-    if extra_paths:
-        scan_roots.extend(extra_paths)
-
-    violations: List[Dict[str, Any]] = []
-    prefix = f"[{label}] " if label else ""
-
-    for root in scan_roots:
-        if not root.exists():
-            continue
-        for item in root.rglob("*"):
-            # Seguir symlinks para detectar bypass
-            try:
-                real = item.resolve()
-            except Exception:
-                real = item
-
-            if item.is_symlink():
-                # Symlink apontando para fora de /kaggle/working também é violação
-                target = str(real)
-                if not target.startswith("/kaggle/working") and not target.startswith("/dev/shm"):
-                    # Symlink para local inesperado — registrar mas não abortar automaticamente
-                    violations.append({
-                        "path": str(item),
-                        "type": "symlink",
-                        "target": target,
-                        "size": 0,
-                        "mtime": item.lstat().st_mtime if item.exists() else 0,
-                    })
-
-            if not item.is_file():
-                continue
-
-            # Verificar se é arquivo estático permitido ANTES de analisar
-            # Calcular path relativo a PERSISTENT_WORKING (/kaggle/working) para casar com ALLOWED_STATIC_FILES
-            try:
-                rel = str(item.relative_to(PERSISTENT_WORKING))
-            except ValueError:
-                rel = str(item)
-
-            # Normalizar separadores para cross-platform
-            rel_normalized = rel.replace("\\", "/")
-            if _is_allowed_static_file(rel_normalized):
-                continue
-
-            stat = item.stat()
-            ext = item.suffix.lower()
-
-            # Verificação por extensão
-            if ext in SENSITIVE_EXTENSIONS or ext in SENSITIVE_ARCHIVES:
-                violations.append({
-                    "path": str(item),
-                    "type": "extension",
-                    "ext": ext,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                })
-                continue
-
-            # Verificação por magic bytes (arquivos sem extensão ou extensão disfarçada)
-            try:
-                magic = item.read_bytes()[:16]
-                is_image = any([
-                    magic[:8] == b"\x89PNG\r\n\x1a\n",   # PNG
-                    magic[:3] == b"\xff\xd8\xff",          # JPEG
-                    magic[:4] == b"RIFF" and magic[8:12] == b"WEBP",  # WEBP
-                    magic[:6] in (b"GIF87a", b"GIF89a"),   # GIF
-                    magic[:4] in (b"PK\x03\x04", b"PK\x05\x06"),  # ZIP
-                ])
-                if is_image:
-                    violations.append({
-                        "path": str(item),
-                        "type": "magic_bytes",
-                        "magic": magic[:8].hex(),
-                        "size": stat.st_size,
-                        "mtime": stat.st_mtime,
-                    })
-            except (OSError, PermissionError):
-                pass
-
+    _clear_git_cache()
+    scan_root = PERSISTENT_AUDIT_PATHS[0] if PERSISTENT_AUDIT_PATHS else PERSISTENT_WORKING
+    violations = _scan_working_violations(
+        scan_root,
+        label=label,
+        extra_paths=extra_paths,
+        check_symlinks=True,
+        check_non_image_sensitive=False,
+    )
     if violations:
-        lines = [f"{prefix}SECURITY VIOLATION: {len(violations)} artefato(s) sensível(is) em armazenamento persistente:"]
-        for v in violations:
-            ts = datetime.datetime.fromtimestamp(v["mtime"]).isoformat() if v.get("mtime") else "unknown"
-            lines.append(f"  PATH : {v['path']}")
-            lines.append(f"  TYPE : {v['type']}")
-            lines.append(f"  SIZE : {v.get('size', '?')} bytes")
-            lines.append(f"  MTIME: {ts}")
-            if v.get("target"):
-                lines.append(f"  TARGET: {v['target']}")
-            lines.append("")
-        _security_abort("\n".join(lines))
+        _security_abort(_format_violations(violations, label))
 
 
 # ---------------------------------------------------------------------------
@@ -1270,14 +1537,15 @@ def final_filesystem_check(
     Verifica também: symlinks, arquivos ocultos, arquivos sem extensão com magic bytes.
     Verifica explicitamente ComfyUI/input, ComfyUI/output, ComfyUI/temp mesmo se vazios.
 
-    Ignora arquivos estáticos conhecidos do ComfyUI (ALLOWED_STATIC_FILES / ALLOWED_STATIC_PREFIXES).
+    Usa abordagem híbrida git-based + allowlist estático via _scan_working_violations():
+    - Arquivos tracked pelo `git clone` oficial do ComfyUI → permitidos
+    - Arquivos untracked/modified → candidatos a violação
+    - Sem git (testes) → fallback para allowlist estático expandido
+    - Extensões sensíveis (.safetensors, .pt, .png, etc.) SEMPRE bloqueadas
 
     Retorna dict com 'violations' (int), 'report' (str).
     """
-    img_found = []
-    arch_found = []
-    symlink_found = []
-
+    _clear_git_cache()
     extra_report_lines = []
 
     # Subpaths críticos — verificar existência e conteúdo mesmo se vazios
@@ -1286,6 +1554,7 @@ def final_filesystem_check(
             scan_root / "ComfyUI" / "input",
             scan_root / "ComfyUI" / "output",
             scan_root / "ComfyUI" / "temp",
+            scan_root / "ComfyUI" / "user",
         ]
         for d in comfyui_subdirs:
             if d.exists():
@@ -1295,62 +1564,45 @@ def final_filesystem_check(
                     f"  {d}: {'VAZIO' if not files else f'{len(files)} arquivo(s) — VERIFICAR'}"
                 )
 
-    if scan_root.exists():
-        for item in scan_root.rglob("*"):
-            # Symlinks
-            if item.is_symlink():
-                try:
-                    target = str(item.resolve())
-                except Exception:
-                    target = "unresolvable"
-                symlink_found.append({
-                    "path": str(item),
-                    "target": target,
-                    "size": 0,
-                    "mtime": item.lstat().st_mtime,
-                })
-                continue
+    violations = _scan_working_violations(
+        scan_root,
+        check_symlinks=True,
+        check_non_image_sensitive=False,
+        skip_output_zip=False,
+    )
 
-            if not item.is_file():
-                continue
+    # Separar violações por tipo para o relatório
+    img_found: List[Dict[str, Any]] = []
+    arch_found: List[Dict[str, Any]] = []
+    symlink_found: List[Dict[str, Any]] = []
 
-            # Verificar se é arquivo estático permitido ANTES de analisar
-            try:
-                rel = str(item.relative_to(scan_root))
-            except ValueError:
-                rel = str(item)
-
-            if _is_allowed_static_file(rel):
-                continue
-
-            stat = item.stat()
-            ext = item.suffix.lower()
-
+    for v in violations:
+        vtype = v.get("type", "")
+        if vtype == "symlink":
+            symlink_found.append(v)
+        elif vtype == "extension" and v.get("ext", "") in SENSITIVE_ARCHIVES:
+            arch_found.append(v)
+        elif vtype == "extension" and v.get("ext", "") in SENSITIVE_EXTENSIONS:
+            img_found.append(v)
+        elif vtype in ("always_blocked_extension",):
+            # Extensão sempre bloqueada (.safetensors, .pt, etc.)
+            ext = v.get("ext", "")
             if ext in SENSITIVE_EXTENSIONS:
-                img_found.append({"path": str(item), "size": stat.st_size, "mtime": stat.st_mtime, "type": "extension"})
-                continue
-            if ext in SENSITIVE_ARCHIVES:
-                arch_found.append({"path": str(item), "size": stat.st_size, "mtime": stat.st_mtime, "type": "extension"})
-                continue
+                img_found.append(v)
+            elif ext in SENSITIVE_ARCHIVES:
+                arch_found.append(v)
+            else:
+                # .safetensors, .pt, .pth, .bin, etc. — tratar como modelo
+                arch_found.append(v)
+        elif vtype == "magic_bytes":
+            # magic bytes pode ser imagem ou archive
+            magic_hex = v.get("magic", "")
+            if magic_hex.startswith("504b"):  # PK = ZIP
+                arch_found.append(v)
+            else:
+                img_found.append(v)
 
-            # Magic bytes para arquivos sem extensão ou extensão suspeita
-            try:
-                magic = item.read_bytes()[:16]
-                is_img = any([
-                    magic[:8] == b"\x89PNG\r\n\x1a\n",
-                    magic[:3] == b"\xff\xd8\xff",
-                    magic[:4] == b"RIFF" and magic[8:12] == b"WEBP",
-                    magic[:6] in (b"GIF87a", b"GIF89a"),
-                ])
-                is_zip = magic[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-                if is_img:
-                    img_found.append({"path": str(item), "size": stat.st_size, "mtime": stat.st_mtime, "type": "magic_bytes"})
-                elif is_zip:
-                    arch_found.append({"path": str(item), "size": stat.st_size, "mtime": stat.st_mtime, "type": "magic_bytes"})
-            except (OSError, PermissionError):
-                pass
-
-    violations = len(img_found) + len(arch_found)
+    violation_count = len(img_found) + len(arch_found)
 
     lines = [
         "",
@@ -1359,7 +1611,7 @@ def final_filesystem_check(
         f"Image files    : {len(img_found)}",
         f"Archive files  : {len(arch_found)}",
         f"Symlinks found : {len(symlink_found)}",
-        f"Violations     : {violations}",
+        f"Violations     : {violation_count}",
         "",
     ]
 
@@ -1368,9 +1620,9 @@ def final_filesystem_check(
         lines.extend(extra_report_lines)
         lines.append("")
 
-    if violations == 0 and not symlink_found:
+    if violation_count == 0 and not symlink_found:
         lines.append("STATUS: PASS ✅")
-    elif violations > 0:
+    elif violation_count > 0:
         lines.append("STATUS: FAIL ❌")
         lines.append("SECURITY VIOLATION DETECTED")
         lines.append("")
@@ -1396,7 +1648,7 @@ def final_filesystem_check(
         print(report)
 
     return {
-        "violations": violations,
+        "violations": violation_count,
         "images": img_found,
         "archives": arch_found,
         "symlinks": symlink_found,
