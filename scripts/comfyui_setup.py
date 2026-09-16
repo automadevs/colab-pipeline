@@ -217,9 +217,9 @@ def assert_working_policy() -> None:
                 continue
 
             # Verificar se é arquivo estático permitido ANTES de analisar
-            # Calcular path relativo à raiz de scan (root), não a PERSISTENT_WORKING
+            # Calcular path relativo a PERSISTENT_WORKING (/kaggle/working) para casar com ALLOWED_STATIC_FILES
             try:
-                rel = str(item.relative_to(root))
+                rel = str(item.relative_to(PERSISTENT_WORKING))
             except ValueError:
                 rel = str(item)
 
@@ -781,9 +781,9 @@ def assert_no_persistent_images(
                 continue
 
             # Verificar se é arquivo estático permitido ANTES de analisar
-            # Calcular path relativo à raiz de scan (root), não a PERSISTENT_WORKING
+            # Calcular path relativo a PERSISTENT_WORKING (/kaggle/working) para casar com ALLOWED_STATIC_FILES
             try:
-                rel = str(item.relative_to(root))
+                rel = str(item.relative_to(PERSISTENT_WORKING))
             except ValueError:
                 rel = str(item)
 
