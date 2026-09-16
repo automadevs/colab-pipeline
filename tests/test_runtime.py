@@ -881,6 +881,7 @@ class TestSecurityExtras(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestM_FilesystemGuardrails(unittest.TestCase):
+    @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
     def test_validate_runtime_path_rejects_traversal(self):
         """validate_runtime_path deve rejeitar path com '..'"""
         with self.assertRaises(comfyui_setup.SecurityError):
@@ -895,6 +896,7 @@ class TestM_FilesystemGuardrails(unittest.TestCase):
                 Path("/kaggle/working/test.png")
             )
 
+    @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
     def test_validate_runtime_path_accepts_dev_shm(self):
         """validate_runtime_path deve aceitar path em /dev/shm"""
         result = comfyui_setup.validate_runtime_path(
@@ -923,6 +925,7 @@ class TestM_FilesystemGuardrails(unittest.TestCase):
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
 
+    @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
     def test_assert_invariants_accepts_shm_paths(self):
         """assert_invariants deve passar com paths em /dev/shm"""
         try:
@@ -1134,6 +1137,360 @@ class TestO_AdversarialCustomNode(unittest.TestCase):
                 self.skipTest("Hardlinks não suportados neste filesystem")
             result = comfyui_setup.final_filesystem_check(scan_root=Path(tmp), silent=True)
             self.assertGreater(result["violations"], 0)
+
+
+# ---------------------------------------------------------------------------
+# P — Snapshot ignora __pycache__ e bytecode compilado
+# ---------------------------------------------------------------------------
+
+class TestP_SnapshotIgnoresBytecode(unittest.TestCase):
+    def test_snapshot_ignores_pycache_directory(self):
+        """snapshot_custom_nodes deve ignorar diretório __pycache__"""
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_dir = Path(tmp) / "custom_nodes"
+            custom_dir.mkdir()
+            node_dir = custom_dir / "ComfyUI_essentials"
+            node_dir.mkdir()
+            # Arquivo fonte
+            (node_dir / "node.py").write_text("# source\n")
+            # Diretório __pycache__ com .pyc
+            pycache = node_dir / "__pycache__"
+            pycache.mkdir()
+            (pycache / "node.cpython-312.pyc").write_bytes(b"bytecode")
+            (pycache / "other.pyc").write_bytes(b"bytecode")
+
+            snapshot = comfyui_setup.snapshot_custom_nodes(Path(tmp))
+
+            node_snap = snapshot["nodes"]["ComfyUI_essentials"]
+            self.assertIn("node.py", node_snap["files"])
+            # __pycache__ não deve aparecer no snapshot
+            self.assertFalse(any("__pycache__" in f for f in node_snap["files"]))
+            self.assertFalse(any(f.endswith(".pyc") for f in node_snap["files"]))
+
+    def test_snapshot_ignores_git_directory(self):
+        """snapshot_custom_nodes deve ignorar diretório .git"""
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_dir = Path(tmp) / "custom_nodes"
+            custom_dir.mkdir()
+            node_dir = custom_dir / "ComfyUI_essentials"
+            node_dir.mkdir()
+            (node_dir / "node.py").write_text("# source\n")
+            git_dir = node_dir / ".git"
+            git_dir.mkdir()
+            (git_dir / "config").write_text("[core]\n")
+
+            snapshot = comfyui_setup.snapshot_custom_nodes(Path(tmp))
+
+            node_snap = snapshot["nodes"]["ComfyUI_essentials"]
+            self.assertIn("node.py", node_snap["files"])
+            self.assertFalse(any(".git" in f for f in node_snap["files"]))
+
+    def test_verify_unchanged_ignores_new_pycache_files(self):
+        """verify_custom_nodes_unchanged não deve flagrar novos arquivos .pyc como alteração"""
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_dir = Path(tmp) / "custom_nodes"
+            custom_dir.mkdir()
+            node_dir = custom_dir / "ComfyUI_essentials"
+            node_dir.mkdir()
+            (node_dir / "node.py").write_text("# original\n")
+
+            startup_snapshot = comfyui_setup.snapshot_custom_nodes(Path(tmp))
+
+            # Simular criação de __pycache__ após startup (comportamento normal do Python)
+            pycache = node_dir / "__pycache__"
+            pycache.mkdir()
+            (pycache / "node.cpython-312.pyc").write_bytes(b"bytecode")
+
+            changes = comfyui_setup.verify_custom_nodes_unchanged(
+                Path(tmp), startup_snapshot, strict=False
+            )
+            # Não deve detectar alterações (apenas bytecode compilado foi adicionado)
+            self.assertEqual(changes, [])
+
+
+# ---------------------------------------------------------------------------
+# Q — Filesystem check respeita ALLOWED_STATIC_FILES
+# ---------------------------------------------------------------------------
+
+class TestQ_FilesystemCheckAllowsStaticFiles(unittest.TestCase):
+    def test_final_check_allows_comfyui_example_png(self):
+        """final_filesystem_check deve permitir ComfyUI/input/example.png"""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Criar estrutura ComfyUI/input/example.png
+            example_png = Path(tmp) / "ComfyUI" / "input" / "example.png"
+            example_png.parent.mkdir(parents=True)
+            example_png.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            result = comfyui_setup.final_filesystem_check(scan_root=Path(tmp), silent=True)
+            self.assertEqual(result["violations"], 0)
+            self.assertIn("PASS", result["report"])
+
+    def test_final_check_allows_comfyui_comfy_types_examples(self):
+        """final_filesystem_check deve permitir arquivos em ComfyUI/comfy/comfy_types/examples/"""
+        with tempfile.TemporaryDirectory() as tmp:
+            example_dir = Path(tmp) / "ComfyUI" / "comfy" / "comfy_types" / "examples"
+            example_dir.mkdir(parents=True)
+            (example_dir / "required_hint.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (example_dir / "input_options.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (example_dir / "input_types.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            result = comfyui_setup.final_filesystem_check(scan_root=Path(tmp), silent=True)
+            self.assertEqual(result["violations"], 0)
+            self.assertIn("PASS", result["report"])
+
+    def test_final_check_allows_custom_nodes_zip(self):
+        """final_filesystem_check deve permitir .zip dentro de custom_nodes/"""
+        with tempfile.TemporaryDirectory() as tmp:
+            node_zip = Path(tmp) / "ComfyUI" / "custom_nodes" / "some_node" / "node.zip"
+            node_zip.parent.mkdir(parents=True)
+            node_zip.write_bytes(b"PK\x03\x04")
+
+            result = comfyui_setup.final_filesystem_check(scan_root=Path(tmp), silent=True)
+            self.assertEqual(result["violations"], 0)
+            self.assertIn("PASS", result["report"])
+
+    def test_final_check_allows_custom_nodes_source_files(self):
+        """final_filesystem_check deve permitir arquivos de código em custom_nodes/"""
+        with tempfile.TemporaryDirectory() as tmp:
+            node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / "some_node"
+            node_dir.mkdir(parents=True)
+            (node_dir / "node.py").write_text("# node code\n")
+            (node_dir / "config.json").write_text("{}")
+            (node_dir / "README.md").write_text("# Node")
+
+            result = comfyui_setup.final_filesystem_check(scan_root=Path(tmp), silent=True)
+            self.assertEqual(result["violations"], 0)
+            self.assertIn("PASS", result["report"])
+
+    def test_final_check_still_detects_leaked_images_outside_allowed(self):
+        """final_filesystem_check deve ainda detectar imagens vazadas fora da lista permitida"""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Imagem em ComfyUI/output (não está na lista de permitidos)
+            leaked = Path(tmp) / "ComfyUI" / "output" / "leaked.png"
+            leaked.parent.mkdir(parents=True)
+            leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            result = comfyui_setup.final_filesystem_check(scan_root=Path(tmp), silent=True)
+            self.assertGreater(result["violations"], 0)
+            self.assertIn("FAIL", result["report"])
+            self.assertIn("leaked.png", result["report"])
+
+
+# ---------------------------------------------------------------------------
+# R — assert_working_policy respeita ALLOWED_STATIC_FILES
+# ---------------------------------------------------------------------------
+
+class TestR_AssertWorkingPolicyAllowsStaticFiles(unittest.TestCase):
+    def test_assert_working_policy_allows_example_png(self):
+        """assert_working_policy deve permitir ComfyUI/input/example.png"""
+        with tempfile.TemporaryDirectory() as tmp:
+            example_png = Path(tmp) / "ComfyUI" / "input" / "example.png"
+            example_png.parent.mkdir(parents=True)
+            example_png.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_assert_working_policy_allows_comfy_types_examples(self):
+        """assert_working_policy deve permitir ComfyUI/comfy/comfy_types/examples/*"""
+        with tempfile.TemporaryDirectory() as tmp:
+            example_dir = Path(tmp) / "ComfyUI" / "comfy" / "comfy_types" / "examples"
+            example_dir.mkdir(parents=True)
+            (example_dir / "required_hint.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_assert_working_policy_allows_custom_nodes_zip(self):
+        """assert_working_policy deve permitir .zip em custom_nodes/"""
+        with tempfile.TemporaryDirectory() as tmp:
+            node_zip = Path(tmp) / "ComfyUI" / "custom_nodes" / "some_node" / "node.zip"
+            node_zip.parent.mkdir(parents=True)
+            node_zip.write_bytes(b"PK\x03\x04")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_assert_working_policy_still_detects_leaked_images(self):
+        """assert_working_policy deve ainda detectar imagens vazadas fora da lista"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leaked = Path(tmp) / "ComfyUI" / "output" / "leaked.png"
+            leaked.parent.mkdir(parents=True)
+            leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+
+# ---------------------------------------------------------------------------
+# S — assert_no_persistent_images respeita ALLOWED_STATIC_FILES
+# ---------------------------------------------------------------------------
+
+class TestS_AssertNoPersistentImagesAllowsStaticFiles(unittest.TestCase):
+    def test_assert_no_persistent_images_allows_example_png(self):
+        """assert_no_persistent_images deve permitir ComfyUI/input/example.png"""
+        with tempfile.TemporaryDirectory() as tmp:
+            example_png = Path(tmp) / "ComfyUI" / "input" / "example.png"
+            example_png.parent.mkdir(parents=True)
+            example_png.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_assert_no_persistent_images_allows_comfy_types_examples(self):
+        """assert_no_persistent_images deve permitir ComfyUI/comfy/comfy_types/examples/*"""
+        with tempfile.TemporaryDirectory() as tmp:
+            example_dir = Path(tmp) / "ComfyUI" / "comfy" / "comfy_types" / "examples"
+            example_dir.mkdir(parents=True)
+            (example_dir / "required_hint.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_assert_no_persistent_images_allows_custom_nodes_zip(self):
+        """assert_no_persistent_images deve permitir .zip em custom_nodes/"""
+        with tempfile.TemporaryDirectory() as tmp:
+            node_zip = Path(tmp) / "ComfyUI" / "custom_nodes" / "some_node" / "node.zip"
+            node_zip.parent.mkdir(parents=True)
+            node_zip.write_bytes(b"PK\x03\x04")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_assert_no_persistent_images_still_detects_leaked_images(self):
+        """assert_no_persistent_images deve ainda detectar imagens vazadas fora da lista"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leaked = Path(tmp) / "ComfyUI" / "output" / "leaked.png"
+            leaked.parent.mkdir(parents=True)
+            leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+
+# ---------------------------------------------------------------------------
+# T — assert_only_allowed_persistent_artifact respeita ALLOWED_STATIC_FILES
+# ---------------------------------------------------------------------------
+
+class TestT_AssertOnlyAllowedPersistentArtifactAllowsStaticFiles(unittest.TestCase):
+    def test_allows_example_png_in_snapshot(self):
+        """assert_only_allowed_persistent_artifact deve permitir ComfyUI/input/example.png no snapshot"""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Primeiro criar snapshot com example.png
+            example_png = Path(tmp) / "ComfyUI" / "input" / "example.png"
+            example_png.parent.mkdir(parents=True)
+            example_png.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            comfyui_setup.record_working_snapshot.__globals__["_WORKING_SNAPSHOT"] = set()
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                # Snapshot inicial com o arquivo permitido
+                comfyui_setup.record_working_snapshot()
+                # Não deve falhar
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def test_allows_comfy_types_examples_in_snapshot(self):
+        """assert_only_allowed_persistent_artifact deve permitir ComfyUI/comfy/comfy_types/examples/* no snapshot"""
+        with tempfile.TemporaryDirectory() as tmp:
+            example_dir = Path(tmp) / "ComfyUI" / "comfy" / "comfy_types" / "examples"
+            example_dir.mkdir(parents=True)
+            (example_dir / "required_hint.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.record_working_snapshot()
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def test_allows_custom_nodes_zip_in_snapshot(self):
+        """assert_only_allowed_persistent_artifact deve permitir .zip em custom_nodes/ no snapshot"""
+        with tempfile.TemporaryDirectory() as tmp:
+            node_zip = Path(tmp) / "ComfyUI" / "custom_nodes" / "some_node" / "node.zip"
+            node_zip.parent.mkdir(parents=True)
+            node_zip.write_bytes(b"PK\x03\x04")
+
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.record_working_snapshot()
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def test_still_detects_new_unauthorized_files(self):
+        """assert_only_allowed_persistent_artifact deve detectar novos arquivos não autorizados"""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Snapshot inicial vazio
+            comfyui_setup._WORKING_SNAPSHOT = set()
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            original_working = comfyui_setup.PERSISTENT_WORKING
+            
+            # Patch PERSISTENT_WORKING para o diretório temp
+            comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.record_working_snapshot()
+                
+                # Adicionar arquivo não autorizado após snapshot
+                leaked = Path(tmp) / "ComfyUI" / "output" / "leaked.png"
+                leaked.parent.mkdir(parents=True)
+                leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+                
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup.PERSISTENT_WORKING = original_working
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
 
 
 if __name__ == "__main__":

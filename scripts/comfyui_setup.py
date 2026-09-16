@@ -191,6 +191,7 @@ def assert_working_policy() -> None:
     Verifica que /kaggle/working contém apenas arquivos permitidos.
     Levanta SecurityError se encontrar qualquer artefato sensível.
     Diferente de assert_no_persistent_images, verifica também extensões não-imagem.
+    Ignora arquivos estáticos conhecidos do ComfyUI (ALLOWED_STATIC_FILES / ALLOWED_STATIC_PREFIXES).
     """
     scan_roots = list(PERSISTENT_AUDIT_PATHS)
     comfyui_persistent_dirs = [
@@ -211,13 +212,21 @@ def assert_working_policy() -> None:
         for item in root.rglob("*"):
             if not item.is_file():
                 continue
-            # output_secure.zip é o único artefato persistente permitido
+            # output_secure.zip é o único artefato persistente permitido (verificar por nome)
+            if item.name == "output_secure.zip":
+                continue
+
+            # Verificar se é arquivo estático permitido ANTES de analisar
+            # Calcular path relativo à raiz de scan (root), não a PERSISTENT_WORKING
             try:
-                rel = item.relative_to(PERSISTENT_WORKING)
-                if str(rel) == "output_secure.zip":
-                    continue
+                rel = str(item.relative_to(root))
             except ValueError:
-                pass
+                rel = str(item)
+
+            # Normalizar separadores para cross-platform
+            rel_normalized = rel.replace("\\", "/")
+            if _is_allowed_static_file(rel_normalized):
+                continue
 
             stat = item.stat()
             ext = item.suffix.lower()
@@ -269,6 +278,7 @@ def assert_only_allowed_persistent_artifact() -> None:
     """
     Verifica que o único arquivo persistente em /kaggle/working (além do snapshot inicial)
     é output_secure.zip. Levanta SecurityError se houver qualquer outro.
+    Também permite arquivos estáticos conhecidos do ComfyUI (ALLOWED_STATIC_FILES / ALLOWED_STATIC_PREFIXES).
     """
     if _WORKING_SNAPSHOT is None:
         record_working_snapshot()
@@ -285,11 +295,14 @@ def assert_only_allowed_persistent_artifact() -> None:
     new_files = current - _WORKING_SNAPSHOT
     # output_secure.zip é permitido
     new_files.discard("output_secure.zip")
+    # Arquivos estáticos permitidos também não contam como novos
+    allowed_to_discard = {f for f in new_files if _is_allowed_static_file(f)}
+    new_files -= allowed_to_discard
     if new_files:
         _security_abort(
             f"assert_only_allowed_persistent_artifact: {len(new_files)} arquivo(s) não autorizado(s) em /kaggle/working:\n"
             + "\n".join(f"  - {f}" for f in sorted(new_files)[:20])
-            + "\nApenas output_secure.zip é permitido como artefato persistente."
+            + "\nApenas output_secure.zip e arquivos estáticos do ComfyUI são permitidos como artefatos persistentes."
         )
     print(f"[SECURITY] assert_only_allowed_persistent_artifact: PASS")
 
@@ -567,6 +580,41 @@ PERSISTENT_AUDIT_PATHS: Tuple[Path, ...] = (
     Path("/kaggle/working"),
 )
 
+# Arquivos/padrões estáticos conhecidos do ComfyUI que NÃO são vazamentos
+# Usado por final_filesystem_check e assert_working_policy
+ALLOWED_STATIC_FILES: frozenset[str] = frozenset({
+    "ComfyUI/input/example.png",
+    "ComfyUI/comfy/comfy_types/examples/required_hint.png",
+    "ComfyUI/comfy/comfy_types/examples/input_options.png",
+    "ComfyUI/comfy/comfy_types/examples/input_types.png",
+})
+
+# Padrões de prefixo permitidos (qualquer arquivo sob esses caminhos é ignorado)
+ALLOWED_STATIC_PREFIXES: Tuple[str, ...] = (
+    "ComfyUI/comfy/comfy_types/examples/",
+    "ComfyUI/custom_nodes/",
+)
+
+
+def _is_allowed_static_file(rel_path: str) -> bool:
+    """Verifica se um caminho relativo é um arquivo estático conhecido/permitido."""
+    # Normalizar separadores de path para comparação cross-platform
+    normalized = rel_path.replace("\\", "/")
+    if normalized in ALLOWED_STATIC_FILES:
+        return True
+    for prefix in ALLOWED_STATIC_PREFIXES:
+        if normalized.startswith(prefix):
+            # Para ComfyUI/custom_nodes/, permitir apenas .zip e arquivos de código
+            if prefix == "ComfyUI/custom_nodes/":
+                if normalized.endswith(".zip"):
+                    return True
+                if any(normalized.endswith(ext) for ext in (".py", ".json", ".yaml", ".yml", ".txt", ".md", ".js", ".css", ".html", ".vue")):
+                    return True
+            else:
+                # Para outros prefixos permitidos (ex: ComfyUI/comfy/comfy_types/examples/), permitir tudo
+                return True
+    return False
+
 # ---------------------------------------------------------------------------
 # Security primitives
 # ---------------------------------------------------------------------------
@@ -732,6 +780,18 @@ def assert_no_persistent_images(
             if not item.is_file():
                 continue
 
+            # Verificar se é arquivo estático permitido ANTES de analisar
+            # Calcular path relativo à raiz de scan (root), não a PERSISTENT_WORKING
+            try:
+                rel = str(item.relative_to(root))
+            except ValueError:
+                rel = str(item)
+
+            # Normalizar separadores para cross-platform
+            rel_normalized = rel.replace("\\", "/")
+            if _is_allowed_static_file(rel_normalized):
+                continue
+
             stat = item.stat()
             ext = item.suffix.lower()
 
@@ -793,6 +853,28 @@ def _hash_file(path: Path, chunk_size: int = 65536) -> str:
     return h.hexdigest()
 
 
+# Padrões ignorados em snapshots de custom nodes (bytecode compilado, VCS, etc.)
+IGNORED_NODE_PATTERNS: frozenset[str] = frozenset({
+    "__pycache__",
+    ".git",
+})
+IGNORED_NODE_EXTENSIONS: frozenset[str] = frozenset({
+    ".pyc", ".pyo", ".pyd",
+})
+
+
+def _should_ignore_node_file(rel_path: str) -> bool:
+    """Verifica se um arquivo relativo deve ser ignorado no snapshot do node."""
+    parts = Path(rel_path).parts
+    # Ignorar qualquer arquivo dentro de __pycache__ ou .git
+    if any(part in IGNORED_NODE_PATTERNS for part in parts):
+        return True
+    # Ignorar por extensão
+    if Path(rel_path).suffix in IGNORED_NODE_EXTENSIONS:
+        return True
+    return False
+
+
 def compute_node_directory_hash(node_path: Path) -> str:
     """
     Computa SHA-256 determinístico do diretório de um custom node.
@@ -804,9 +886,14 @@ def compute_node_directory_hash(node_path: Path) -> str:
     for f in sorted(node_path.rglob("*")):
         if f.is_file() and not f.is_symlink():
             try:
-                files.append((str(f.relative_to(node_path)), _hash_file(f)))
+                rel = str(f.relative_to(node_path))
+                if _should_ignore_node_file(rel):
+                    continue
+                files.append((rel, _hash_file(f)))
             except (OSError, PermissionError):
-                files.append((str(f.relative_to(node_path)), "UNREADABLE"))
+                rel = str(f.relative_to(node_path))
+                if not _should_ignore_node_file(rel):
+                    files.append((rel, "UNREADABLE"))
     for rel, fhash in files:
         h.update(rel.encode("utf-8"))
         h.update(fhash.encode("utf-8"))
@@ -850,6 +937,7 @@ def snapshot_custom_nodes(comfyui_dir: Path) -> Dict[str, Any]:
     """
     Cria snapshot dos custom nodes instalados: nome, path, lista de arquivos com SHA-256.
     Usado para detectar alterações posteriores ao startup.
+    Ignora: __pycache__, .git, arquivos .pyc/.pyo/.pyd
     """
     custom_dir = Path(comfyui_dir) / "custom_nodes"
     snapshot: Dict[str, Any] = {
@@ -866,9 +954,14 @@ def snapshot_custom_nodes(comfyui_dir: Path) -> Dict[str, Any]:
         for f in sorted(item.rglob("*")):
             if f.is_file():
                 try:
-                    files[str(f.relative_to(item))] = _hash_file(f)
+                    rel = str(f.relative_to(item))
+                    if _should_ignore_node_file(rel):
+                        continue
+                    files[rel] = _hash_file(f)
                 except (OSError, PermissionError):
-                    files[str(f.relative_to(item))] = "UNREADABLE"
+                    rel = str(f.relative_to(item))
+                    if not _should_ignore_node_file(rel):
+                        files[rel] = "UNREADABLE"
         snapshot["nodes"][item.name] = {
             "path": str(item),
             "file_count": len(files),
@@ -1177,6 +1270,8 @@ def final_filesystem_check(
     Verifica também: symlinks, arquivos ocultos, arquivos sem extensão com magic bytes.
     Verifica explicitamente ComfyUI/input, ComfyUI/output, ComfyUI/temp mesmo se vazios.
 
+    Ignora arquivos estáticos conhecidos do ComfyUI (ALLOWED_STATIC_FILES / ALLOWED_STATIC_PREFIXES).
+
     Retorna dict com 'violations' (int), 'report' (str).
     """
     img_found = []
@@ -1217,6 +1312,15 @@ def final_filesystem_check(
                 continue
 
             if not item.is_file():
+                continue
+
+            # Verificar se é arquivo estático permitido ANTES de analisar
+            try:
+                rel = str(item.relative_to(scan_root))
+            except ValueError:
+                rel = str(item)
+
+            if _is_allowed_static_file(rel):
                 continue
 
             stat = item.stat()
