@@ -1281,6 +1281,18 @@ class TestQ_FilesystemCheckAllowsStaticFiles(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestR_AssertWorkingPolicyAllowsStaticFiles(unittest.TestCase):
+    def _patch_working(self, tmp):
+        """Helper para patchar PERSISTENT_WORKING e PERSISTENT_AUDIT_PATHS"""
+        original_working = comfyui_setup.PERSISTENT_WORKING
+        original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+        comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+        comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+        return original_working, original_paths
+
+    def _restore_working(self, original_working, original_paths):
+        comfyui_setup.PERSISTENT_WORKING = original_working
+        comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+
     def test_assert_working_policy_allows_example_png(self):
         """assert_working_policy deve permitir ComfyUI/input/example.png"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1288,12 +1300,11 @@ class TestR_AssertWorkingPolicyAllowsStaticFiles(unittest.TestCase):
             example_png.parent.mkdir(parents=True)
             example_png.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 comfyui_setup.assert_working_policy()
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
     def test_assert_working_policy_allows_comfy_types_examples(self):
         """assert_working_policy deve permitir ComfyUI/comfy/comfy_types/examples/*"""
@@ -1302,12 +1313,11 @@ class TestR_AssertWorkingPolicyAllowsStaticFiles(unittest.TestCase):
             example_dir.mkdir(parents=True)
             (example_dir / "required_hint.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 comfyui_setup.assert_working_policy()
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
     def test_assert_working_policy_allows_custom_nodes_zip(self):
         """assert_working_policy deve permitir .zip em custom_nodes/"""
@@ -1316,12 +1326,11 @@ class TestR_AssertWorkingPolicyAllowsStaticFiles(unittest.TestCase):
             node_zip.parent.mkdir(parents=True)
             node_zip.write_bytes(b"PK\x03\x04")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 comfyui_setup.assert_working_policy()
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
     def test_assert_working_policy_still_detects_leaked_images(self):
         """assert_working_policy deve ainda detectar imagens vazadas fora da lista"""
@@ -1330,13 +1339,12 @@ class TestR_AssertWorkingPolicyAllowsStaticFiles(unittest.TestCase):
             leaked.parent.mkdir(parents=True)
             leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 with self.assertRaises(comfyui_setup.SecurityError):
                     comfyui_setup.assert_working_policy()
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -1344,6 +1352,18 @@ class TestR_AssertWorkingPolicyAllowsStaticFiles(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestS_AssertNoPersistentImagesAllowsStaticFiles(unittest.TestCase):
+    def _patch_working(self, tmp):
+        """Helper para patchar PERSISTENT_WORKING e PERSISTENT_AUDIT_PATHS"""
+        original_working = comfyui_setup.PERSISTENT_WORKING
+        original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+        comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+        comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+        return original_working, original_paths
+
+    def _restore_working(self, original_working, original_paths):
+        comfyui_setup.PERSISTENT_WORKING = original_working
+        comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+
     def test_assert_no_persistent_images_allows_example_png(self):
         """assert_no_persistent_images deve permitir ComfyUI/input/example.png"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1351,12 +1371,11 @@ class TestS_AssertNoPersistentImagesAllowsStaticFiles(unittest.TestCase):
             example_png.parent.mkdir(parents=True)
             example_png.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 comfyui_setup.assert_no_persistent_images(label="TEST")
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
     def test_assert_no_persistent_images_allows_comfy_types_examples(self):
         """assert_no_persistent_images deve permitir ComfyUI/comfy/comfy_types/examples/*"""
@@ -1365,12 +1384,11 @@ class TestS_AssertNoPersistentImagesAllowsStaticFiles(unittest.TestCase):
             example_dir.mkdir(parents=True)
             (example_dir / "required_hint.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 comfyui_setup.assert_no_persistent_images(label="TEST")
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
     def test_assert_no_persistent_images_allows_custom_nodes_zip(self):
         """assert_no_persistent_images deve permitir .zip em custom_nodes/"""
@@ -1379,12 +1397,11 @@ class TestS_AssertNoPersistentImagesAllowsStaticFiles(unittest.TestCase):
             node_zip.parent.mkdir(parents=True)
             node_zip.write_bytes(b"PK\x03\x04")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 comfyui_setup.assert_no_persistent_images(label="TEST")
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
     def test_assert_no_persistent_images_still_detects_leaked_images(self):
         """assert_no_persistent_images deve ainda detectar imagens vazadas fora da lista"""
@@ -1393,13 +1410,12 @@ class TestS_AssertNoPersistentImagesAllowsStaticFiles(unittest.TestCase):
             leaked.parent.mkdir(parents=True)
             leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
-            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            original_working, original_paths = self._patch_working(tmp)
             try:
                 with self.assertRaises(comfyui_setup.SecurityError):
                     comfyui_setup.assert_no_persistent_images(label="TEST")
             finally:
-                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                self._restore_working(original_working, original_paths)
 
 
 # ---------------------------------------------------------------------------
