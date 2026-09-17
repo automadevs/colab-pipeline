@@ -1509,12 +1509,103 @@ class TestT_AssertOnlyAllowedPersistentArtifactAllowsStaticFiles(unittest.TestCa
                 comfyui_setup.PERSISTENT_WORKING = original_working
                 comfyui_setup._WORKING_SNAPSHOT = original_snapshot
 
+    def test_git_internal_files_after_snapshot_ignored(self):
+        """assert_only_allowed_persistent_artifact deve ignorar arquivos internos .git (FETCH_HEAD, ORIG_HEAD) criados após o snapshot"""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Snapshot inicial vazio (sem .git ainda)
+            comfyui_setup._WORKING_SNAPSHOT = set()
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            original_working = comfyui_setup.PERSISTENT_WORKING
+
+            comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                # Snapshot inicial — antes de qualquer operação git
+                comfyui_setup.record_working_snapshot()
+
+                # Simular git pull/fetch escrevendo arquivos internos do .git APÓS o snapshot
+                git_dir = Path(tmp) / ".git"
+                git_dir.mkdir()
+                (git_dir / "FETCH_HEAD").write_text("abc123\trefs/heads/main\n")
+                (git_dir / "ORIG_HEAD").write_text("abc123\n")
+
+                # Também dentro de ComfyUI/custom_nodes/node/.git
+                cn_git = Path(tmp) / "ComfyUI" / "custom_nodes" / "some_node" / ".git"
+                cn_git.mkdir(parents=True)
+                (cn_git / "FETCH_HEAD").write_text("def456\trefs/heads/main\n")
+                (cn_git / "ORIG_HEAD").write_text("def456\n")
+
+                # Não deve levantar SecurityError — arquivos .git são bookkeeping do git
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup.PERSISTENT_WORKING = original_working
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def test_non_git_new_file_still_detected(self):
+        """assert_only_allowed_persistent_artifact deve continuar detectando arquivos novos fora de .git/"""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Snapshot inicial vazio
+            comfyui_setup._WORKING_SNAPSHOT = set()
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            original_working = comfyui_setup.PERSISTENT_WORKING
+
+            comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.record_working_snapshot()
+
+                # Arquivo .png solto fora de .git/ — deve ser detectado
+                leaked = Path(tmp) / "leaked.png"
+                leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup.PERSISTENT_WORKING = original_working
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def test_git_internal_and_real_violation_together(self):
+        """Quando .git/ é modificado e um arquivo real surge, apenas o real deve ser flagrado"""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui_setup._WORKING_SNAPSHOT = set()
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            original_working = comfyui_setup.PERSISTENT_WORKING
+
+            comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.record_working_snapshot()
+
+                # Arquivo interno do .git — deve ser ignorado
+                git_dir = Path(tmp) / "ComfyUI" / ".git"
+                git_dir.mkdir(parents=True)
+                (git_dir / "FETCH_HEAD").write_text("abc123\trefs/heads/main\n")
+                (git_dir / "ORIG_HEAD").write_text("abc123\n")
+
+                # Arquivo real não autorizado — deve ser detectado
+                leaked = Path(tmp) / "ComfyUI" / "output" / "leaked.png"
+                leaked.parent.mkdir(parents=True)
+                leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup.PERSISTENT_WORKING = original_working
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
 
 # ---------------------------------------------------------------------------
 # U — Git-based working directory audit (abordagem B)
 # Verifica que um clone limpo do ComfyUI passa, mas arquivos sensíveis
 # colocados manualmente continuam sendo detectados.
 # ---------------------------------------------------------------------------
+
 
 class TestU_GitBasedAudit(unittest.TestCase):
     """Testa a checagem baseada em git (git ls-files / git status --porcelain)."""
