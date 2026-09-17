@@ -423,7 +423,7 @@ def audit_working_directory(
     *,
     label: str = "AUDIT",
     raise_on_violation: bool = True,
-    include_final_filesystem: bool = True,
+    include_final_filesystem: bool = False,
     include_working_policy: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -444,7 +444,12 @@ def audit_working_directory(
       - unauthorized_persistent_artifact: diff contra o snapshot + allowlist
         (== assert_only_allowed_persistent_artifact)
       - final_filesystem: como working_policy porem incluindo output_secure.zip
-        (== final_filesystem_check; omitida com include_final_filesystem=False)
+        (== final_filesystem_check da sessao final; omitida por PADRAO porque
+        output_secure.zip — o unico artefato permitido pos-geracao — seria
+        flagrado como `extension`.So faz sentido liga-la
+        (include_final_filesystem=True) na verificacao de ENCERRAMENTO da
+        sessao, quando ate o ZIP ja deve ter sumido. Nos gates PRE-ZIP e
+        POST-CLEAR ela deve ficar DESLIGADA.)
 
     include_working_policy=False omite a categoria working_policy. Usado em
     testes sem clone git: _is_git_changed_file() eh fail-closed (retorna True
