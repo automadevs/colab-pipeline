@@ -136,6 +136,24 @@ SENSITIVE_NON_IMAGE_EXTENSIONS = frozenset({
 })
 
 
+def _is_git_internal_path(rel_path: str) -> bool:
+    """Retorna True se o caminho relativo contém um segmento '.git'.
+
+    Arquivos dentro de diretórios .git/ são bookkeeping interno do próprio Git
+    (FETCH_HEAD, ORIG_HEAD, refs/, objects/, logs/, etc.) — criados ou modificados
+    automaticamente por ``git pull``/``git fetch``/``git merge``, nunca escritos
+    pelo usuário. Como o diretório .git em si nunca é *tracked* pelo próprio git,
+    esses arquivos nunca devem ser candidatos a "artefato persistente não
+    autorizado".
+
+    Usa ``Path(rel_path).parts`` para detectar o segmento '.git' em **qualquer**
+    posição do caminho (ex: ``ComfyUI/.git/FETCH_HEAD``,
+    ``custom_nodes/foo/.git/HEAD``) e não apenas quando o caminho começa com
+    '.git/'.
+    """
+    return ".git" in Path(rel_path).parts
+
+
 def record_working_snapshot() -> set:
     """
     Registra snapshot dos arquivos em /kaggle/working no início da sessão.
@@ -150,9 +168,13 @@ def record_working_snapshot() -> set:
             if item.is_file():
                 try:
                     rel = str(item.relative_to(working))
-                    snapshot.add(rel)
                 except ValueError:
-                    snapshot.add(str(item))
+                    rel = str(item)
+                # Ignorar arquivos internos do .git (bookkeeping do próprio Git,
+                # nunca escritos pelo usuário nem tracked pelo git)
+                if _is_git_internal_path(rel):
+                    continue
+                snapshot.add(rel)
     _WORKING_SNAPSHOT = snapshot
     print(f"[SECURITY] Working snapshot: {len(snapshot)} arquivo(s) registrado(s) em /kaggle/working")
     return snapshot
@@ -172,9 +194,12 @@ def assert_working_clean() -> None:
             if item.is_file():
                 try:
                     rel = str(item.relative_to(working))
-                    current.add(rel)
                 except ValueError:
-                    current.add(str(item))
+                    rel = str(item)
+                # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
+                if _is_git_internal_path(rel):
+                    continue
+                current.add(rel)
     new_files = current - _WORKING_SNAPSHOT
     # output_secure.zip é permitido
     new_files.discard("output_secure.zip")
@@ -236,9 +261,12 @@ def assert_only_allowed_persistent_artifact() -> None:
             if item.is_file():
                 try:
                     rel = str(item.relative_to(working))
-                    current.add(rel)
                 except ValueError:
-                    current.add(str(item))
+                    rel = str(item)
+                # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
+                if _is_git_internal_path(rel):
+                    continue
+                current.add(rel)
     new_files = current - _WORKING_SNAPSHOT
     # output_secure.zip é permitido
     new_files.discard("output_secure.zip")
@@ -882,6 +910,10 @@ def _scan_working_violations(
                 rel = str(item)
             rel_normalized = rel.replace("\\", "/")
 
+            # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
+            if _is_git_internal_path(rel_normalized):
+                continue
+
             # Camada 1: checagem git-based + allowlist estático
             if _is_file_allowed(rel_normalized, scan_root):
                 # Mesmo se permitido, verificar extensões sempre bloqueadas
@@ -1119,7 +1151,6 @@ def _hash_file(path: Path, chunk_size: int = 65536) -> str:
 # Padrões ignorados em snapshots de custom nodes (bytecode compilado, VCS, etc.)
 IGNORED_NODE_PATTERNS: frozenset[str] = frozenset({
     "__pycache__",
-    ".git",
 })
 IGNORED_NODE_EXTENSIONS: frozenset[str] = frozenset({
     ".pyc", ".pyo", ".pyd",
@@ -1129,8 +1160,11 @@ IGNORED_NODE_EXTENSIONS: frozenset[str] = frozenset({
 def _should_ignore_node_file(rel_path: str) -> bool:
     """Verifica se um arquivo relativo deve ser ignorado no snapshot do node."""
     parts = Path(rel_path).parts
-    # Ignorar qualquer arquivo dentro de __pycache__ ou .git
+    # Ignorar __pycache__ (bytecode compilado)
     if any(part in IGNORED_NODE_PATTERNS for part in parts):
+        return True
+    # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
+    if _is_git_internal_path(rel_path):
         return True
     # Ignorar por extensão
     if Path(rel_path).suffix in IGNORED_NODE_EXTENSIONS:
