@@ -623,26 +623,26 @@ def _is_allowed_static_file(rel_path: str) -> bool:
 _git_tracked_cache: Dict[str, frozenset[str]] = {}
 
 
-def _get_comfyui_dir(scan_root: Path) -> Optional[Path]:
-    """
-    Retorna o diretório do clone do ComfyUI dentro de scan_root, se existir.
-    Procura por scan_root/ComfyUI/.git (repo oficial clonado).
-    """
-    comfyui = scan_root / "ComfyUI"
-    if (comfyui / ".git").exists():
-        return comfyui
-    return None
+def _get_git_repo_dirs(scan_root: Path) -> Optional[List[Path]]:
+    """Retorna os repositórios Git de primeiro nível encontrados em scan_root."""
+    repos = [
+        child for child in scan_root.iterdir()
+        if child.is_dir() and (child / ".git").is_dir()
+    ]
+    return repos or None
 
 
 def _get_git_tracked_set(scan_root: Path) -> Optional[frozenset[str]]:
     """
     Retorna o conjunto de paths relativos (relativos a scan_root) de todos
-    arquivos tracked pelo git no repo ComfyUI dentro de scan_root.
+        arquivos tracked pelo git nos repos de primeiro nível dentro de scan_root.
 
-    Usa `git -C <comfyui_dir> ls-files` para listar arquivos tracked.
+        Usa `git -C <repo_dir> ls-files` para listar arquivos tracked em cada repo.
     Retorna None se:
-      - Não houver repo git do ComfyUI em scan_root
-      - git não estiver disponível ou falhar
+            - Não houver repo git em scan_root
+
+        Um repo individual que falhar não contribui arquivos confiáveis; os demais
+        repos continuam sendo agregados, preservando o comportamento fail-closed.
 
     O cache é por scan_root resolved string.
     """
@@ -650,28 +650,26 @@ def _get_git_tracked_set(scan_root: Path) -> Optional[frozenset[str]]:
     if key in _git_tracked_cache:
         return _git_tracked_cache[key]
 
-    comfyui_dir = _get_comfyui_dir(scan_root)
-    if comfyui_dir is None:
-        return None
-
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(comfyui_dir), "ls-files"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return None
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    repo_dirs = _get_git_repo_dirs(scan_root)
+    if repo_dirs is None:
         return None
 
     tracked: set[str] = set()
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
+    for repo_dir in repo_dirs:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_dir), "ls-files"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
-        # git ls-files retorna paths relativos ao repo (ex: comfy/..., web/...)
-        # Prefixar com "ComfyUI/" para casar com os paths relativos a scan_root
-        tracked.add(f"ComfyUI/{line}")
+        if result.returncode != 0:
+            continue
+        prefix = f"{repo_dir.name}/"
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line:
+                tracked.add(f"{prefix}{line}")
 
     frozen = frozenset(tracked)
     _git_tracked_cache[key] = frozen
@@ -681,43 +679,41 @@ def _get_git_tracked_set(scan_root: Path) -> Optional[frozenset[str]]:
 def _get_git_untracked_set(scan_root: Path) -> Optional[frozenset[str]]:
     """
     Retorna o conjunto de paths relativos (relativos a scan_root) de arquivos
-    untracked ou modified no repo ComfyUI dentro de scan_root.
+    untracked ou modified nos repos de primeiro nível dentro de scan_root.
 
-    Usa `git -C <comfyui_dir> status --porcelain --ignored=no` para listar.
-    Retorna None se não houver repo git ou git falhar.
+    Um repo individual que falhar não contribui paths alterados; seus arquivos
+    continuam não confiáveis porque também não aparecem no conjunto tracked.
     """
     key = str(scan_root.resolve()) + ":untracked"
     if key in _git_tracked_cache:
         return _git_tracked_cache[key]
 
-    comfyui_dir = _get_comfyui_dir(scan_root)
-    if comfyui_dir is None:
-        return None
-
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(comfyui_dir), "status", "--porcelain", "--ignored=no"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return None
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    repo_dirs = _get_git_repo_dirs(scan_root)
+    if repo_dirs is None:
         return None
 
     changed: set[str] = set()
-    for line in result.stdout.splitlines():
-        if len(line) < 4:
+    for repo_dir in repo_dirs:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_dir), "status", "--porcelain", "--ignored=no"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
-        status = line[:2]
-        if status == "!!":
+        if result.returncode != 0:
             continue
-        path = line[3:].strip()
-        if " -> " in path:
-            path = path.split(" -> ")[1]
-        if path.startswith('"') and path.endswith('"'):
-            path = path[1:-1]
-        if path:
-            changed.add(f"ComfyUI/{path}")
+        prefix = f"{repo_dir.name}/"
+        for line in result.stdout.splitlines():
+            if len(line) < 4 or line[:2] == "!!":
+                continue
+            path = line[3:].strip()
+            if " -> " in path:
+                path = path.split(" -> ")[1]
+            if path.startswith('"') and path.endswith('"'):
+                path = path[1:-1]
+            if path:
+                changed.add(f"{prefix}{path}")
 
     frozen = frozenset(changed)
     _git_tracked_cache[key] = frozen
