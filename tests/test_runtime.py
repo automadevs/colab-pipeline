@@ -1599,6 +1599,70 @@ class TestT_AssertOnlyAllowedPersistentArtifactAllowsStaticFiles(unittest.TestCa
                 comfyui_setup.PERSISTENT_WORKING = original_working
                 comfyui_setup._WORKING_SNAPSHOT = original_snapshot
 
+    def test_pycache_after_snapshot_ignored(self):
+        """assert_only_allowed_persistent_artifact deve ignorar __pycache__/*.pyc criados apos o snapshot (import do servidor)"""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui_setup._WORKING_SNAPSHOT = set()
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            original_working = comfyui_setup.PERSISTENT_WORKING
+
+            comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.record_working_snapshot()
+
+                # Simular subida do servidor gerando bytecode APOS o snapshot
+                pycache = Path(tmp) / "ComfyUI" / "__pycache__"
+                pycache.mkdir(parents=True)
+                (pycache / "server.cpython-312.pyc").write_bytes(b"bytecode")
+                nested = Path(tmp) / "ComfyUI" / "api_server" / "routes" / "__pycache__"
+                nested.mkdir(parents=True)
+                (nested / "__init__.cpython-312.pyc").write_bytes(b"bytecode")
+
+                # Nao deve levantar SecurityError — bytecode nao eh artefato
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup.PERSISTENT_WORKING = original_working
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def test_pycache_and_real_violation_together(self):
+        """Quando __pycache__/ surge junto de um arquivo real, apenas o real deve ser flagrado"""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui_setup._WORKING_SNAPSHOT = set()
+            original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+            original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            original_working = comfyui_setup.PERSISTENT_WORKING
+
+            comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.record_working_snapshot()
+
+                pycache = Path(tmp) / "ComfyUI" / "__pycache__"
+                pycache.mkdir(parents=True)
+                (pycache / "server.cpython-312.pyc").write_bytes(b"bytecode")
+
+                leaked = Path(tmp) / "leaked.png"
+                leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+                comfyui_setup.PERSISTENT_WORKING = original_working
+                comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def test_runtime_filter_exact_segment_not_substring(self):
+        """_is_ephemeral_internal_path usa igualdade exata de segmento, nao substring"""
+        self.assertTrue(comfyui_setup._is_ephemeral_internal_path("ComfyUI/__pycache__/a.pyc"))
+        self.assertTrue(comfyui_setup._is_ephemeral_internal_path("ComfyUI/.git/FETCH_HEAD"))
+        self.assertTrue(comfyui_setup._is_ephemeral_internal_path("x.PYC"))
+        self.assertFalse(comfyui_setup._is_ephemeral_internal_path("ComfyUI/my_pycache_notes.txt"))
+        self.assertFalse(comfyui_setup._is_ephemeral_internal_path("ComfyUI/.gitignore"))
+        self.assertFalse(comfyui_setup._is_ephemeral_internal_path("ComfyUI/leaked.png"))
+
 
 # ---------------------------------------------------------------------------
 # U — Git-based working directory audit (abordagem B)

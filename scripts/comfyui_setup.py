@@ -153,6 +153,30 @@ def _is_git_internal_path(rel_path: str) -> bool:
     """
     return ".git" in Path(rel_path).parts
 
+RUNTIME_GENERATED_DIR_NAMES: frozenset[str] = frozenset({
+    "__pycache__",
+})
+RUNTIME_GENERATED_EXTENSIONS: frozenset[str] = frozenset({
+    ".pyc",
+    ".pyo",
+    ".pyd",
+})
+
+
+def _is_runtime_generated_path(rel_path: str) -> bool:
+    """Retorna True se o caminho eh artefato gerado pelo runtime Python."""
+    parts = Path(rel_path).parts
+    if any(part in RUNTIME_GENERATED_DIR_NAMES for part in parts):
+        return True
+    if Path(rel_path).suffix.lower() in RUNTIME_GENERATED_EXTENSIONS:
+        return True
+    return False
+
+
+def _is_ephemeral_internal_path(rel_path: str) -> bool:
+    """Retorna True para bookkeeping interno (git ou runtime) — nunca artefato."""
+    return _is_git_internal_path(rel_path) or _is_runtime_generated_path(rel_path)
+
 
 def record_working_snapshot() -> set:
     """
@@ -170,9 +194,9 @@ def record_working_snapshot() -> set:
                     rel = str(item.relative_to(working))
                 except ValueError:
                     rel = str(item)
-                # Ignorar arquivos internos do .git (bookkeeping do próprio Git,
-                # nunca escritos pelo usuário nem tracked pelo git)
-                if _is_git_internal_path(rel):
+                # Ignorar bookkeeping interno (.git/ e bytecode __pycache__) —
+                # nunca escritos pelo usuario como artefato.
+                if _is_ephemeral_internal_path(rel):
                     continue
                 snapshot.add(rel)
     _WORKING_SNAPSHOT = snapshot
@@ -196,8 +220,9 @@ def assert_working_clean() -> None:
                     rel = str(item.relative_to(working))
                 except ValueError:
                     rel = str(item)
-                # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
-                if _is_git_internal_path(rel):
+                # Ignorar bookkeeping interno (.git/ e bytecode __pycache__) —
+                # nunca escritos pelo usuario como artefato.
+                if _is_ephemeral_internal_path(rel):
                     continue
                 current.add(rel)
     new_files = current - _WORKING_SNAPSHOT
@@ -263,8 +288,9 @@ def assert_only_allowed_persistent_artifact() -> None:
                     rel = str(item.relative_to(working))
                 except ValueError:
                     rel = str(item)
-                # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
-                if _is_git_internal_path(rel):
+                # Ignorar bookkeeping interno (.git/ e bytecode __pycache__) —
+                # nunca escritos pelo usuario como artefato.
+                if _is_ephemeral_internal_path(rel):
                     continue
                 current.add(rel)
     new_files = current - _WORKING_SNAPSHOT
@@ -910,8 +936,9 @@ def _scan_working_violations(
                 rel = str(item)
             rel_normalized = rel.replace("\\", "/")
 
-            # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
-            if _is_git_internal_path(rel_normalized):
+            # Ignorar bookkeeping interno (.git/ e bytecode __pycache__) —
+            # gerados pelo git e pelo interpretador, nunca artefato de usuário.
+            if _is_ephemeral_internal_path(rel_normalized):
                 continue
 
             # Camada 1: checagem git-based + allowlist estático
@@ -1149,22 +1176,18 @@ def _hash_file(path: Path, chunk_size: int = 65536) -> str:
 
 
 # Padrões ignorados em snapshots de custom nodes (bytecode compilado, VCS, etc.)
-IGNORED_NODE_PATTERNS: frozenset[str] = frozenset({
-    "__pycache__",
-})
-IGNORED_NODE_EXTENSIONS: frozenset[str] = frozenset({
-    ".pyc", ".pyo", ".pyd",
-})
+# Alias dos conjuntos centralizados RUNTIME_GENERATED_* (mantidos por compat).
+IGNORED_NODE_PATTERNS: frozenset[str] = RUNTIME_GENERATED_DIR_NAMES
+IGNORED_NODE_EXTENSIONS: frozenset[str] = RUNTIME_GENERATED_EXTENSIONS
 
 
 def _should_ignore_node_file(rel_path: str) -> bool:
-    """Verifica se um arquivo relativo deve ser ignorado no snapshot do node."""
-    parts = Path(rel_path).parts
-    # Ignorar __pycache__ (bytecode compilado)
-    if any(part in IGNORED_NODE_PATTERNS for part in parts):
-        return True
-    # Ignorar arquivos internos do .git (bookkeeping do próprio Git)
-    if _is_git_internal_path(rel_path):
+    """Verifica se um arquivo relativo deve ser ignorado no snapshot do node.
+
+    Reusa _is_ephemeral_internal_path (.git/ + __pycache__/bytecode) e
+    adiciona a checagem de extensao compilada.
+    """
+    if _is_ephemeral_internal_path(rel_path):
         return True
     # Ignorar por extensão
     if Path(rel_path).suffix in IGNORED_NODE_EXTENSIONS:
