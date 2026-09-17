@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -1661,6 +1662,56 @@ class TestU_GitBasedAudit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             comfyui_dir = self._create_comfyui_git_repo(tmp)
             (comfyui_dir / "unexpected.py").write_text("print('unexpected')\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_clone_colab_pipeline_json_tracked_limpo_e_permitido(self):
+        """JSON tracked e limpo de um segundo repo deve passar a política."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "colab-pipeline"
+            repo.mkdir()
+            runtime = repo / "kaggle_runtime"
+            runtime.mkdir()
+            config = runtime / "08_master_pipeline.json"
+            config.write_text('{"nodes": []}\n')
+            env = os.environ.copy()
+            env["GIT_AUTHOR_NAME"] = "Test"
+            env["GIT_AUTHOR_EMAIL"] = "test@test.com"
+            env["GIT_COMMITTER_NAME"] = "Test"
+            env["GIT_COMMITTER_EMAIL"] = "test@test.com"
+            subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=str(repo), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, env=env, check=True)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+
+    def test_clone_colab_pipeline_json_modificado_e_reprovado(self):
+        """JSON tracked mas modificado de um segundo repo deve ser reprovado."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "colab-pipeline"
+            repo.mkdir()
+            config = repo / "config.json"
+            config.write_text('{"clean": true}\n')
+            env = os.environ.copy()
+            env["GIT_AUTHOR_NAME"] = "Test"
+            env["GIT_AUTHOR_EMAIL"] = "test@test.com"
+            env["GIT_COMMITTER_NAME"] = "Test"
+            env["GIT_COMMITTER_EMAIL"] = "test@test.com"
+            subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=str(repo), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, env=env, check=True)
+            config.write_text('{"clean": false}\n')
 
             original = comfyui_setup.PERSISTENT_AUDIT_PATHS
             comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
