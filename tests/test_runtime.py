@@ -1795,10 +1795,44 @@ class TestT_AssertOnlyAllowedPersistentArtifactAllowsStaticFiles(unittest.TestCa
             try:
                 comfyui_setup.record_working_snapshot()
                 res = comfyui_setup.audit_working_directory(
-                    label="TEST", raise_on_violation=True, include_final_filesystem=False,
+                    label="TEST", raise_on_violation=True,
                 )
                 self.assertFalse(res["has_violations"])
                 self.assertIn("STATUS: PASS", res["report"])
+            finally:
+                self._restore_working_roots(*orig)
+
+    def test_audit_final_filesystem_flags_output_zip_by_design(self):
+        """Categoria final_filesystem (opt-in) flagra output_secure.zip — por design.
+
+        Regressao do POST-CLEAR: com o default (include_final_filesystem=False),
+        output_secure.zip NAO pode falhar o audit (eh o unico artefato permitido).
+        So a verificacao de ENCERRAMENTO liga a categoria.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                comfyui_setup.record_working_snapshot()
+                (Path(tmp) / "output_secure.zip").write_bytes(b"PK\x03\x04")
+                # Default (gates PRE-ZIP/POST-CLEAR): passa
+                ok = comfyui_setup.audit_working_directory(
+                    label="TEST-POST-CLEAR", raise_on_violation=True,
+                )
+                self.assertFalse(ok["has_violations"])
+                # Opt-in (gate FINAL): flagra o zip
+                bad = comfyui_setup.audit_working_directory(
+                    label="TEST-FINAL", raise_on_violation=False,
+                    include_final_filesystem=True,
+                )
+                self.assertTrue(bad["has_violations"])
+                self.assertEqual(bad["total_by_category"]["final_filesystem"], 1)
+                self.assertEqual(bad["total_by_category"]["unauthorized_persistent_artifact"], 0)
+                with self.assertRaises(comfyui_setup.SecurityError) as ctx:
+                    comfyui_setup.audit_working_directory(
+                        label="TEST-FINAL", raise_on_violation=True,
+                        include_final_filesystem=True,
+                    )
+                self.assertIn("final_filesystem", str(ctx.exception))
             finally:
                 self._restore_working_roots(*orig)
 
