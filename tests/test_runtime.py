@@ -1663,6 +1663,145 @@ class TestT_AssertOnlyAllowedPersistentArtifactAllowsStaticFiles(unittest.TestCa
         self.assertFalse(comfyui_setup._is_ephemeral_internal_path("ComfyUI/.gitignore"))
         self.assertFalse(comfyui_setup._is_ephemeral_internal_path("ComfyUI/leaked.png"))
 
+    def _set_working_roots(self, tmp):
+        """Patch PERSISTENT_WORKING/PERSISTENT_AUDIT_PATHS/_WORKING_SNAPSHOT para tmp."""
+        comfyui_setup._WORKING_SNAPSHOT = set()
+        original_snapshot = comfyui_setup._WORKING_SNAPSHOT
+        original_paths = comfyui_setup.PERSISTENT_AUDIT_PATHS
+        original_working = comfyui_setup.PERSISTENT_WORKING
+        comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+        comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+        return original_snapshot, original_paths, original_working
+
+    def _restore_working_roots(self, original_snapshot, original_paths, original_working):
+        comfyui_setup.PERSISTENT_AUDIT_PATHS = original_paths
+        comfyui_setup.PERSISTENT_WORKING = original_working
+        comfyui_setup._WORKING_SNAPSHOT = original_snapshot
+
+    def _write_traceback_files(self, tmp):
+        """Recria os 8 arquivos do traceback real (metadados de custom nodes + yaml)."""
+        nodes = [
+            Path(tmp) / "ComfyUI" / "custom_nodes" / "ComfyUI_essentials",
+            Path(tmp) / "ComfyUI" / "custom_nodes" / "comfyui-krea2edit",
+        ]
+        for node in nodes:
+            node.mkdir(parents=True, exist_ok=True)
+            (node / ".gitignore").write_text("*.pyc\n")
+            (node / "LICENSE").write_text("MIT\n")
+            (node / "pyproject.toml").write_text('[project]\nname = "x"\n')
+        (nodes[0] / "fonts").mkdir(parents=True, exist_ok=True)
+        (nodes[0] / "fonts" / "ShareTechMono-Regular.ttf").write_bytes(b"\x00\x01\x00\x00font")
+        (Path(tmp) / "ComfyUI" / "extra_model_paths.yaml").write_text("comfyui:\n  base_path: /kaggle/input\n")
+        return nodes
+
+    def test_allows_extra_model_paths_yaml(self):
+        """extra_model_paths.yaml (gerado pelo proprio pipeline) eh autorizado."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                (Path(tmp) / "ComfyUI").mkdir(parents=True, exist_ok=True)
+                comfyui_setup.record_working_snapshot()
+                (Path(tmp) / "ComfyUI" / "extra_model_paths.yaml").write_text("comfyui:\n  base_path: /kaggle/input\n")
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                self._restore_working_roots(*orig)
+
+    def test_rebuild_snapshot_allows_authorized_install_files(self):
+        """Re-baseline APOS o provisionamento cobre custom nodes + yaml (fix dos 8 arquivos)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                comfyui_setup.record_working_snapshot()
+                self._write_traceback_files(tmp)
+                comfyui_setup.rebuild_working_snapshot_after_provisioning(label="TEST-POST-SETUP")
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+                # Sem clone git nos testes, a categoria working_policy eh fail-closed
+                # (marca tudo como git_changed); por isso omitida aqui — em producao
+                # o clone do ComfyUI sempre existe.
+                res = comfyui_setup.audit_working_directory(
+                    label="TEST", raise_on_violation=False,
+                    include_final_filesystem=False, include_working_policy=False,
+                )
+                self.assertFalse(res["has_violations"])
+            finally:
+                self._restore_working_roots(*orig)
+
+    def test_rebuild_snapshot_fail_closed_on_persistent_image(self):
+        """Re-baseline NAO lava lixo: com .png presente, aborta e mantem snapshot antigo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                comfyui_setup.record_working_snapshot()
+                before = set(comfyui_setup._WORKING_SNAPSHOT)
+                (Path(tmp) / "leaked.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.rebuild_working_snapshot_after_provisioning(label="TEST")
+                self.assertEqual(set(comfyui_setup._WORKING_SNAPSHOT), before)
+            finally:
+                self._restore_working_roots(*orig)
+
+    def test_non_git_new_file_still_detected_after_rebuild(self):
+        """Re-baseline nao enfraquece: png novo DEPOIS do rebuild segue detectado."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                comfyui_setup.record_working_snapshot()
+                self._write_traceback_files(tmp)
+                comfyui_setup.rebuild_working_snapshot_after_provisioning(label="TEST")
+                (Path(tmp) / "ComfyUI" / "output").mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / "ComfyUI" / "output" / "leaked.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_only_allowed_persistent_artifact()
+            finally:
+                self._restore_working_roots(*orig)
+
+    def test_audit_reports_all_categories_at_once(self):
+        """Uma execucao do audit mostra TODAS as categorias (nao uma por run)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                (Path(tmp) / "ComfyUI" / "output").mkdir(parents=True, exist_ok=True)
+                comfyui_setup.record_working_snapshot()
+                (Path(tmp) / "ComfyUI" / "output" / "leaked.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                (Path(tmp) / "comfyui.log").write_text("log\n")
+                (Path(tmp) / "mystery_blob").write_bytes(b"conteudo-desconhecido")
+
+                res = comfyui_setup.audit_working_directory(
+                    label="TEST", raise_on_violation=False, include_final_filesystem=False,
+                )
+                self.assertTrue(res["has_violations"])
+                self.assertGreater(len(res["categories"]["persistent_images"]), 0)
+                self.assertGreater(len(res["categories"]["working_policy"]), 0)
+                self.assertGreater(len(res["categories"]["unauthorized_persistent_artifact"]), 0)
+                self.assertIn("persistent_images", res["report"])
+                self.assertIn("working_policy", res["report"])
+                self.assertIn("unauthorized_persistent_artifact", res["report"])
+                # Modo padrao levanta UM unico SecurityError com todas as categorias
+                with self.assertRaises(comfyui_setup.SecurityError) as ctx:
+                    comfyui_setup.audit_working_directory(
+                        label="TEST", raise_on_violation=True, include_final_filesystem=False,
+                    )
+                msg = str(ctx.exception)
+                self.assertIn("persistent_images", msg)
+                self.assertIn("working_policy", msg)
+                self.assertIn("unauthorized_persistent_artifact", msg)
+            finally:
+                self._restore_working_roots(*orig)
+
+    def test_audit_working_directory_passes_clean_tree(self):
+        """Arvore limpa: audit passa sem SecurityError e has_violations=False."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                comfyui_setup.record_working_snapshot()
+                res = comfyui_setup.audit_working_directory(
+                    label="TEST", raise_on_violation=True, include_final_filesystem=False,
+                )
+                self.assertFalse(res["has_violations"])
+                self.assertIn("STATUS: PASS", res["report"])
+            finally:
+                self._restore_working_roots(*orig)
+
 
 # ---------------------------------------------------------------------------
 # U — Git-based working directory audit (abordagem B)

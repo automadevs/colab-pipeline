@@ -204,6 +204,43 @@ def record_working_snapshot() -> set:
     return snapshot
 
 
+def rebuild_working_snapshot_after_provisioning(label: str = "POST-SETUP") -> set:
+    """
+    Re-baseline do snapshot de /kaggle/working APOS o provisionamento oficial.
+
+    O snapshot inicial (record_working_snapshot) eh tirado na celula PRE-CHECK,
+    ANTES de setup_comfyui(). Tudo que a instalacao oficial instala depois
+    (custom nodes aninhados, extra_model_paths.yaml, __pycache__ do servidor,
+    bookkeeping .git/) nasce como "arquivo novo" e seria flagrado arquivo por
+    arquivo. Em vez de enumerar extensao por extensao, o baseline passa a ser
+    o ambiente TOTALMENTE PROVISIONADO: a fase de geracao nao pode persistir
+    nada novo a partir dai.
+
+    Fail-closed: antes de reescrever o baseline, roda uma varredura de
+    imagens/archives/modelos/symlinks sobre TUDO (independente do snapshot).
+    Se houver qualquer artefato sensivel, aborta e NAO reescreve — nunca
+    "lava" lixo para dentro do baseline.
+    """
+    scan_root = PERSISTENT_AUDIT_PATHS[0] if PERSISTENT_AUDIT_PATHS else PERSISTENT_WORKING
+    _clear_git_cache()
+    pre_existing = _scan_working_violations(
+        scan_root,
+        check_symlinks=True,
+        check_non_image_sensitive=False,
+        skip_output_zip=True,
+    )
+    if pre_existing:
+        _security_abort(_format_violations(pre_existing, f"{label}-PRE-REBASELINE"))
+    previous_count = len(_WORKING_SNAPSHOT) if _WORKING_SNAPSHOT is not None else 0
+    snapshot = record_working_snapshot()
+    added = len(snapshot) - previous_count
+    print(
+        f"[SECURITY] Working snapshot re-baseline [{label}]: "
+        f"{previous_count} -> {len(snapshot)} arquivo(s) (+{max(added, 0)} do provisionamento oficial)"
+    )
+    return snapshot
+
+
 def assert_working_clean() -> None:
     """
     Verifica que /kaggle/working não tem novos arquivos desde o snapshot.
@@ -266,21 +303,21 @@ def assert_working_policy() -> None:
     print(f"[SECURITY] assert_working_policy: PASS (zero artefatos proibidos)")
 
 
-def assert_only_allowed_persistent_artifact() -> None:
+def _scan_unauthorized_persistent_files(scan_root: Path) -> List[Dict[str, Any]]:
     """
-    Verifica que o único arquivo persistente em /kaggle/working (além do snapshot inicial)
-    é output_secure.zip. Levanta SecurityError se houver qualquer outro.
+    Coleta (sem abortar) os arquivos novos em scan_root que nao sao permitidos.
 
-    Usa abordagem híbrida git-based + allowlist estático:
-    - Arquivos tracked pelo `git clone` oficial do ComfyUI → permitidos
-    - Arquivos untracked/modified → não permitidos (a menos que seja custom_node)
-    - Sem git → fallback para allowlist estático expandido
+    Mesma logica de assert_only_allowed_persistent_artifact(), em modo coleta:
+    - compara contra _WORKING_SNAPSHOT (auto-registra se ainda nao existe)
+    - ignora bookkeeping interno (.git/, __pycache__/bytecode)
+    - descarta output_secure.zip e arquivos autorizados (git tracked/allowlist)
+
+    Retorna lista de violacoes (dicts com path/size/mtime/ext/type).
     """
-    _clear_git_cache()
     if _WORKING_SNAPSHOT is None:
         record_working_snapshot()
     current: set = set()
-    working = PERSISTENT_AUDIT_PATHS[0] if PERSISTENT_AUDIT_PATHS else PERSISTENT_WORKING
+    working = scan_root
     if working.exists():
         for item in working.rglob("*"):
             if item.is_file():
@@ -299,13 +336,171 @@ def assert_only_allowed_persistent_artifact() -> None:
     # Arquivos permitidos (git tracked ou allowlist) também não contam como novos
     allowed_to_discard = {f for f in new_files if _is_file_allowed(f.replace("\\", "/"), working)}
     new_files -= allowed_to_discard
-    if new_files:
+    violations: List[Dict[str, Any]] = []
+    for rel in sorted(new_files):
+        item = working / rel
+        try:
+            stat = item.stat()
+            size, mtime = stat.st_size, stat.st_mtime
+        except (OSError, PermissionError):
+            size, mtime = 0, 0.0
+        violations.append({
+            "path": str(item),
+            "type": "unauthorized_persistent_file",
+            "rel": rel.replace("\\", "/"),
+            "ext": Path(rel).suffix.lower(),
+            "size": size,
+            "mtime": mtime,
+        })
+    return violations
+
+
+def assert_only_allowed_persistent_artifact() -> None:
+    """
+    Verifica que o único arquivo persistente em /kaggle/working (além do snapshot inicial)
+    é output_secure.zip. Levanta SecurityError se houver qualquer outro.
+
+    Usa abordagem híbrida git-based + allowlist estático:
+    - Arquivos tracked pelo `git clone` oficial do ComfyUI → permitidos
+    - Arquivos untracked/modified → não permitidos (a menos que seja custom_node)
+    - Sem git → fallback para allowlist estático expandido
+    """
+    _clear_git_cache()
+    working = PERSISTENT_AUDIT_PATHS[0] if PERSISTENT_AUDIT_PATHS else PERSISTENT_WORKING
+    violations = _scan_unauthorized_persistent_files(working)
+    if violations:
         _security_abort(
-            f"assert_only_allowed_persistent_artifact: {len(new_files)} arquivo(s) não autorizado(s) em /kaggle/working:\n"
-            + "\n".join(f"  - {f}" for f in sorted(new_files)[:20])
+            f"assert_only_allowed_persistent_artifact: {len(violations)} arquivo(s) não autorizado(s) em /kaggle/working:\n"
+            + "\n".join(f"  - {v['rel']}" for v in violations[:20])
             + "\nApenas output_secure.zip e arquivos da instalação oficial do ComfyUI são permitidos."
         )
+    _clear_git_cache()
     print(f"[SECURITY] assert_only_allowed_persistent_artifact: PASS")
+
+
+def _format_audit_report(
+    results: Dict[str, Any],
+    max_samples: int = 20,
+) -> str:
+    """
+    Formata o dict retornado por audit_working_directory() em relatorio unico.
+
+    Agrupa por categoria, com contagem total, breakdown por tipo e amostra
+    de paths — para que TODAS as categorias de violacao aparecam numa unica
+    execucao, em vez de uma por run (whack-a-mole).
+    """
+    lines = [
+        "",
+        f"=== WORKING DIRECTORY AUDIT [{results.get('label', '')}] ===",
+        f"Scan root: {results.get('scan_root', '?')}",
+        "",
+    ]
+    grand_total = 0
+    for category, violations in results.get("categories", {}).items():
+        count = len(violations)
+        grand_total += count
+        lines.append(f"[{category}] {count} violacao(oes)")
+        if count:
+            by_type: Dict[str, int] = {}
+            for v in violations:
+                vtype = v.get("type", "?")
+                by_type[vtype] = by_type.get(vtype, 0) + 1
+            breakdown = ", ".join(f"{t}={n}" for t, n in sorted(by_type.items()))
+            lines.append(f"  por tipo: {breakdown}")
+            for v in violations[:max_samples]:
+                extra = v.get("rel") or v.get("ext") or v.get("target") or ""
+                lines.append(f"  - {v.get('path', '?')}  (type={v.get('type', '?')}{f', {extra}' if extra else ''})")
+            if count > max_samples:
+                lines.append(f"  ... e mais {count - max_samples} (ver log completo)")
+        lines.append("")
+    lines.append(f"TOTAL: {grand_total} violacao(oes) em {len(results.get('categories', {}))} categoria(s)")
+    lines.append(f"STATUS: {'FAIL' if grand_total else 'PASS'}")
+    return "\n".join(lines)
+
+
+def audit_working_directory(
+    scan_root: Optional[Path] = None,
+    *,
+    label: str = "AUDIT",
+    raise_on_violation: bool = True,
+    include_final_filesystem: bool = True,
+    include_working_policy: bool = True,
+) -> Dict[str, Any]:
+    """
+    Auditoria consolidada de /kaggle/working: roda TODAS as checagens em
+    modo coleta e reporta um unico relatorio agrupado por categoria.
+
+    Motivo: o notebook executa assert_no_persistent_images,
+    assert_working_policy, assert_only_allowed_persistent_artifact e
+    final_filesystem_check em sequencia, cada um abortando na propria
+    primeira falha — o usuario so via UMA categoria por run. Aqui todas as
+    categorias sao coletadas ANTES de reportar, entao uma execucao mostra
+    tudo de uma vez.
+
+    Categorias (podem se sobrepor — o mesmo arquivo pode aparecer em mais
+    de uma, pois cada uma usa flags diferentes):
+      - persistent_images: imagens/archives/modelos/symlinks (== assert_no_persistent_images)
+      - working_policy: acima + .json/.log/.db/etc. e git_changed (== assert_working_policy)
+      - unauthorized_persistent_artifact: diff contra o snapshot + allowlist
+        (== assert_only_allowed_persistent_artifact)
+      - final_filesystem: como working_policy porem incluindo output_secure.zip
+        (== final_filesystem_check; omitida com include_final_filesystem=False)
+
+    include_working_policy=False omite a categoria working_policy. Usado em
+    testes sem clone git: _is_git_changed_file() eh fail-closed (retorna True
+    quando nao ha repo), entao sem git a categoria marcaria TUDO como
+    violacao. Em producao (Kaggle) o clone do ComfyUI sempre existe.
+
+    Retorna dict com 'label', 'scan_root', 'categories', 'total_by_category',
+    'has_violations'. Com raise_on_violation=True (padrao), imprime o
+    relatorio e levanta UM unico SecurityError com todas as categorias.
+    """
+    root = Path(scan_root) if scan_root is not None else (
+        PERSISTENT_AUDIT_PATHS[0] if PERSISTENT_AUDIT_PATHS else PERSISTENT_WORKING
+    )
+    _clear_git_cache()
+    categories: Dict[str, List[Dict[str, Any]]] = {}
+    categories["persistent_images"] = _scan_working_violations(
+        root,
+        check_symlinks=True,
+        check_non_image_sensitive=False,
+        skip_output_zip=True,
+    )
+    categories["working_policy"] = (
+        _scan_working_violations(
+            root,
+            check_symlinks=True,
+            check_non_image_sensitive=True,
+            skip_output_zip=True,
+        )
+        if include_working_policy
+        else []
+    )
+    categories["unauthorized_persistent_artifact"] = _scan_unauthorized_persistent_files(root)
+    if include_final_filesystem:
+        # output_secure.zip detectado aqui de proposito (= final_filesystem_check)
+        categories["final_filesystem"] = _scan_working_violations(
+            root,
+            check_symlinks=True,
+            check_non_image_sensitive=False,
+            skip_output_zip=False,
+        )
+    _clear_git_cache()
+    results: Dict[str, Any] = {
+        "label": label,
+        "scan_root": str(root),
+        "categories": categories,
+        "total_by_category": {name: len(v) for name, v in categories.items()},
+        "has_violations": any(categories.values()),
+    }
+    report = _format_audit_report(results)
+    if results["has_violations"]:
+        if raise_on_violation:
+            _security_abort(report)
+        return {**results, "report": report}
+    print(report)
+    print(f"[SECURITY] audit_working_directory [{label}]: PASS (zero violacoes em todas as categorias)")
+    return {**results, "report": report}
 
 
 def validate_runtime_path(path: Path, allowed_roots: Optional[List[Path]] = None) -> Path:
@@ -633,6 +828,9 @@ ALLOWED_STATIC_ROOT_FILES: frozenset[str] = frozenset({
     "ComfyUI/output/README.md",
     "ComfyUI/temp/README.md",
     "ComfyUI/user/.gitkeep",
+    # Config gerada pelo proprio setup_comfyui() (extra_model_paths.yaml) —
+    # nunca dado de usuario: aponta modelos para /kaggle/input (datasets).
+    "ComfyUI/extra_model_paths.yaml",
 })
 
 
