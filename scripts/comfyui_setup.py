@@ -786,6 +786,13 @@ PERSISTENT_AUDIT_PATHS: Tuple[Path, ...] = (
 # NOTA: Em produção (Kaggle), a checagem primária é baseada em git — arquivos
 # tracked pelo `git clone` oficial do ComfyUI não são violação. Este allowlist
 # serve como fallback para quando o git não está disponível (testes, dirs temporários).
+# Subpastas de custom nodes onde imagens empacotadas (docs/screenshots/ícones
+# de UI) são esperadas. Restrição conservadora: a exceção NARROW de imagens
+# tracked-e-limpas (ver _is_packaged_node_doc_image) só vale dentro de um
+# destes segmentos. Qualquer imagem tracked-e-limpa fora deles continua bloqueada.
+NODE_DOC_IMAGE_DIR_NAMES: frozenset[str] = frozenset({
+    "docs", "web", "src_web", "assets", "images",
+})
 ALLOWED_STATIC_FILES: frozenset[str] = frozenset({
     "ComfyUI/input/example.png",
     "ComfyUI/comfy/comfy_types/examples/required_hint.png",
@@ -851,6 +858,9 @@ def _is_allowed_static_file(rel_path: str) -> bool:
     Extensões realmente sensíveis (.safetensors, .pt, .png, .jpg, etc.) são
     SEMPRE bloqueadas por _scan_working_violations(), mesmo se casarem com um
     prefixo permitido aqui — isso é uma camada extra de defesa.
+    Exceções NARROW (ver _is_allowed_static_file na Camada 1): arquivos de
+    fábrica conhecidos (ex: ComfyUI/input/example.png) e imagens de docs
+    empacotadas de custom nodes tracked-e-limpas (ver _is_packaged_node_doc_image).
     """
     # Normalizar separadores de path para comparação cross-platform
     normalized = rel_path.replace("\\", "/")
@@ -878,6 +888,10 @@ def _is_allowed_static_file(rel_path: str) -> bool:
 
 # Cache de arquivos tracked pelo git (evita rodar git status a cada chamada)
 _git_tracked_cache: Dict[str, frozenset[str]] = {}
+
+# Cache dos sets (tracked, changed) dos repos git ANINHADOS de custom nodes,
+# por node_dir resolvido. NUNCA confunde repos: a chave inclui o path absoluto.
+_nested_node_git_cache: Dict[str, Optional[Tuple[frozenset[str], frozenset[str]]]] = {}
 
 
 def _get_git_repo_dirs(scan_root: Path) -> Optional[List[Path]]:
@@ -980,6 +994,7 @@ def _get_git_untracked_set(scan_root: Path) -> Optional[frozenset[str]]:
 def _clear_git_cache() -> None:
     """Limpa o cache de git tracked/untracked. Usado em testes."""
     _git_tracked_cache.clear()
+    _nested_node_git_cache.clear()
 
 
 def _matches_git_changed_path(rel_path: str, changed_paths: frozenset[str]) -> bool:
@@ -1016,6 +1031,9 @@ def _is_file_allowed(rel_path: str, scan_root: Path) -> bool:
     _scan_working_violations() via parâmetro skip_output_zip.
     Extensões sensíveis (.safetensors, .pt, etc.) são bloqueadas por
     _scan_working_violations() MESMO se o arquivo for tracked pelo git.
+    Exceção: extensões de IMAGEM (.png, .jpg, etc.) passam se forem arquivo
+    de fábrica conhecido (_is_allowed_static_file) ou doc empacotada de
+    custom node tracked-e-limpa (_is_packaged_node_doc_image) — ver Camada 1.
     """
     normalized = rel_path.replace("\\", "/")
 
@@ -1037,6 +1055,107 @@ def _is_file_allowed(rel_path: str, scan_root: Path) -> bool:
 
     # Passo 2: fallback estático apenas quando git não está disponível.
     return _is_allowed_static_file(normalized)
+
+
+def _get_nested_node_git_sets(
+    scan_root: Path, node_dir: Path
+) -> Optional[Tuple[frozenset[str], frozenset[str]]]:
+    """
+    Retorna (tracked, changed) do repo git ANINHADO de um custom node.
+
+    node_dir: dir absoluto do custom node (ex: .../ComfyUI/custom_nodes/rgthree-comfy).
+    Retorna None se node_dir não for um repo git válido ou o git falhar —
+    fail-closed: chamadores tratam None como "não confiável".
+    """
+    cache_key = str(node_dir.resolve())
+    cached = _nested_node_git_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if not node_dir.is_dir() or not (node_dir / ".git").is_dir():
+        result: Optional[Tuple[frozenset[str], frozenset[str]]] = None
+        _nested_node_git_cache[cache_key] = result
+        return result
+    try:
+        tracked_proc = subprocess.run(
+            ["git", "-C", str(node_dir), "ls-files"],
+            capture_output=True, text=True, timeout=30,
+        )
+        changed_proc = subprocess.run(
+            ["git", "-C", str(node_dir), "status", "--porcelain", "--ignored=no"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        result = None
+        _nested_node_git_cache[cache_key] = result
+        return result
+    if tracked_proc.returncode != 0 or changed_proc.returncode != 0:
+        result = None
+        _nested_node_git_cache[cache_key] = result
+        return result
+    tracked: set[str] = set()
+    for line in tracked_proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            tracked.add(line.replace("\\", "/"))
+    changed: set[str] = set()
+    for line in changed_proc.stdout.splitlines():
+        if len(line) < 4 or line[:2] == "!!":
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ")[1]
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        if path:
+            changed.add(path.replace("\\", "/"))
+    result = (frozenset(tracked), frozenset(changed))
+    _nested_node_git_cache[cache_key] = result
+    return result
+
+
+def _is_packaged_node_doc_image(rel_path: str, scan_root: Path) -> bool:
+    """
+    Exceção NARROW para imagens empacotadas de custom nodes (docs/screenshots/
+    ícones de UI). Retorna True SOMENTE quando TODAS as condições valem:
+
+    1. O path está em ComfyUI/custom_nodes/<node>/... (nunca raiz do ComfyUI,
+       nunca input/output/temp/user, nunca o próprio colab-pipeline).
+    2. Abaixo do dir do node há um segmento de documentação/asset conhecido
+       (docs/, web/, src_web/, assets/, images/) — ver NODE_DOC_IMAGE_DIR_NAMES.
+    3. O arquivo está tracked E limpo no repo git DAQUELE custom node
+       (git ls-files + git status do node, não do ComfyUI pai).
+
+    Fail-closed: repo ausente/ilegível, git indisponível, arquivo untracked ou
+    modificado → False. Extensões NÃO-imagem (ex: .safetensors) nunca passam
+    por aqui — ficam no bloqueio incondicional.
+    """
+    normalized = rel_path.replace("\\", "/")
+    parts = Path(normalized).parts
+    # Condicao 1: dentro de ComfyUI/custom_nodes/<node>/ (minimo 4 segmentos)
+    if (
+        len(parts) < 4
+        or parts[0] != "ComfyUI"
+        or parts[1] != "custom_nodes"
+        or parts[2] in ("", ".", "..")
+    ):
+        return False
+    ext = Path(normalized).suffix.lower()
+    if ext not in SENSITIVE_EXTENSIONS:
+        return False
+    # Condicao 2: segmento de docs/assets conhecido abaixo do dir do node
+    node_sub_parts = parts[3:]
+    if not any(seg in NODE_DOC_IMAGE_DIR_NAMES for seg in node_sub_parts[:-1]):
+        return False
+    # Condicao 3: tracked-e-limpo no repo git do node
+    node_dir = scan_root / "ComfyUI" / "custom_nodes" / parts[2]
+    sets = _get_nested_node_git_sets(scan_root, node_dir)
+    if sets is None:
+        return False
+    tracked, changed = sets
+    rel_inside_node = "/".join(node_sub_parts)
+    if rel_inside_node not in tracked:
+        return False
+    return not _matches_git_changed_path(rel_inside_node, changed)
 
 
 # Extensões de modelo que são SEMPRE bloqueadas, mesmo se tracked pelo git
@@ -1154,10 +1273,33 @@ def _scan_working_violations(
                         "ext": ext, "size": item.stat().st_size,
                         "mtime": item.stat().st_mtime,
                     })
+                elif (
+                    ext in SENSITIVE_EXTENSIONS
+                    and not _is_allowed_static_file(rel_normalized)
+                    and not _is_packaged_node_doc_image(rel_normalized, scan_root)
+                ):
+                    # Imagem permitida pelo git/allowlist mas que NÃO é arquivo
+                    # de fábrica conhecido (example.png, comfy_types/examples/)
+                    # nem doc empacotada de custom node → continua bloqueada
+                    # (fail-closed). Ex: ComfyUI/output/gerado.png mesmo se
+                    # commitado em algum repo.
+                    violations.append({
+                        "path": str(item), "type": "extension",
+                        "ext": ext, "size": item.stat().st_size,
+                        "mtime": item.stat().st_mtime,
+                    })
                 continue
 
             stat = item.stat()
             ext = item.suffix.lower()
+
+            # Exceção NARROW: imagem empacotada de custom node (docs/screenshots/
+            # ícones) tracked-e-limpa no git do próprio node. Tudo o mais segue
+            # para as camadas de bloqueio abaixo.
+            if ext in SENSITIVE_EXTENSIONS and _is_packaged_node_doc_image(
+                rel_normalized, scan_root
+            ):
+                continue
 
             # Camada 2: extensões sensíveis (imagem/archive/modelo)
             if ext in SENSITIVE_EXTENSIONS or ext in SENSITIVE_ARCHIVES or ext in ALWAYS_BLOCKED_EXTENSIONS:
