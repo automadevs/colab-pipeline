@@ -1953,6 +1953,119 @@ class TestU_GitBasedAudit(unittest.TestCase):
             finally:
                 comfyui_setup.PERSISTENT_AUDIT_PATHS = original
 
+    def _git_env(self):
+        env = os.environ.copy()
+        env["GIT_AUTHOR_NAME"] = "Test"
+        env["GIT_AUTHOR_EMAIL"] = "test@test.com"
+        env["GIT_COMMITTER_NAME"] = "Test"
+        env["GIT_COMMITTER_EMAIL"] = "test@test.com"
+        return env
+
+    def _git_commit_all(self, repo_dir, msg="init"):
+        env = self._git_env()
+        subprocess.run(["git", "init"], cwd=str(repo_dir), capture_output=True, env=env, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), capture_output=True, env=env, check=True)
+        subprocess.run(["git", "commit", "-m", msg], cwd=str(repo_dir), capture_output=True, env=env, check=True)
+
+    def _create_node_with_image(self, tmp, node_name="rgthree-comfy", subdir="docs", tracked=True):
+        """Cria custom node ANINHADO com .git proprio + imagem; commita se tracked."""
+        node = Path(tmp) / "ComfyUI" / "custom_nodes" / node_name / subdir
+        node.mkdir(parents=True, exist_ok=True)
+        img = node / "screenshot.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n")
+        node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / node_name
+        if tracked:
+            self._git_commit_all(node_dir)
+        return img
+
+    def test_node_doc_image_tracked_limpa_passa(self):
+        """custom_nodes/<node>/docs/screenshot.png tracked-e-limpo no git do node → PASSA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_image(tmp, tracked=True)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_doc_image_untracked_reprova(self):
+        """custom_nodes/<node>/docs/leaked.png criado manualmente (untracked) → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / "rgthree-comfy" / "docs"
+            node_dir.mkdir(parents=True, exist_ok=True)
+            (node_dir / "leaked.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_doc_image_modificada_reprova(self):
+        """Imagem tracked mas MODIFICADA depois do commit → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            img = self._create_node_with_image(tmp, tracked=True)
+            img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"alterada")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_image_fora_de_docs_reprova(self):
+        """Imagem tracked-e-limpa mas fora de docs/web/assets (ex: raiz do node) → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_image(tmp, subdir="nao_docs", tracked=True)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_output_image_reprova_mesmo_tracked(self):
+        """ComfyUI/output/*.png REPROVA sempre — fora de custom_nodes, sem exceção."""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui_dir = self._create_comfyui_git_repo(tmp)
+            leaked = comfyui_dir / "output" / "gerado.png"
+            leaked.write_bytes(b"\x89PNG\r\n\x1a\n")
+            # Mesmo se alguem commitar no repo pai, continua bloqueado
+            env = self._git_env()
+            subprocess.run(["git", "add", "-A"], cwd=str(comfyui_dir), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "commit", "-m", "add img"], cwd=str(comfyui_dir), capture_output=True, env=env, check=True)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
     def test_safetensors_colocado_manualmente_e_detectado(self):
         """Arquivo .safetensors colado manualmente deve ser detectado como violação."""
         with tempfile.TemporaryDirectory() as tmp:
