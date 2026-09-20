@@ -732,6 +732,14 @@ ALLOWED_CUSTOM_NODES: frozenset[str] = frozenset([
     "comfyui-krea2edit",
     "ComfyUI-Krea2T-Enhancer",
     "rgthree-comfy",
+    "ComfyUI-QwenVL",               # 1038lab/ComfyUI-QwenVL (captioning fallback A)
+    # "ComfyUI_QwenVL_PromptCaption" DESABILITADO (fallback B, WingeD123):
+    # a pasta do node ficaria em ComfyUI/models/text_encoders/<FOLDER>/ e o README
+    # exige renomear o peso para 'model.safetensors' + config HF dentro de uma pasta
+    # DEDICADA em text_encoders — um .safetensors solto do Dataset NÃO é listado
+    # sem essa reestruturação (copiar para /kaggle/working = ALWAYS_BLOCKED).
+    # Só habilitar após teste real na UI confirmando que o modelo do Dataset aparece
+    # no dropdown sem download. Ver CUSTOM_NODES no notebook 08 (cell-007).
 ])
 
 # EXPECTED_CUSTOM_NODE_HASHES: hash SHA-256 esperado do diretório de cada node.

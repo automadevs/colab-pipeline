@@ -734,6 +734,61 @@ class TestK_CustomNodeAllowlist(unittest.TestCase):
             with self.assertRaises(comfyui_setup.SecurityError):
                 comfyui_setup.verify_custom_nodes_unchanged(Path(tmp), snapshot, strict=True)
 
+    def test_qwenvl_spec_maps_to_allowed_folder(self):
+        """1038lab/ComfyUI-QwenVL deve derivar pasta 'ComfyUI-QwenVL' autorizada."""
+        repo, branch, node_name = comfyui_setup.parse_custom_node_spec(
+            "1038lab/ComfyUI-QwenVL"
+        )
+        self.assertEqual(repo, "https://github.com/1038lab/ComfyUI-QwenVL.git")
+        self.assertEqual(branch, "main")
+        self.assertEqual(node_name, "ComfyUI-QwenVL")
+        self.assertIn(node_name, comfyui_setup.ALLOWED_CUSTOM_NODES)
+
+    def test_winged_qwenvl_spec_parses_to_folder_name(self):
+        """WingeD123/ComfyUI_QwenVL_PromptCaption deriva a pasta esperada (fallback B)."""
+        repo, branch, node_name = comfyui_setup.parse_custom_node_spec(
+            "WingeD123/ComfyUI_QwenVL_PromptCaption"
+        )
+        self.assertEqual(
+            repo, "https://github.com/WingeD123/ComfyUI_QwenVL_PromptCaption.git"
+        )
+        self.assertEqual(branch, "main")
+        self.assertEqual(node_name, "ComfyUI_QwenVL_PromptCaption")
+
+    @unittest.expectedFailure
+    def test_winged_qwenvl_folder_in_allowlist(self):
+        """Fallback B habilitado em ALLOWED_CUSTOM_NODES (hoje DESABILITADO).
+
+        Este teste falha enquanto 'ComfyUI_QwenVL_PromptCaption' estiver comentado
+        na allowlist. Ele inverte para verde automaticamente no dia em que a
+        entrada for habilitada (após teste real na UI confirmar que o modelo do
+        Dataset aparece no dropdown SEM download). Ver item 3.b do plano e o
+        comentário na célula SETUP do notebook 08 (cell-007).
+        """
+        self.assertIn(
+            "ComfyUI_QwenVL_PromptCaption", comfyui_setup.ALLOWED_CUSTOM_NODES
+        )
+
+    def test_every_default_node_is_in_allowlist(self):
+        """Guarda anti-drift: todo spec de DEFAULT_CUSTOM_NODES deriva pasta autorizada."""
+        for spec in comfyui_setup.DEFAULT_CUSTOM_NODES:
+            node_name = comfyui_setup.parse_custom_node_spec(spec)[2]
+            self.assertIn(
+                node_name, comfyui_setup.ALLOWED_CUSTOM_NODES,
+                f"spec '{spec}' deriva pasta '{node_name}' fora da allowlist",
+            )
+
+    def test_allowlist_passes_with_qwenvl_folders(self):
+        """Pastas simuladas dos nodes de captioning passam em strict=True."""
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_dir = Path(tmp) / "custom_nodes"
+            custom_dir.mkdir()
+            for node in ("ComfyUI-QwenVL", "ComfyUI_QwenVL_PromptCaption"):
+                if node in comfyui_setup.ALLOWED_CUSTOM_NODES:
+                    (custom_dir / node).mkdir()
+            unknown = comfyui_setup.check_custom_nodes_allowlist(Path(tmp), strict=True)
+            self.assertEqual(unknown, [])
+
 
 # ---------------------------------------------------------------------------
 # L — ngrok desabilitado por padrão
