@@ -234,16 +234,17 @@ def parse_hf_input(value: str) -> tuple[str, Optional[str], str]:
     """Parseia entrada HF e retorna (repo_id, file_path ou None, revision).
 
     Formatos:
-    - hf:org/repo ou hf:org/repo/path/to/arquivo.safetensors
+    - hf:org/repo ou hf:org/repo/path/to/arquivo.safetensors (hf:// também aceito)
     - https://huggingface.co/org/repo/resolve/main/arquivo.safetensors
     - https://huggingface.co/org/repo/blob/main/arquivo.safetensors
     """
     value = str(value or "").strip()
 
     if value.lower().startswith("hf:"):
-        # hf:org/repo/path/...
+        # hf:org/repo/path/... (também aceita hf://org/repo como atalho de URL)
         hf_part = value[3:]  # Remove "hf:"
-        parts = hf_part.split("/")
+        # Ignora segmentos vazios (ex.: "hf://org/repo" -> ["org", "repo"])
+        parts = [p for p in hf_part.split("/") if p]
         if len(parts) < 2:
             raise ValueError("Formato HF inválido: use hf:org/repo ou hf:org/repo/path/to/arquivo")
         repo_id = f"{parts[0]}/{parts[1]}"

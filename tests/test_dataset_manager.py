@@ -521,6 +521,42 @@ class DatasetManagerTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertIn("hf:org/repo", error)
 
+    def test_parse_hf_input_accepts_double_slash_with_file(self):
+        """Tolera hf://org/repo/arquivo (barra dupla digitada por engano)"""
+        repo_id, file_path, revision = parse_hf_input(
+            "hf://myorg/myrepo/path/to/model.safetensors"
+        )
+        self.assertEqual(repo_id, "myorg/myrepo")
+        self.assertEqual(file_path, "path/to/model.safetensors")
+        self.assertEqual(revision, "main")
+
+    def test_parse_hf_input_accepts_double_slash_repo_only(self):
+        """Tolera hf://org/repo (repo inteiro)"""
+        repo_id, file_path, revision = parse_hf_input("hf://myorg/myrepo")
+        self.assertEqual(repo_id, "myorg/myrepo")
+        self.assertIsNone(file_path)
+        self.assertEqual(revision, "main")
+
+    def test_validate_hf_input_accepts_double_slash(self):
+        """hf://org/repo/arquivo passa na validação da coleta"""
+        self.assertIsNone(validate_hf_input("hf://myorg/myrepo/model.safetensors"))
+        self.assertIsNone(validate_hf_input("hf://myorg/myrepo"))
+
+    def test_validate_hf_input_rejects_empty_segments(self):
+        """Rejeita hf:, hf:/ e hf:// sem org/repo na fase de coleta"""
+        for value in ("hf:", "hf:/", "hf://"):
+            with self.subTest(value=value):
+                error = validate_hf_input(value)
+                self.assertIsNotNone(error)
+                self.assertIn("hf:org/repo", error)
+
+    def test_collect_input_queue_accepts_double_slash_hf(self):
+        """Entrada hf://... digitada pelo usuário é aceita na coleta"""
+        entries = ["hf://myorg/myrepo/model.safetensors", "done"]
+        inputs = iter(entries)
+        queue = collect_input_queue(input_fn=lambda prompt="": next(inputs))
+        self.assertEqual(queue, ["hf://myorg/myrepo/model.safetensors"])
+
     def test_collect_input_queue_retries_malformed_hf(self):
         """Entrada HF malformada é rejeitada e a coleta continua"""
         entries = ["hf:single", "hf:org/repo/arquivo.safetensors", "done"]
