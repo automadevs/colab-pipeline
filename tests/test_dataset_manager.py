@@ -1,5 +1,8 @@
+import contextlib
+import io
 import json
 import hashlib
+import os
 import sys
 import tempfile
 import unittest
@@ -12,29 +15,45 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 from kaggle_dataset_manager import (
     CATEGORIES,
     DatasetFile,
+    DownloadFailure,
+    DownloadOutcome,
+    ResolutionFailure,
+    ResolutionOutcome,
+    ResolvedArtifact,
     build_dataset_path,
+    classify_resolved_artifacts,
     collect_dataset_edits,
     collect_input_queue,
     compare_states,
+    configure_hf_cache,
+    cleanup_hf_cache,
     download_input_queue,
     download_resolved_queue,
+    format_hf_resolution_error,
     format_size,
+    guess_category,
     manifest_payload,
+    normalize_hf_file_path,
     parse_current_files,
     parse_air,
+    parse_input,
     normalize_category,
     classify_civitai_type,
     classify_resource_type,
     parse_size,
+    print_download_failure_summary,
+    print_resolution_summary,
     publish,
     publish_staged_state,
     read_manifest,
+    redact_secrets,
     resolve_queue_metadata,
     queue_contains_checkpoint,
     render_preview,
     retry,
     validate_air,
     validate_civitai_url,
+    validate_hf_repo_id,
     _expected_sha256,
     download_with_civitai_cli,
     is_hf_input,
@@ -325,7 +344,8 @@ class DatasetManagerTests(unittest.TestCase):
         self.assertEqual(queue, [])
         resolve.assert_not_called()
 
-    def test_queue_continues_after_item_failure(self):
+    def test_download_input_queue_aborts_when_resolution_fails(self):
+        """1 falha de resolução aborta a fila ANTES de qualquer download (item 10)."""
         entries = ["urn:air:krea2:lora:civitai:1@2", "urn:air:krea2:lora:civitai:3@4"]
         inputs = iter([*entries, "done"])
 
@@ -334,16 +354,55 @@ class DatasetManagerTests(unittest.TestCase):
                 raise RuntimeError("falha permanente")
             return [self._fake_info(value)]
 
+        downloads = []
+
         def fake_download(info, category, staging_dir, token, source_url=None, air=None):
+            downloads.append(source_url)
             return DatasetFile("loras/ok.safetensors", 1, "hash")
 
         with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=fake_resolve), patch.object(
             kaggle_dataset_manager, "download_civitai_file", side_effect=fake_download
         ), patch.object(kaggle_dataset_manager, "classify_civitai_type", return_value="loras"):
-            queue = download_input_queue(Path("/tmp"), "token", input_fn=lambda prompt="": next(inputs))
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(RuntimeError) as ctx:
+                    download_input_queue(Path("/tmp"), "token", input_fn=lambda prompt="": next(inputs))
 
-        self.assertEqual(len(queue), 1)
-        self.assertEqual(queue[0].path, "loras/ok.safetensors")
+        self.assertIn("nenhum download foi iniciado", str(ctx.exception))
+        self.assertIn("INPUT RESOLUTION SUMMARY", stdout.getvalue())
+        self.assertEqual(downloads, [])
+
+    def test_download_input_queue_aborts_when_download_fails(self):
+        """1 falha de download aborta SEM retornar fila parcial (publicação transacional)."""
+        entries = ["urn:air:krea2:lora:civitai:1@2", "urn:air:krea2:lora:civitai:3@4"]
+        inputs = iter([*entries, "done"])
+
+        def fake_resolve(value, token, input_fn):
+            return [self._fake_info(value)]
+
+        downloads = []
+
+        def fake_download(info, category, staging_dir, token, source_url=None, air=None):
+            downloads.append(source_url)
+            if source_url == entries[1]:
+                raise RuntimeError("falha permanente de download")
+            return DatasetFile("loras/ok.safetensors", 1, "hash")
+
+        with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=fake_resolve), patch.object(
+            kaggle_dataset_manager, "download_civitai_file", side_effect=fake_download
+        ), patch.object(kaggle_dataset_manager, "classify_civitai_type", return_value="loras"):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(RuntimeError) as ctx:
+                    download_input_queue(Path("/tmp"), "token", input_fn=lambda prompt="": next(inputs))
+
+        self.assertIn("nenhuma alteração no dataset foi publicada", str(ctx.exception))
+        output = stdout.getvalue()
+        self.assertIn("[DOWNLOAD FAILED]", output)
+        self.assertIn("2 arquivo(s) resolvido(s)", output)
+        self.assertIn("1 arquivo(s) baixado(s)", output)
+        self.assertIn("1 arquivo(s) com falha", output)
+        self.assertEqual(downloads, entries)  # ambos tentados; o lote ainda falha
 
     def test_classify_checkpoint_with_preset_destination_skips_prompt(self):
         def boom(prompt=""):
@@ -386,11 +445,12 @@ class DatasetManagerTests(unittest.TestCase):
             raise AssertionError(f"nenhum prompt pode ocorrer durante o download: {prompt}")
 
         with patch.object(kaggle_dataset_manager, "download_civitai_file", side_effect=fake_download):
-            queue = download_resolved_queue(
+            outcome = download_resolved_queue(
                 [entry], Path("/tmp"), "token", input_fn=boom, checkpoint_destination="diffusion_models"
             )
 
-        self.assertEqual([item.path for item in queue], ["diffusion_models/f.safetensors"])
+        self.assertTrue(outcome.ok)
+        self.assertEqual([item.path for item in outcome.items], ["diffusion_models/f.safetensors"])
 
     def test_collect_dataset_edits_collects_without_applying(self):
         inputs = iter(["s", "remove checkpoints/old.safetensors", "move a.safetensors b.safetensors", "bogus a b", "done"])
@@ -629,10 +689,13 @@ class DatasetManagerTests(unittest.TestCase):
             return [{"model": {"type": "lora"}, "version": {"id": 2}, "file": {}, "air": {"type": "lora"}}]
 
         with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=fake_resolve_civitai):
-            resolved = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "")
+            outcome = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "")
 
-        self.assertEqual(len(resolved), 1)
-        self.assertEqual(resolved[0]["source"], "civitai")
+        self.assertEqual(len(outcome.artifacts), 1)
+        self.assertEqual(outcome.failures, [])
+        self.assertEqual(outcome.artifacts[0].provider, "civitai")
+        self.assertEqual(outcome.artifacts[0].source, "civitai")
+        self.assertEqual(outcome.artifacts[0].resource_type, "lora")
 
     def test_resolve_queue_metadata_routes_hf_to_hf(self):
         """resolve_queue_metadata roteia HF para resolve_hf_input"""
@@ -650,10 +713,14 @@ class DatasetManagerTests(unittest.TestCase):
             }]
 
         with patch.object(kaggle_dataset_manager, "resolve_hf_input", side_effect=fake_resolve_hf):
-            resolved = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "", hf_token="hf_token")
+            outcome = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "", hf_token="hf_token")
 
-        self.assertEqual(len(resolved), 1)
-        self.assertEqual(resolved[0]["source"], "hf")
+        self.assertEqual(len(outcome.artifacts), 1)
+        self.assertEqual(outcome.failures, [])
+        self.assertEqual(outcome.artifacts[0].source, "hf")
+        self.assertEqual(outcome.artifacts[0].provider, "huggingface")
+        self.assertEqual(outcome.artifacts[0].category, "loras")
+        self.assertEqual(outcome.artifacts[0].base_model, "sdxl")
 
     def test_resolve_queue_metadata_hf_failure_does_not_stop_others(self):
         """Item HF inexistente na Fase 1 não interrompe os demais itens"""
@@ -671,10 +738,18 @@ class DatasetManagerTests(unittest.TestCase):
 
         with patch.object(kaggle_dataset_manager, "resolve_civitai_input", return_value=civitai_info), \
              patch.object(kaggle_dataset_manager, "resolve_hf_input", side_effect=fake_resolve_hf):
-            resolved = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "", hf_token="tok")
+            outcome = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "", hf_token="tok")
 
-        self.assertEqual([entry["source"] for entry in resolved], ["civitai", "hf"])
-        self.assertEqual(resolved[1]["info"]["file_path"], "outro.safetensors")
+        self.assertEqual([artifact.source for artifact in outcome.artifacts], ["civitai", "hf"])
+        self.assertEqual(outcome.artifacts[1].file_path, "outro.safetensors")
+        self.assertEqual(len(outcome.failures), 1)
+        failure = outcome.failures[0]
+        self.assertEqual(failure.original_input, "hf:org/missing/file.safetensors")
+        self.assertEqual(failure.provider, "huggingface")
+        self.assertIn("Repositório não encontrado", failure.technical)
+        # Mensagem contextual do item 14 (nunca só o erro técnico)
+        self.assertIn("Falha ao obter metadata do Hugging Face", failure.reason)
+        self.assertIn("nenhum download foi iniciado", failure.reason)
 
     # =========================================================================
     # TESTES HUGGING FACE - FASES (SEM DOWNLOAD NA FASE 1) E RESILIÊNCIA
@@ -695,13 +770,13 @@ class DatasetManagerTests(unittest.TestCase):
              patch.object(kaggle_dataset_manager, "classify_civitai_type") as classify_mock, \
              patch.object(kaggle_dataset_manager, "download_civitai_file") as civitai_download, \
              patch.object(kaggle_dataset_manager, "download_hf_file") as hf_download:
-            resolved = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "", hf_token="tok")
+            outcome = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "", hf_token="tok")
 
             civitai_download.assert_not_called()
             hf_download.assert_not_called()
             classify_mock.assert_not_called()
 
-        self.assertEqual([entry["source"] for entry in resolved], ["civitai", "hf"])
+        self.assertEqual([artifact.source for artifact in outcome.artifacts], ["civitai", "hf"])
 
 
 
@@ -744,9 +819,10 @@ class DatasetManagerTests(unittest.TestCase):
 
         with patch.object(kaggle_dataset_manager, "download_hf_file", return_value=item) as hf_download, \
              patch.object(kaggle_dataset_manager, "classify_civitai_type") as classify_mock:
-            queue = download_resolved_queue(resolved, Path("staging"), "token", input_fn=explode, hf_token="tok")
+            outcome = download_resolved_queue(resolved, Path("staging"), "token", input_fn=explode, hf_token="tok")
 
-        self.assertEqual(queue, [item])
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.items, [item])
         classify_mock.assert_not_called()
         kwargs = hf_download.call_args.kwargs
         self.assertEqual(kwargs["repo_id"], "org/repo")
@@ -755,8 +831,8 @@ class DatasetManagerTests(unittest.TestCase):
         self.assertEqual(kwargs["revision"], "dev")
         self.assertEqual(kwargs["base_model"], "sdxl")
 
-    def test_download_resolved_queue_hf_failure_does_not_stop_others(self):
-        """Item HF inválido no meio da fila não derruba os demais downloads"""
+    def test_download_resolved_queue_continues_attempts_but_marks_batch_failed(self):
+        """Falha no meio: demais itens ainda são tentados; outcome.ok=False (transacional)."""
         civitai_entry = {
             "value": "urn:air:krea2:lora:civitai:1@2",
             "index": 1,
@@ -796,16 +872,41 @@ class DatasetManagerTests(unittest.TestCase):
         with patch.object(kaggle_dataset_manager, "download_civitai_file", return_value=civitai_item), \
              patch.object(kaggle_dataset_manager, "download_hf_file", side_effect=fake_download_hf_file), \
              patch.object(kaggle_dataset_manager, "classify_civitai_type", return_value="loras"):
-            queue = download_resolved_queue(
-                [civitai_entry, hf_entry("org/missing", 2), hf_entry("org/repo", 3)],
-                Path("staging"),
-                "token",
-                input_fn=lambda p="": "",
-                hf_token="tok",
-            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                outcome = download_resolved_queue(
+                    [civitai_entry, hf_entry("org/missing", 2), hf_entry("org/repo", 3)],
+                    Path("staging"),
+                    "token",
+                    input_fn=lambda p="": "",
+                    hf_token="tok",
+                )
 
-        self.assertEqual(queue, [civitai_item, hf_item])
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.items, [civitai_item, hf_item])
+        self.assertEqual(len(outcome.failures), 1)
+        self.assertEqual(outcome.resolved_count, 3)
         self.assertEqual(calls, ["org/missing", "org/repo"])
+        output = stdout.getvalue()
+        self.assertIn("[ERROR] Download falhou para [2/3]", output)
+        self.assertIn("org/missing", output)
+        self.assertIn("Repositório não encontrado", output)
+
+    def test_print_download_failure_summary_format(self):
+        outcome = DownloadOutcome(
+            items=[DatasetFile("loras/a.safetensors", 1, "h")],
+            failures=[DownloadFailure("hf:org/missing/f.safetensors", 2, 7, reason="boom")],
+            resolved_count=7,
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            print_download_failure_summary(outcome)
+        text = stdout.getvalue()
+        self.assertIn("[DOWNLOAD FAILED]", text)
+        self.assertIn("7 arquivo(s) resolvido(s)", text)
+        self.assertIn("1 arquivo(s) baixado(s)", text)
+        self.assertIn("1 arquivo(s) com falha", text)
+        self.assertIn("Nenhuma alteração no dataset foi publicada.", text)
 
     # =========================================================================
     # TESTES HUGGING FACE - DOWNLOAD E MANIFEST
@@ -880,6 +981,40 @@ class DatasetManagerTests(unittest.TestCase):
         self.assertEqual(parsed["loras/hf.safetensors"].hf_repo_id, "org/repo")
         self.assertEqual(parsed["loras/hf.safetensors"].hf_file_path, "hf.safetensors")
 
+    def test_manifest_hf_entry_has_required_fields_and_no_secrets(self):
+        """Manifest pós-download: provider/repo/path/revision/filename/size/category/base_model/hash; sem tokens."""
+        token = "hf_secret_token_should_never_appear"
+        hf_item = DatasetFile(
+            "loras/hf.safetensors",
+            10,
+            "abc123hash",
+            "https://huggingface.co/org/repo/resolve/main/nested/hf.safetensors",
+            None,
+            None,
+            None,
+            None,
+            "sdxl",
+            "org/repo",
+            "main",
+            "nested/hf.safetensors",
+        )
+        payload = manifest_payload("owner/dataset", {"loras/hf.safetensors": hf_item})
+        blob = json.dumps(payload)
+        entry = payload["files"][0]
+        self.assertEqual(entry["filename"], "hf.safetensors")
+        self.assertEqual(entry["category"], "loras")
+        self.assertEqual(entry["size"], 10)
+        self.assertEqual(entry["sha256"], "abc123hash")
+        self.assertEqual(entry["base_model"], "sdxl")
+        self.assertEqual(entry["hf_repo_id"], "org/repo")
+        self.assertEqual(entry["hf_revision"], "main")
+        self.assertEqual(entry["hf_file_path"], "nested/hf.safetensors")
+        self.assertEqual(entry["source"], "https://huggingface.co/org/repo/resolve/main/nested/hf.safetensors")
+        self.assertNotIn(token, blob)
+        self.assertNotIn("HF_TOKEN", blob)
+        self.assertNotIn("token=", blob.lower())
+        self.assertNotIn("authorization", blob.lower())
+
     def test_read_manifest_accepts_legacy_entries_without_hf_fields(self):
         """Manifest antigo (sem campos HF) continua válido"""
         legacy = {
@@ -921,23 +1056,27 @@ class DatasetManagerTests(unittest.TestCase):
         return fake
 
     def test_hf_file_size_reads_sibling_size(self):
-        """_hf_file_size devolve o size do sibling retornado por model_info"""
+        """_hf_file_size lê RepoSibling.rfilename/size com files_metadata=True (1.31.0)"""
+        calls = {}
+
         class Sibling:
-            def __init__(self, filename, size):
-                self.filename = filename
+            def __init__(self, rfilename, size):
+                self.rfilename = rfilename  # attr REAL do RepoSibling (não 'filename')
                 self.size = size
 
         class Info:
             siblings = [Sibling("a.safetensors", 111), Sibling("alvo.safetensors", 222)]
 
         class HfApi:
-            def model_info(self, repo_id, revision=None, token=None, **kwargs):
+            def model_info(self, repo_id, revision=None, token=None, files_metadata=False, **kwargs):
+                calls["files_metadata"] = files_metadata
                 return Info()
 
         fake = self._fake_hf_module(HfApi)
         with patch.dict(sys.modules, {"huggingface_hub": fake}):
             size = kaggle_dataset_manager._hf_file_size("org/repo", "alvo.safetensors", token="tok")
         self.assertEqual(size, 222)
+        self.assertTrue(calls["files_metadata"])
 
     def test_hf_file_size_translates_gated_repo_error(self):
         """GatedRepoError vira RuntimeError com mensagem sobre HF_TOKEN"""
@@ -984,6 +1123,481 @@ class DatasetManagerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 kaggle_dataset_manager._hf_hub_download("org/repo", "arquivo.safetensors")
         self.assertIn("Arquivo não encontrado", str(ctx.exception))
+
+
+    # =========================================================================
+    # TESTES HUGGING FACE - FORMATOS, VALIDAÇÃO E PARSER (itens 4/9/16)
+    # =========================================================================
+
+    def test_parse_hf_input_supported_formats(self):
+        """Todos os formatos suportados normalizam para (repo_id, file_path, revision)"""
+        cases = {
+            "hf:owner/repo": ("owner/repo", None, "main"),
+            "hf:owner/repo/file.safetensors": ("owner/repo", "file.safetensors", "main"),
+            "hf://owner/repo/path/to/file.safetensors": ("owner/repo", "path/to/file.safetensors", "main"),
+            "https://huggingface.co/owner/repo/resolve/main/file.safetensors": (
+                "owner/repo", "file.safetensors", "main",
+            ),
+            "https://huggingface.co/owner/repo/blob/v2/file.safetensors": (
+                "owner/repo", "file.safetensors", "v2",
+            ),
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(parse_hf_input(value), expected)
+
+    def test_parse_hf_input_rejects_invalid_forms(self):
+        """Casos inválidos (item 16): estrutura, traversal cru e percent-encoded"""
+        invalid = (
+            "hf:",
+            "hf://",
+            "hf://owner",
+            "hf://owner/",
+            "hf://owner/repo/../../secret",
+            "hf://owner/repo/%2e%2e/secret.safetensors",
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_hf_input(value)
+
+    def test_normalize_hf_file_path_validation(self):
+        """Normaliza separadores e rejeita traversal/absoluto/extensão/URL"""
+        self.assertEqual(normalize_hf_file_path("a//b/./c.safetensors"), "a/b/c.safetensors")
+        self.assertEqual(normalize_hf_file_path("dir\\model.safetensors"), "dir/model.safetensors")
+        invalid = (
+            "",
+            "../x.safetensors",
+            "a/../../x.safetensors",
+            "%2e%2e/x.safetensors",
+            "/abs/x.safetensors",
+            "C:\\abs\\x.safetensors",
+            "x.txt",
+            "sem_extensao",
+            "https://evil.example/x.safetensors",
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    normalize_hf_file_path(value)
+
+    def test_validate_hf_repo_id_rejects_malformed(self):
+        """repo_id deve ser owner/repo com charset do Hub"""
+        self.assertIsNone(validate_hf_repo_id("owner/repo"))
+        self.assertIsNone(validate_hf_repo_id("my-org/my_repo.1"))
+        for bad in ("owner", "a/b/c", "own er/repo", "-bad/repo", "bad-/repo", "../.."):
+            with self.subTest(bad=bad):
+                self.assertIsNotNone(validate_hf_repo_id(bad))
+
+    def test_parse_input_routes_providers_and_rejects_done(self):
+        """Parser roteia providers; 'done' nunca vira artefato (item 11)"""
+        hf = parse_input("hf:org/repo/f.safetensors", 1)
+        self.assertEqual(hf.provider, "huggingface")
+        self.assertEqual(hf.repo_id, "org/repo")
+        self.assertEqual(hf.file_path, "f.safetensors")
+        self.assertEqual(hf.state, "PARSED")
+        air = parse_input("urn:air:krea2:lora:civitai:1@2", 2)
+        self.assertEqual(air.provider, "civitai")
+        url = parse_input("https://civitai.com/models/3", 3)
+        self.assertEqual(url.provider, "civitai")
+        for bad in ("done", "", "not-an-air", "urn:air:x:lora:civitai:0@1"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_input(bad)
+
+    # =========================================================================
+    # TESTES HUGGING FACE - METADATA COM API MOCKADA (itens 6/16)
+    # =========================================================================
+
+    def test_hf_list_repo_files_uses_dedicated_api(self):
+        """_hf_list_repo_files usa HfApi.list_repo_files (list[str]) e repassa o token"""
+        calls = {}
+
+        class HfApi:
+            def list_repo_files(self, repo_id=None, revision=None, token=None):
+                calls.update(repo_id=repo_id, revision=revision, token=token)
+                return ["a.safetensors", "README.md"]
+
+        fake = self._fake_hf_module(HfApi)
+        with patch.dict(sys.modules, {"huggingface_hub": fake}):
+            files = kaggle_dataset_manager._hf_list_repo_files("org/repo", revision="dev", token="hf_secret")
+        self.assertEqual(files, ["a.safetensors", "README.md"])
+        self.assertEqual(calls["repo_id"], "org/repo")
+        self.assertEqual(calls["revision"], "dev")
+        self.assertEqual(calls["token"], "hf_secret")  # repo privado funciona com HF_TOKEN
+
+    def test_hf_list_repo_files_translates_gated_error(self):
+        """GatedRepoError na listagem vira mensagem clara sobre HF_TOKEN"""
+        class GatedRepoError(Exception):
+            pass
+
+        class HfApi:
+            def list_repo_files(self, repo_id=None, revision=None, token=None):
+                raise GatedRepoError("403")
+
+        fake = self._fake_hf_module(HfApi)
+        with patch.dict(sys.modules, {"huggingface_hub": fake}):
+            with self.assertRaises(RuntimeError) as ctx:
+                kaggle_dataset_manager._hf_list_repo_files("org/gated")
+        self.assertIn("gated", str(ctx.exception))
+        self.assertIn("HF_TOKEN", str(ctx.exception))
+
+
+    def test_hf_file_size_file_not_found(self):
+        """Arquivo ausente do repo -> FileNotFoundError com nome do arquivo"""
+        class Info:
+            siblings = []
+
+        class HfApi:
+            def model_info(self, repo_id, revision=None, token=None, files_metadata=False, **kwargs):
+                return Info()
+
+        fake = self._fake_hf_module(HfApi)
+        with patch.dict(sys.modules, {"huggingface_hub": fake}):
+            with self.assertRaises(FileNotFoundError) as ctx:
+                kaggle_dataset_manager._hf_file_size("org/repo", "ausente.safetensors")
+        self.assertIn("ausente.safetensors", str(ctx.exception))
+
+    def test_hf_file_size_falls_back_to_get_hf_file_metadata(self):
+        """Sem size nos siblings -> fallback get_hf_file_metadata (sem round-trips extras no caso normal)"""
+        import types
+
+        class Sibling:
+            rfilename = "f.safetensors"
+            size = None
+
+        class Info:
+            siblings = [Sibling()]
+
+        class HfApi:
+            def model_info(self, repo_id, revision=None, token=None, files_metadata=False, **kwargs):
+                return Info()
+
+            def hf_hub_url(self, repo_id, filename, revision=None):
+                return f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+
+        fake = types.ModuleType("huggingface_hub")
+        fake.HfApi = HfApi
+        fake.hf_hub_download = lambda **kwargs: kwargs
+        fake.get_hf_file_metadata = lambda url, token=None: types.SimpleNamespace(size=987)
+        with patch.dict(sys.modules, {"huggingface_hub": fake}):
+            size = kaggle_dataset_manager._hf_file_size("org/repo", "f.safetensors", token="tok")
+        self.assertEqual(size, 987)
+
+    def test_hf_file_size_redacts_token_on_network_error(self):
+        """Erro de rede não pode vazar o HF_TOKEN na mensagem (item 7)"""
+        class HfApi:
+            def model_info(self, repo_id, revision=None, token=None, files_metadata=False, **kwargs):
+                raise ConnectionError(f"proxy rejeitou para {token}")
+
+        fake = self._fake_hf_module(HfApi)
+        with patch.dict(sys.modules, {"huggingface_hub": fake}):
+            with self.assertRaises(RuntimeError) as ctx:
+                kaggle_dataset_manager._hf_file_size("org/repo", "f.safetensors", token="hf_super_secret")
+        message = str(ctx.exception)
+        self.assertNotIn("hf_super_secret", message)
+        self.assertIn("***REDACTED***", message)
+
+    def test_hf_file_size_unexpected_api_response(self):
+        """Resposta inesperada da API vira RuntimeError contextual (não AttributeError cru)"""
+        class HfApi:
+            def model_info(self, repo_id, revision=None, token=None, files_metadata=False, **kwargs):
+                return object()  # sem .siblings
+
+        fake = self._fake_hf_module(HfApi)
+        with patch.dict(sys.modules, {"huggingface_hub": fake}):
+            with self.assertRaises(RuntimeError) as ctx:
+                kaggle_dataset_manager._hf_file_size("org/repo", "f.safetensors")
+        message = str(ctx.exception)
+        self.assertIn("Erro ao obter tamanho do arquivo HF", message)
+        # O detalhe técnico fica na mensagem, mas SEMPRE embrulhado em contexto
+        self.assertNotIsInstance(ctx.exception, AttributeError)
+
+    def test_resolve_hf_repo_only_lists_filters_and_asks(self):
+        """Caso A: repo sem arquivo -> lista filtrada, re-pergunta até válida, categoria e base_model"""
+        prompts = []
+        answers = iter(["README.md", "2"])  # 1ª inválida (fora da lista), 2ª = nested/b.safetensors
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            if "Escolha" in prompt:
+                return next(answers)
+            if "Categoria" in prompt:
+                return "loras"
+            if "Base model" in prompt:
+                return "sdxl"
+            return ""
+
+        files = [".gitattributes", "README.md", "a.safetensors", "nested/b.safetensors"]
+        with patch.object(kaggle_dataset_manager, "_hf_list_repo_files", return_value=files), \
+             patch.object(kaggle_dataset_manager, "_hf_file_size", return_value=1234):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = resolve_hf_input("hf:org/repo", input_fn=fake_input)
+
+        self.assertEqual(sum(1 for p in prompts if "Escolha" in p), 2)  # re-perguntou
+        self.assertEqual(result[0]["file_path"], "nested/b.safetensors")
+        self.assertEqual(result[0]["category"], "loras")
+        self.assertEqual(result[0]["base_model"], "sdxl")
+        self.assertEqual(result[0]["size"], 1234)
+        listing = stdout.getvalue().split("Arquivos de modelo em org/repo:")[1].split("[WARN]")[0]
+        self.assertIn("a.safetensors", listing)
+        self.assertNotIn("README.md", listing)  # filtrado por extensão
+
+    def test_resolve_hf_repo_only_without_model_files_fails(self):
+        """Repo sem arquivos de modelo -> erro claro na Fase 1 (não baixa nada)"""
+        with patch.object(kaggle_dataset_manager, "_hf_list_repo_files", return_value=["README.md", ".gitattributes"]):
+            with self.assertRaises(RuntimeError) as ctx:
+                resolve_hf_input("hf:org/repo", input_fn=lambda p="": "")
+        self.assertIn("Nenhum arquivo de modelo", str(ctx.exception))
+
+
+    def test_print_resolution_summary_with_failures_reports_no_action(self):
+        """Resumo com falha (item 10): FAILED + linguagem de aborto, sem 'Ready'"""
+        outcome = ResolutionOutcome(
+            artifacts=[ResolvedArtifact("civitai", "urn:air:krea2:lora:civitai:1@2", 1, 2, "f.safetensors", category="loras")],
+            failures=[ResolutionFailure(
+                "hf://org/missing/f.safetensors", 2, "huggingface",
+                reason="Falha ao obter metadata do Hugging Face.\n  Input:\n    hf://org/missing/f.safetensors",
+            )],
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            print_resolution_summary(outcome)
+        out = stdout.getvalue()
+        self.assertIn("FAILED:", out)
+        self.assertIn("hf://org/missing/f.safetensors", out)
+        self.assertIn("1/2 inputs resolved", out)
+        self.assertIn("1 input(s) FAILED.", out)
+        self.assertIn("Nenhum arquivo foi modificado.", out)
+        self.assertIn("Nenhum download foi iniciado.", out)
+        self.assertNotIn("Ready for download.", out)
+
+    def test_classify_resolved_artifacts_preset_checkpoint_no_prompt(self):
+        """Classificação entre resumo e download: checkpoint com destino pré-respondido não pergunta"""
+        hf_art = ResolvedArtifact(
+            "huggingface", "hf:o/r/f.safetensors", 1, 2, "f.safetensors",
+            category="vae", repo_id="o/r", file_path="f.safetensors", revision="main",
+        )
+        ckpt = ResolvedArtifact(
+            "civitai", "urn:air:sdxl:checkpoint:civitai:1@2", 2, 2, "c.safetensors",
+            resource_type="checkpoint",
+        )
+
+        def boom(prompt=""):
+            raise AssertionError(f"não deve perguntar: {prompt}")
+
+        classify_resolved_artifacts([hf_art, ckpt], input_fn=boom, checkpoint_destination="diffusion_models")
+        self.assertEqual(ckpt.category, "diffusion_models")
+        self.assertEqual(ckpt.destination, "diffusion_models/c.safetensors")
+        self.assertEqual(ckpt.state, "READY_TO_DOWNLOAD")
+        self.assertEqual(hf_art.destination, "vae/f.safetensors")
+        self.assertEqual(hf_art.state, "READY_TO_DOWNLOAD")
+
+    def test_guess_category_pure_mapping(self):
+        """guess_category: puro, retorna None quando exige interação"""
+        self.assertEqual(guess_category("lora"), "loras")
+        self.assertEqual(guess_category("Checkpoint"), None)
+        self.assertEqual(guess_category(""), None)
+        self.assertEqual(guess_category("desconhecido"), None)
+
+    def test_redact_secrets_and_format_hf_error(self):
+        """Redação de credenciais e mensagem contextual HF (itens 7/14)"""
+        message = redact_secrets("falha com hf_abc123xyz e tok456", ["hf_abc123xyz", "tok456"])
+        self.assertNotIn("hf_abc123xyz", message)
+        self.assertNotIn("tok456", message)
+        self.assertIn("***REDACTED***", message)
+
+        formatted = format_hf_resolution_error("hf://o/r/f.safetensors", "o/r", "f.safetensors", "erro X")
+        self.assertIn("Input:", formatted)
+        self.assertIn("hf://o/r/f.safetensors", formatted)
+        self.assertIn("Repo:", formatted)
+        self.assertIn("o/r", formatted)
+        self.assertIn("Erro técnico:", formatted)
+        self.assertIn("erro X", formatted)
+        self.assertIn("nenhum download foi iniciado", formatted)
+
+    # =========================================================================
+    # TESTES DE CACHE/StAGING HF (item 8)
+    # =========================================================================
+
+    def test_configure_and_cleanup_hf_cache(self):
+        """configure_hf_cache redireciona HF_HOME etc. e cleanup restaura/remove"""
+        kvars = kaggle_dataset_manager.HF_CACHE_ENV_VARS
+        original = {var: os.environ.get(var) for var in kvars}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cache_dir = configure_hf_cache(Path(tmp) / "hf_cache")
+                self.assertEqual(os.environ.get("HF_HOME"), str(cache_dir))
+                self.assertEqual(os.environ.get("HF_HUB_CACHE"), str(cache_dir))
+                self.assertTrue(cache_dir.is_dir())
+                cleanup_hf_cache(cache_dir)
+                self.assertFalse(cache_dir.exists())
+            for var, value in original.items():
+                self.assertEqual(os.environ.get(var), value)
+        finally:
+            cleanup_hf_cache(None)
+
+    def test_download_hf_file_removes_local_cache(self):
+        """.cache/huggingface do hf_hub_download é removido do staging após o download"""
+        def fake_hf_hub_download(repo_id, filename, revision="main", token=None, local_dir=None):
+            target = Path(local_dir) / Path(filename).name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"hf-bytes")
+            cache_blob = Path(local_dir) / ".cache" / "huggingface" / "download.lock"
+            cache_blob.parent.mkdir(parents=True, exist_ok=True)
+            cache_blob.write_text("cache")
+            return str(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp)
+            with patch.object(kaggle_dataset_manager, "_hf_hub_download", side_effect=fake_hf_hub_download):
+                item = download_hf_file("org/repo", "nested/f.safetensors", "loras", staging, hf_token="t")
+            self.assertTrue((staging / "loras" / "f.safetensors").exists())
+            self.assertFalse((staging / "loras" / ".cache").exists())
+            self.assertEqual(item.path, "loras/f.safetensors")
+
+    def test_publish_staged_state_ignores_hidden_cache_files(self):
+        """Arquivos ocultos (.cache) não entram no manifest e são limpos antes do publish"""
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp)
+            (staging / "loras").mkdir()
+            (staging / "loras" / "ok.safetensors").write_bytes(b"abc")
+            hidden = staging / ".cache" / "junk.bin"
+            hidden.parent.mkdir()
+            hidden.write_bytes(b"junk")
+
+            def fake_input(prompt=""):
+                return "n" if "Publicar" in prompt else ""
+
+            with patch.object(kaggle_dataset_manager, "kaggle_files", return_value=[]), \
+                 patch.object(kaggle_dataset_manager, "publish", return_value="ok"):
+                result = publish_staged_state("owner/ds", staging, input_fn=fake_input)
+
+            self.assertIsNone(result)
+            manifest = json.loads((staging / "dataset-manifest.json").read_text())
+            paths = [entry["path"] for entry in manifest["files"]]
+            self.assertIn("loras/ok.safetensors", paths)
+            self.assertFalse(any(".cache" in path for path in paths))
+            self.assertFalse((staging / ".cache").exists())
+
+
+    # =========================================================================
+    # TESTES DE FLUXO GLOBAL - 7 INPUTS (item 16)
+    # =========================================================================
+
+    @staticmethod
+    def _seven_pending():
+        return [
+            "urn:air:krea2:lora:civitai:1@2",
+            "hf:org/alpha/f.safetensors",
+            "urn:air:krea2:vae:civitai:3@4",
+            "hf:org/beta/f.safetensors",
+            "urn:air:krea2:lora:civitai:5@6",
+            "hf:org/gamma/f.safetensors",
+            "urn:air:krea2:text_encoders:civitai:7@8",
+        ]
+
+    @staticmethod
+    def _hf_flow_info(value):
+        """Dict de info no formato devolvido por resolve_hf_input (1 arquivo)."""
+        repo_id = value[len("hf:"):].rsplit("/", 1)[0]
+        return {
+            "repo_id": repo_id,
+            "file_path": "f.safetensors",
+            "revision": "main",
+            "filename": "f.safetensors",
+            "category": "loras",
+            "base_model": "sdxl",
+            "size": 10,
+            "source_url": f"https://huggingface.co/{repo_id}/resolve/main/f.safetensors",
+            "air": None,
+            "source": "hf",
+        }
+
+    def _resolve_seven(self, hf_fail=(), civ_fail=()):
+        """Resolve os 7 inputs com providers mockados; nenhum download pode ocorrer."""
+        pending = self._seven_pending()
+
+        def fake_civ(value, token, input_fn=input):
+            if value in civ_fail:
+                raise RuntimeError("civitai indisponível")
+            return [self._fake_info(value)]
+
+        def fake_hf(value, hf_token=None, input_fn=input):
+            if any(marker in value for marker in hf_fail):
+                raise RuntimeError("Repositório não encontrado: org")
+            return [self._hf_flow_info(value)]
+
+        with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=fake_civ), \
+             patch.object(kaggle_dataset_manager, "resolve_hf_input", side_effect=fake_hf), \
+             patch.object(kaggle_dataset_manager, "download_civitai_file") as civ_download, \
+             patch.object(kaggle_dataset_manager, "download_hf_file") as hf_download:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                outcome = resolve_queue_metadata(pending, "tok", input_fn=lambda p="": "", hf_token="t")
+            civ_download.assert_not_called()
+            hf_download.assert_not_called()
+        return outcome
+
+    def test_resolution_flow_7_of_7_success(self):
+        """7 inputs / 7 sucesso: outcome completo e ok"""
+        outcome = self._resolve_seven()
+        self.assertEqual(len(outcome.artifacts), 7)
+        self.assertEqual(outcome.failures, [])
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.total, 7)
+
+    def test_resolution_flow_7_with_1_failure(self):
+        """7 inputs / 1 falha: registra a falha sem derrubar os demais (sem download)"""
+        outcome = self._resolve_seven(hf_fail=("beta",))
+        self.assertEqual(len(outcome.artifacts), 6)
+        self.assertEqual(len(outcome.failures), 1)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.failures[0].original_input, "hf:org/beta/f.safetensors")
+
+    def test_resolution_flow_7_with_2_failures(self):
+        """7 inputs / 2 falhas (1 HF + 1 Civitai)"""
+        outcome = self._resolve_seven(hf_fail=("beta",), civ_fail=("urn:air:krea2:vae:civitai:3@4",))
+        self.assertEqual(len(outcome.artifacts), 5)
+        self.assertEqual(len(outcome.failures), 2)
+        self.assertFalse(outcome.ok)
+
+    def test_resolution_flow_7_all_failures(self):
+        """7 inputs / todos falham: outcome sem artefatos -> orquestrador aborta"""
+        pending = self._seven_pending()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("falha total")
+
+        with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=boom), \
+             patch.object(kaggle_dataset_manager, "resolve_hf_input", side_effect=boom):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                outcome = resolve_queue_metadata(pending, "tok", input_fn=lambda p="": "", hf_token="t")
+        self.assertEqual(outcome.artifacts, [])
+        self.assertEqual(len(outcome.failures), 7)
+        self.assertFalse(outcome.ok)
+
+    def test_print_resolution_summary_success(self):
+        """Resumo de sucesso (item 17): formato, contagem e 'Ready for download'"""
+        artifact = ResolvedArtifact(
+            "huggingface", "hf:org/repo/f.safetensors", 1, 1, "f.safetensors",
+            size_bytes=2048, category="loras", base_model="sdxl",
+            repo_id="org/repo", file_path="f.safetensors", revision="main",
+            destination="loras/f.safetensors", state="READY_TO_DOWNLOAD",
+        )
+        outcome = ResolutionOutcome(artifacts=[artifact])
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            print_resolution_summary(outcome)
+        out = stdout.getvalue()
+        self.assertIn("INPUT RESOLUTION SUMMARY", out)
+        self.assertIn("[1] Hugging Face", out)
+        self.assertIn("Repo: org/repo", out)
+        self.assertIn("Category: loras", out)
+        self.assertIn("1/1 inputs resolved", out)
+        self.assertIn("Ready for download.", out)
 
 
 if __name__ == "__main__":

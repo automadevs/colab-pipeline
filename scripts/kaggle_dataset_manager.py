@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -62,6 +62,17 @@ CATEGORIES = (
 MANIFEST_NAME = "dataset-manifest.json"
 METADATA_NAME = "dataset-metadata.json"
 CIVITAI_CLI_PACKAGE = "@civitai/cli@0.1.104"
+# Extenções aceitas para arquivos de pesos baixados do Hugging Face.
+HF_ALLOWED_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx", ".npz"}
+# Variáveis de cache do huggingface_hub. As constantes HF_HOME/HF_HUB_CACHE são
+# congeladas na importação do módulo: precisam ser definidas ANTES do primeiro
+# import da lib (ver configure_hf_cache / inspect_environment no master_pipeline).
+HF_CACHE_ENV_VARS = ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")
+# Estados explícitos do fluxo de inputs (parser -> resolver -> downloader):
+#   INPUT_COLLECTED (collect_input_queue) -> PARSED (parse_input)
+#   -> RESOLVED/FAILED (resolve_queue_metadata) -> READY_TO_DOWNLOAD
+#   (classify_resolved_artifacts/validação) -> DOWNLOADED (download_resolved_queue)
+INPUT_STATES = ("INPUT_COLLECTED", "PARSED", "RESOLVED", "FAILED", "READY_TO_DOWNLOAD", "DOWNLOADED")
 CATEGORY_ALIASES = {
     "checkpoint": "checkpoints",
     "checkpoints": "checkpoints",
@@ -230,13 +241,75 @@ def is_hf_input(value: str) -> bool:
     return host == "huggingface.co" or host.endswith(".huggingface.co")
 
 
-def parse_hf_input(value: str) -> tuple[str, Optional[str], str]:
-    """Parseia entrada HF e retorna (repo_id, file_path ou None, revision).
+def validate_hf_repo_id(repo_id: str) -> Optional[str]:
+    """Valida a estrutura de um repo_id HF (owner/repo); None quando válido.
 
-    Formatos:
+    Espelha as regras do Hub (caracteres alfanuméricos + '-', '_', '.', sem
+    começar/terminar com '-' ou '.', máx. 96) para falhar cedo com mensagem
+    clara em vez do erro genérico da biblioteca.
+    """
+    parts = str(repo_id or "").split("/")
+    if len(parts) != 2 or not all(parts):
+        return f"repo_id HF inválido (esperado owner/repo): {repo_id!r}"
+    for part in parts:
+        if (
+            len(part) > 96
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", part)
+            or part[0] in "-."
+            or part[-1] in "-."
+        ):
+            return f"repo_id HF inválido: {repo_id!r}"
+    return None
+
+
+def normalize_hf_file_path(file_path: str) -> str:
+    """Normaliza e valida um caminho de arquivo DENTRO de um repo HF.
+
+    Levanta ValueError para: vazio, path traversal (inclusive percent-encoded
+    como %2e%2e%2f), caminho absoluto (unix/windows), URL embutida e extensão
+    fora de HF_ALLOWED_EXTENSIONS. Separaçõess '\\' são normalizadas para '/'.
+    Retorna o caminho normalizado (relativo ao repo).
+    """
+    raw = str(file_path or "").strip()
+    if not raw:
+        raise ValueError("Caminho de arquivo HF vazio")
+    candidates = [raw]
+    decoded = urllib.parse.unquote(raw)
+    if decoded != raw:
+        candidates.append(decoded)
+    normalized = ""
+    for candidate in candidates:
+        candidate = candidate.replace("\\", "/")
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", candidate):
+            raise ValueError(f"Caminho HF inválido (URL não permitida): {file_path}")
+        if candidate.startswith("/") or re.match(r"^[A-Za-z]:", candidate):
+            raise ValueError(f"Caminho HF absoluto não permitido: {file_path}")
+        segments = [segment for segment in candidate.split("/") if segment not in ("", ".")]
+        if not segments:
+            raise ValueError(f"Caminho de arquivo HF vazio: {file_path}")
+        if any(segment == ".." for segment in segments):
+            raise ValueError(f"Caminho HF com path traversal não permitido: {file_path}")
+        normalized = "/".join(segments)
+    extension = Path(normalized).suffix.lower()
+    if extension not in HF_ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(HF_ALLOWED_EXTENSIONS))
+        raise ValueError(
+            f"Extensão HF não permitida: {extension or '(sem extensão)'}; use uma de: {allowed}"
+        )
+    return normalized
+
+
+def parse_hf_input(value: str) -> tuple[str, Optional[str], str]:
+    """Parser único de todas as entradas HF -> (repo_id, file_path|None, revision).
+
+    Formatos (item 4; 'hf://NÃO' é scheme HTTP, só um atalho do prefixo 'hf:'):
     - hf:org/repo ou hf:org/repo/path/to/arquivo.safetensors (hf:// também aceito)
     - https://huggingface.co/org/repo/resolve/main/arquivo.safetensors
     - https://huggingface.co/org/repo/blob/main/arquivo.safetensors
+
+    Puro: sem chamadas de rede e sem prompts. Valida repo_id e, quando houver
+    arquivo, normaliza/valida o caminho (traversal/absoluto/extensão) via
+    normalize_hf_file_path.
     """
     value = str(value or "").strip()
 
@@ -249,27 +322,31 @@ def parse_hf_input(value: str) -> tuple[str, Optional[str], str]:
             raise ValueError("Formato HF inválido: use hf:org/repo ou hf:org/repo/path/to/arquivo")
         repo_id = f"{parts[0]}/{parts[1]}"
         file_path = "/".join(parts[2:]) if len(parts) > 2 else None
-        return repo_id, file_path, "main"
-
-    # URL format
-    parsed = urllib.parse.urlparse(value)
-    path_parts = [p for p in parsed.path.split("/") if p]
-
-    # Expected: /org/repo/resolve/main/path/to/file ou /org/repo/blob/main/path/to/file
-    if len(path_parts) < 2:
-        raise ValueError("URL HF inválida: esperado /org/repo/resolve/rev/arquivo ou /org/repo/blob/rev/arquivo")
-
-    repo_id = f"{path_parts[0]}/{path_parts[1]}"
-
-    # Detectar resolve/blob
-    if len(path_parts) >= 4 and path_parts[2] in {"resolve", "blob"}:
-        revision = path_parts[3]
-        file_path = "/".join(path_parts[4:]) if len(path_parts) > 4 else None
-    else:
-        # Fallback: tudo após /org/repo é caminho
-        file_path = "/".join(path_parts[2:]) if len(path_parts) > 2 else None
         revision = "main"
+    else:
+        # URL huggingface.co
+        parsed = urllib.parse.urlparse(value)
+        path_parts = [p for p in parsed.path.split("/") if p]
+        if len(path_parts) < 2:
+            raise ValueError(
+                "URL HF inválida: esperado /org/repo/resolve/rev/arquivo ou /org/repo/blob/rev/arquivo"
+            )
+        repo_id = f"{path_parts[0]}/{path_parts[1]}"
+        # Detectar resolve/blob (preserva revisions diferentes de 'main')
+        if len(path_parts) >= 4 and path_parts[2] in {"resolve", "blob"}:
+            revision = path_parts[3]
+            file_path = "/".join(path_parts[4:]) if len(path_parts) > 4 else None
+        else:
+            # Fallback: tudo após /org/repo é caminho
+            file_path = "/".join(path_parts[2:]) if len(path_parts) > 2 else None
+            revision = "main"
 
+    repo_error = validate_hf_repo_id(repo_id)
+    if repo_error:
+        raise ValueError(repo_error)
+    revision = revision or "main"
+    if file_path is not None:
+        file_path = normalize_hf_file_path(file_path)
     return repo_id, file_path, revision
 
 
@@ -293,8 +370,96 @@ def _hf_api_available() -> bool:
         return False
 
 
+def _sibling_name(sibling: Any) -> str:
+    """Nome do arquivo de uma entrada de lista de arquivos do Hub.
+
+    huggingface_hub 1.31.0 expõe ``RepoSibling.rfilename`` (o atributo
+    ``filename`` NUNCA existiu na lib — origem do bug 'RepoSibling object has
+    no attribute filename'). Aceitamos também variantes defensivas ('filename',
+    'path' e dicts) para tolerar outras formas de resposta da API.
+    """
+    for attribute in ("rfilename", "filename", "path"):
+        value = getattr(sibling, attribute, None)
+        if value:
+            return str(value)
+    if isinstance(sibling, dict):
+        for key in ("rfilename", "filename", "path"):
+            if sibling.get(key):
+                return str(sibling[key])
+    return ""
+
+
+def redact_secrets(text: Any, secrets: Iterable[Optional[str]]) -> str:
+    """Remove trechos de credenciais de mensagens exibidas/logadas (item 7)."""
+    result = str(text or "")
+    for secret in secrets:
+        if secret and len(secret) >= 4:  # evita remover substrings triviais
+            result = result.replace(secret, "***REDACTED***")
+    return result
+
+
+_HF_CACHE_ENV_BACKUP: dict[str, Optional[str]] = {}
+
+
+def configure_hf_cache(cache_root: Optional[Path] = None) -> Path:
+    """Redireciona o cache do huggingface_hub para um diretório temporário.
+
+    DEVE ser chamado ANTES do primeiro import de huggingface_hub: as constantes
+    HF_HOME/HF_HUB_CACHE/HUGGINGFACE_HUB_CACHE são congeladas na importação do
+    módulo (por isso inspect_environment lê a versão via importlib.metadata,
+    sem importar a lib). Os valores originais são preservados para cleanup_hf_cache.
+    """
+    cache_dir = Path(cache_root) if cache_root else Path(tempfile.mkdtemp(prefix="hf_cache_"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for variable in HF_CACHE_ENV_VARS:
+        _HF_CACHE_ENV_BACKUP.setdefault(variable, os.environ.get(variable))
+        os.environ[variable] = str(cache_dir)
+    return cache_dir
+
+
+def cleanup_hf_cache(cache_dir: Optional[Path]) -> None:
+    """Remove o cache temporário HF e restaura as variáveis de ambiente."""
+    if cache_dir:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    for variable, original in list(_HF_CACHE_ENV_BACKUP.items()):
+        if original is None:
+            os.environ.pop(variable, None)
+        else:
+            os.environ[variable] = original
+        _HF_CACHE_ENV_BACKUP.pop(variable, None)
+
+
+def clean_hf_local_cache(directory: Path) -> None:
+    """Remove '<directory>/.cache' (metadata local que hf_hub_download cria em local_dir).
+
+    Sem isso, arquivos de cache do Hugging Face terminariam no staging e seriam
+    enviados junto do dataset (o staging é publicado como diretório inteiro).
+    """
+    cache_dir = Path(directory) / ".cache"
+    if cache_dir.is_dir():
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def _prune_empty_dirs(root: Path) -> None:
+    """Remove subdiretórios vazios deixados pelo download (ex.: aninhamentos do repo)."""
+    root = Path(root)
+    if not root.is_dir():
+        return
+    for directory in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        if directory != root:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+
+
 def _hf_list_repo_files(repo_id: str, revision: str = "main", token: Optional[str] = None) -> list[str]:
-    """Lista arquivos do repositório HF. Retorna nomes dos arquivos."""
+    """Lista os arquivos do repo via HfApi.list_repo_files (API dedicada, list[str]).
+
+    Usa a API correta para listagem em vez de percorrer os RepoSibling de
+    model_info — compatível com huggingface_hub 1.31.0 e sem depender da
+    estrutura dos siblings. Não baixa nada.
+    """
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -305,8 +470,8 @@ def _hf_list_repo_files(repo_id: str, revision: str = "main", token: Optional[st
         )
     try:
         api = HfApi()
-        info = api.model_info(repo_id, revision=revision, token=token)
-        return [f.filename for f in (info.siblings or [])]
+        files = api.list_repo_files(repo_id=repo_id, revision=revision, token=token)
+        return [str(name) for name in (files or [])]
     except Exception as exc:
         exc_name = type(exc).__name__
         if exc_name == "RepositoryNotFoundError":
@@ -316,41 +481,53 @@ def _hf_list_repo_files(repo_id: str, revision: str = "main", token: Optional[st
                 f"Repositório gated (acesso restrito): {repo_id}\n"
                 f"Configure HF_TOKEN nos Secrets do Colab com acesso a este repositório."
             )
-        raise RuntimeError(f"Erro ao listar arquivos HF: {exc}")
+        raise RuntimeError(f"Erro ao listar arquivos HF: {redact_secrets(exc, [token])}")
 
 
 def _hf_file_size(repo_id: str, file_path: str, revision: str = "main", token: Optional[str] = None) -> int:
-    """Obtém tamanho do arquivo HF em bytes."""
+    """Obtém tamanho do arquivo HF em bytes com UMA chamada de metadata ao repo.
+
+    Estratégia consciente (item 6): ``model_info(..., files_metadata=True)``
+    confirma em uma única chamada que o arquivo pertence ao repo e devolve o
+    tamanho em ``RepoSibling.size`` — o campo 'size' só é populado quando
+    files_metadata=True, e o nome do arquivo é 'rfilename' (não 'filename') em
+    huggingface_hub 1.31.0 (ver _sibling_name). Quando o size não vem nos
+    siblings, cai para get_hf_file_metadata (HEAD no arquivo) como fallback,
+    evitando round-trips redundantes no caso normal.
+    """
     try:
         from huggingface_hub import HfApi
     except ImportError:
         raise RuntimeError("huggingface_hub não está instalado (execute !pip install huggingface_hub no Colab)")
     try:
         api = HfApi()
-        info = api.model_info(repo_id, revision=revision, token=token)
-        found = False
-        for file_info in (info.siblings or []):
-            if file_info.filename == file_path:
-                found = True
-                if file_info.size:
-                    return file_info.size or 0
+        info = api.model_info(repo_id, revision=revision, token=token, files_metadata=True)
+        sibling = None
+        for candidate in (info.siblings or []):
+            if _sibling_name(candidate) == file_path:
+                sibling = candidate
                 break
-        # Fallback: metadata direta do arquivo (casos sem size nos siblings)
+        if sibling is None:
+            raise FileNotFoundError(f"Arquivo não encontrado: {file_path} em {repo_id}")
+        size = getattr(sibling, "size", None)
+        if size:
+            return int(size)
+        # Fallback: metadata direta do arquivo (alguns itens vêm sem size)
         from huggingface_hub import get_hf_file_metadata
 
         metadata = get_hf_file_metadata(api.hf_hub_url(repo_id, file_path, revision=revision), token=token)
-        if metadata.size:
-            return metadata.size
-        if found:
-            return 0
-        raise FileNotFoundError(f"Arquivo não encontrado: {file_path} em {repo_id}")
+        if metadata and getattr(metadata, "size", None):
+            return int(metadata.size)
+        raise RuntimeError(f"Tamanho indisponível para {file_path} em {repo_id}")
+    except FileNotFoundError:
+        raise
     except Exception as exc:
         exc_name = type(exc).__name__
         if exc_name == "RepositoryNotFoundError":
             raise RuntimeError(f"Repositório não encontrado: {repo_id}")
         elif exc_name == "GatedRepoError":
             raise RuntimeError(f"Repositório gated; HF_TOKEN sem acesso: {repo_id}")
-        raise RuntimeError(f"Erro ao obter tamanho do arquivo HF: {exc}")
+        raise RuntimeError(f"Erro ao obter tamanho do arquivo HF: {redact_secrets(exc, [token])}")
 
 
 def _hf_hub_download(repo_id: str, filename: str, revision: str = "main", token: Optional[str] = None, local_dir: Optional[str] = None) -> str:
@@ -372,15 +549,15 @@ def _hf_hub_download(repo_id: str, filename: str, revision: str = "main", token:
         raise RuntimeError(f"Erro ao baixar arquivo HF: {exc}")
 
 
-def classify_resource_type(resource_type: str, input_fn=input, checkpoint_destination: Optional[str] = None) -> str:
-    """Mapeia um resource_type para categoria do dataset, com fallback interativo.
+def guess_category(resource_type: str) -> Optional[str]:
+    """Mapeamento PURO resource_type -> categoria; None quando exige interação.
 
-    Para tipo vazio/desconhecido, SEMPRE pergunta ao usuário (usado para HF).
+    None cobre os casos que precisam do usuário: tipo vazio (HF genérico),
+    'checkpoint' (depende do destino do lote) e tipos desconhecidos. Usado
+    pelo resolução/resumo sem prompts; classify_resource_type cuida da
+    interação.
     """
     resource_type = str(resource_type or "").strip().lower()
-    if not resource_type:
-        # Tipo não disponível (HF genérico)
-        return normalize_category(input_fn(f"Categoria {CATEGORIES}: "))
     if resource_type in {"lora", "locon", "dora"}:
         return "loras"
     if resource_type == "vae":
@@ -397,11 +574,28 @@ def classify_resource_type(resource_type: str, input_fn=input, checkpoint_destin
         return "upscale_models"
     if resource_type in {"motion_module", "video", "video_model"}:
         return "video_models"
+    return None
+
+
+def classify_resource_type(resource_type: str, input_fn=input, checkpoint_destination: Optional[str] = None) -> str:
+    """Mapeia um resource_type para categoria do dataset, com fallback interativo.
+
+    Para tipo vazio/desconhecido, SEMPRE pergunta ao usuário (usado para HF).
+    O mapeamento puro (sem prompts) vive em guess_category; 'checkpoint'
+    respeita checkpoint_destination quando pré-respondido.
+    """
+    resource_type = str(resource_type or "").strip().lower()
+    if not resource_type:
+        # Tipo não disponível (HF genérico)
+        return normalize_category(input_fn(f"Categoria {CATEGORIES}: "))
     if resource_type == "checkpoint":
         if checkpoint_destination:
             return normalize_category(checkpoint_destination)
         choice = input_fn("Checkpoint: 1=checkpoints/ 2=diffusion_models/: ").strip().lower()
         return normalize_category({"1": "checkpoints", "2": "diffusion_models"}.get(choice, choice))
+    guessed = guess_category(resource_type)
+    if guessed:
+        return guessed
     print(f"[WARN] Tipo desconhecido: {resource_type}")
     return normalize_category(input_fn(f"Destino manual {CATEGORIES}: "))
 
@@ -613,11 +807,32 @@ def render_preview(dataset: str, current: dict[str, DatasetFile], desired: dict[
     return "\n".join(lines)
 
 
-def resolve_hf_input(value: str, hf_token: Optional[str] = None, input_fn=input) -> list[dict[str, Any]]:
-    """Resolve entrada HF em uma ou mais filas.
+def _hf_is_candidate_file(name: str) -> bool:
+    """Arquivo de modelo elegível para seleção (extensão permitida, sem segmentos ocultos)."""
+    lowered = str(name or "").lower()
+    parts = Path(lowered).parts
+    if any(part.startswith(".") for part in parts):
+        return False
+    return Path(lowered).suffix in HF_ALLOWED_EXTENSIONS
 
-    Retorna [{repo_id, file_path, revision, filename, category, base_model, size, source_url, air: None}].
-    Se arquivo não for especificado no input, lista e pede ao usuário escolher.
+
+def resolve_hf_input(value: str, hf_token: Optional[str] = None, input_fn=input) -> list[dict[str, Any]]:
+    """Fase 1 (metadados) de uma entrada HF: validação/listagem/metadata + prompts.
+
+    NÃO baixa nada (download só na Fase 2).
+
+    Caso A — ``hf:owner/repo`` (sem arquivo):
+      1) valida acesso ao repo (list_repo_files);
+      2) lista os arquivos filtrando por extensão relevante;
+      3) apresenta e pede qual arquivo baixar (re-PERGUNTANDO até válida);
+      4) pede categoria; 5) pede base_model.
+    Caso B — ``hf:owner/repo/caminho/arquivo``:
+      1) valida o caminho (feito no parse: traversal/absoluto/extensão);
+      2) confirma existência + obtém tamanho (model_info files_metadata=True);
+      3) pede categoria; 4) pede base_model.
+
+    Categoria e base_model são SEMPRE perguntados para HF — não existe
+    auto-classificação a partir de um repo genérico.
     """
     value = str(value or "").strip()
     if not _hf_api_available():
@@ -627,43 +842,55 @@ def resolve_hf_input(value: str, hf_token: Optional[str] = None, input_fn=input)
         )
     repo_id, file_path, revision = parse_hf_input(value)
 
-    # Se não tem arquivo, listar e pedir
+    # ---- Caso A: só o repo -> listar e pedir o arquivo ----
     if not file_path:
         files = _hf_list_repo_files(repo_id, revision=revision, token=hf_token)
-        if not files:
-            raise RuntimeError(f"Repositório vazio: {repo_id}")
-        print(f"Arquivos em {repo_id}:")
-        for idx, fname in enumerate(files, start=1):
-            print(f"  {idx}: {fname}")
-        choice = input_fn("Escolha o número do arquivo (ou nome completo): ").strip()
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(files):
-                file_path = files[idx]
-            else:
-                file_path = choice  # Assume nome completo
-        except ValueError:
-            file_path = choice  # Assume nome completo
+        candidates = sorted(name for name in files if _hf_is_candidate_file(name))
+        if not candidates:
+            raise RuntimeError(
+                f"Nenhum arquivo de modelo em {repo_id}; extensões aceitas: "
+                f"{', '.join(sorted(HF_ALLOWED_EXTENSIONS))}"
+            )
+        print(f"Arquivos de modelo em {repo_id}:")
+        for position, name in enumerate(candidates, start=1):
+            print(f"  {position}: {name}")
+        while True:
+            choice = input_fn("Escolha o número do arquivo (ou caminho completo): ").strip()
+            selected = None
+            if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+                selected = candidates[int(choice) - 1]
+            elif choice in candidates:
+                selected = choice
+            if selected:
+                file_path = selected
+                break
+            print(f"[WARN] Opção inválida: {choice or '(vazio)'}; escolha um número da lista ou o caminho exato.")
+        # Pertence ao repo e é seguro/extensionável (pertence por construção: veio do list_repo_files)
+        file_path = normalize_hf_file_path(file_path)
 
-    # Obter tamanho
+    # ---- Caso B (e A já escolhido): existência + tamanho ----
+    file_path = normalize_hf_file_path(file_path)  # revalida defensivamente
     size = _hf_file_size(repo_id, file_path, revision=revision, token=hf_token)
+    if size <= 0:
+        raise RuntimeError(f"Tamanho inválido (0 bytes) para {file_path} em {repo_id}")
     filename = Path(file_path).name
 
-    # SEMPRE perguntar categoria para HF
-    category = classify_resource_type("", input_fn=input_fn)  # "" -> sempre pergunta
+    # SEMPRE perguntar categoria para HF (sem fallback automático)
+    category = classify_resource_type("", input_fn=input_fn)
 
-    # SEMPRE perguntar base_model para HF
+    # SEMPRE perguntar base_model para HF (não inferível de repo genérico)
     base_model = input_fn("Base model (ex: sdxl, krea2, etc): ").strip() or "unknown"
 
-    # Imprimir no formato esperado
+    # Mesmo formato de print usado para Civitai (+ tamanho para o resumo)
     print(
         f"Modelo: {repo_id} | "
         f"arquivo: {file_path} | "
         f"tipo: {category} | "
-        f"base model: {base_model}"
+        f"base model: {base_model} | "
+        f"tamanho: {format_size(size)}"
     )
 
-    # Source URL (resolve endpoint)
+    # Source URL (endpoint resolve — nunca contém o token)
     source_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{file_path}"
 
     return [{
@@ -786,6 +1013,18 @@ def download_hf_file(
             final_destination.unlink()
         shutil.move(str(downloaded_path), str(final_destination))
 
+    # Defesa (itens 8/9): o destino final precisa permanecer DENTRO do staging
+    try:
+        final_destination.resolve().relative_to(Path(staging_dir).resolve())
+    except ValueError:
+        raise RuntimeError(f"Destino fora do staging bloqueado: {final_destination}")
+
+    # Remove o '.cache/huggingface' que hf_hub_download cria em local_dir e os
+    # subdiretórios vazios do aninhamento do repo — o staging deve conter
+    # somente o arquivo do dataset (item 8: cache controlado, nunca publicado).
+    clean_hf_local_cache(destination_dir)
+    _prune_empty_dirs(destination_dir)
+
     # Validar tamanho e calcular hash
     if not final_destination.exists():
         raise RuntimeError(f"Arquivo não encontrado após download: {final_destination}")
@@ -855,7 +1094,11 @@ def download_civitai_file(
 
 
 def collect_input_queue(input_fn=input) -> list[str]:
-    """Coleta pura da fila AIR/URL/HF: valida cada entrada até o usuário digitar 'done'."""
+    """Coleta pura da fila AIR/URL/HF: valida cada entrada via parser até 'done'.
+
+    A validação é delegada a parse_input (mesma regra usada na resolução);
+    'done' fecha a lista e nunca vira artefato. Sem downloads nem outros prompts.
+    """
     pending: list[str] = []
     while True:
         value = input_fn("\nAIR/URL/HF (done para finalizar): ").strip()
@@ -864,127 +1107,418 @@ def collect_input_queue(input_fn=input) -> list[str]:
         if not value:
             print("[WARN] Entrada vazia")
             continue
-        if value.lower().startswith("urn:air:"):
-            _, error = validate_air(value)
-        elif is_hf_input(value):
-            error = validate_hf_input(value)
-        else:
-            error = validate_civitai_url(value)
-        if error:
-            print(f"[WARN] Entrada inválida: {error}")
+        try:
+            parse_input(value, len(pending) + 1)
+        except ValueError as exc:
+            print(f"[WARN] Entrada inválida: {exc}")
             continue
         pending.append(value)
     print(f"[INFO] Lista fechada com {len(pending)} item(ns).")
     return pending
 
 
-def resolve_queue_metadata(pending: list[str], token: str, input_fn=input, hf_token: Optional[str] = None) -> list[dict[str, Any]]:
-    """Resolve os metadados Civitai/HF de cada item da fila sem baixar nada.
+@dataclass
+class ParsedInput:
+    """Saída PURA do parser (sem rede/prompts): entrada normalizada por provider."""
 
-    Retorna uma entrada por arquivo resolvido, preservando os metadados resolvidos,
-    para que a fase de download não precise chamar as APIs da Civitai/HF novamente.
+    provider: str  # "civitai" | "huggingface"
+    original_input: str
+    index: int = 0
+    repo_id: Optional[str] = None      # HF
+    file_path: Optional[str] = None    # HF
+    revision: Optional[str] = None     # HF
+    state: str = "PARSED"
+
+
+@dataclass
+class ResolvedArtifact:
+    """Saída da Fase 1 (metadata resolver): 1 arquivo pronto para download."""
+
+    provider: str                      # "civitai" | "huggingface"
+    original_input: str
+    index: int
+    total: int
+    filename: str
+    size_bytes: int = 0
+    category: Optional[str] = None     # HF: sempre na Fase 1; Civitai: quando inferível
+    base_model: Optional[str] = None
+    destination: Optional[str] = None  # "categoria/arquivo" no dataset
+    state: str = "RESOLVED"            # -> READY_TO_DOWNLOAD -> DOWNLOADED
+    # Hugging Face
+    repo_id: Optional[str] = None
+    file_path: Optional[str] = None
+    revision: Optional[str] = None
+    source_url: Optional[str] = None
+    # Civitai (metadados crus do provider para o downloader)
+    info: Optional[dict[str, Any]] = None
+    resource_type: Optional[str] = None
+    air: Optional[dict[str, Any]] = None
+
+    @property
+    def source(self) -> str:
+        """Compat com o formato antigo das filas: 'hf' para Hugging Face."""
+        return "hf" if self.provider == "huggingface" else "civitai"
+
+
+@dataclass
+class ResolutionFailure:
+    """Entrada que falhou na Fase 1; motiva o aborto antes de tocar o dataset."""
+
+    original_input: str
+    index: int
+    provider: str = "unknown"
+    reason: str = ""        # mensagem contextual (exibida no resumo)
+    technical: str = ""     # erro técnico original, já redigido
+    state: str = "FAILED"
+
+
+@dataclass
+class ResolutionOutcome:
+    """Resultado da Fase 1: TODOS os artefatos + falhas (nunca aborta no meio)."""
+
+    artifacts: list[ResolvedArtifact] = field(default_factory=list)
+    failures: list[ResolutionFailure] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return len(self.artifacts) + len(self.failures)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.artifacts) and not self.failures
+
+
+@dataclass
+class DownloadFailure:
+    """Entrada que falhou na Fase 2; motiva o aborto antes de publicar o dataset."""
+
+    original_input: str
+    index: int
+    total: int
+    reason: str = ""
+
+
+@dataclass
+class DownloadOutcome:
+    """Resultado da Fase 2: itens baixados + falhas (tenta todos; publica só se zero falhas)."""
+
+    items: list[DatasetFile] = field(default_factory=list)
+    failures: list[DownloadFailure] = field(default_factory=list)
+    resolved_count: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures
+
+
+def print_download_failure_summary(outcome: DownloadOutcome) -> None:
+    """Relatório de falha transacional da Fase 2 (sem publicação parcial)."""
+    print("\n[DOWNLOAD FAILED]")
+    print(f"{outcome.resolved_count} arquivo(s) resolvido(s)")
+    print(f"{len(outcome.items)} arquivo(s) baixado(s)")
+    print(f"{len(outcome.failures)} arquivo(s) com falha")
+    print("\nNenhuma alteração no dataset foi publicada.")
+
+
+def format_hf_resolution_error(value: str, repo_id: Optional[str], file_path: Optional[str], technical: str) -> str:
+    """Mensagem contextual de falha HF: o erro técnico nunca é a única explicação (item 14)."""
+    return (
+        "Falha ao obter metadata do Hugging Face.\n"
+        f"  Input:\n    {value}\n"
+        f"  Repo:\n    {repo_id or '(não identificado)'}\n"
+        f"  Arquivo:\n    {file_path or '(repo inteiro)'}\n"
+        f"  Erro técnico:\n    {technical}\n"
+        "  Ação:\n    nenhum download foi iniciado."
+    )
+
+
+def parse_input(value: str, index: int = 0) -> ParsedInput:
+    """Etapa PARSER do pipeline: entrada de texto -> ParsedInput (sem rede/prompts).
+
+    Roteia por provider: HF (prefixo hf:/URL huggingface.co) vs Civitai
+    (urn:air:/URL civitai.com). 'done' é exclusivamente o marcador de fim da
+    coleta (nunca vira artefato); entradas não reconhecidas são erro.
+    """
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError("Entrada vazia")
+    if value.lower() == "done":
+        raise ValueError("'done' é o marcador de fim da coleta, não um input")
+    if is_hf_input(value):
+        repo_id, file_path, revision = parse_hf_input(value)
+        return ParsedInput("huggingface", value, index, repo_id, file_path, revision)
+    if value.lower().startswith("urn:air:"):
+        _, error = validate_air(value)
+        if error:
+            raise ValueError(error)
+    else:
+        error = validate_civitai_url(value)
+        if error:
+            raise ValueError(error)
+    return ParsedInput("civitai", value, index)
+
+
+def _build_artifact(parsed: ParsedInput, info: dict[str, Any], total: int) -> ResolvedArtifact:
+    """Converte a resposta específica do provider em um ResolvedArtifact comum (item 15)."""
+    if parsed.provider == "huggingface":
+        filename = str(info.get("filename") or Path(str(info.get("file_path") or "model.safetensors")).name)
+        category = info.get("category")
+        return ResolvedArtifact(
+            provider="huggingface",
+            original_input=parsed.original_input,
+            index=parsed.index,
+            total=total,
+            filename=filename,
+            size_bytes=int(info.get("size") or 0),
+            category=category,
+            base_model=info.get("base_model"),
+            destination=f"{category}/{filename}" if category else None,
+            repo_id=info.get("repo_id") or parsed.repo_id,
+            file_path=info.get("file_path") or parsed.file_path,
+            revision=info.get("revision") or parsed.revision or "main",
+            source_url=info.get("source_url"),
+            info=info,
+        )
+    air = info.get("air") or {}
+    model = info.get("model") or {}
+    file_info = info.get("file") or {}
+    resource_type = str(air.get("type") or model.get("type") or "unknown")
+    # Mapeamento puro (sem prompt): checkpoint/desconhecido ficam para
+    # classify_resolved_artifacts, depois que o destino do lote for conhecido.
+    category = guess_category(resource_type)
+    filename = Path(file_info.get("name") or "model.safetensors").name
+    base_model = air.get("base_model") or (info.get("version") or {}).get("baseModel")
+    return ResolvedArtifact(
+        provider="civitai",
+        original_input=parsed.original_input,
+        index=parsed.index,
+        total=total,
+        filename=filename,
+        size_bytes=int(float(file_info.get("sizeKB") or 0) * 1024),
+        category=category,
+        base_model=base_model,
+        destination=f"{category}/{filename}" if category else None,
+        info=info,
+        resource_type=resource_type,
+        air=air or None,
+    )
+
+
+def resolve_queue_metadata(pending: list[str], token: str, input_fn=input, hf_token: Optional[str] = None) -> ResolutionOutcome:
+    """Fase 1 (metadata resolver): resolve TODOS os inputs sem baixar nada.
+
+    Nunca interrompe no meio: cada entrada vira um ResolvedArtifact ou uma
+    ResolutionFailure com mensagem contextual. O orquestrador consulta
+    outcome.failures e ABORTA antes de qualquer pergunta de edição/download
+    quando houver ao menos uma falha (item 10: sem dataset parcial).
     """
     if hf_token is None:
         hf_token = get_secret("HF_TOKEN")
     if not hf_token:
         print("[WARN] HF_TOKEN não configurado; repositórios HF privados/gated falharão.")
 
-    resolved: list[dict[str, Any]] = []
-    failures = 0
+    outcome = ResolutionOutcome()
     total = len(pending)
     for index, value in enumerate(pending, start=1):
         print(f"[INFO] Resolvendo metadados [{index}/{total}]: {value}")
         try:
-            if value.lower().startswith("urn:air:") or (not is_hf_input(value)):
-                # Civitai AIR ou URL
-                infos = resolve_civitai_input(value, token, input_fn)
-                source = "civitai"
-            else:
-                # Hugging Face
-                infos = resolve_hf_input(value, hf_token=hf_token, input_fn=input_fn)
-                source = "hf"
+            parsed = parse_input(value, index)
         except Exception as exc:
-            failures += 1
-            print(f"[ERROR] Falha ao resolver [{index}/{total}] {value}: {exc}")
+            technical = redact_secrets(exc, [token, hf_token])
+            outcome.failures.append(ResolutionFailure(value, index, "unknown", str(technical), technical))
+            print(f"[ERROR] Falha ao resolver [{index}/{total}] {value}: {technical}")
+            continue
+        try:
+            if parsed.provider == "huggingface":
+                infos = resolve_hf_input(value, hf_token=hf_token, input_fn=input_fn)
+            else:
+                infos = resolve_civitai_input(value, token, input_fn)
+        except Exception as exc:
+            technical = redact_secrets(exc, [token, hf_token])
+            if parsed.provider == "huggingface":
+                reason = format_hf_resolution_error(value, parsed.repo_id, parsed.file_path, technical)
+            else:
+                reason = (
+                    "Falha ao resolver metadata Civitai.\n"
+                    f"  Input:\n    {value}\n"
+                    f"  Erro técnico:\n    {technical}\n"
+                    "  Ação:\n    nenhum download foi iniciado."
+                )
+            outcome.failures.append(ResolutionFailure(value, index, parsed.provider, reason, technical))
+            print(f"[ERROR] Falha ao resolver [{index}/{total}] {value}: {technical}")
             continue
         for info in infos:
-            if source == "civitai":
-                air = info.get("air") or {}
-                resource_type = air.get("type") or info["model"].get("type", "unknown")
-            else:
-                # HF
-                resource_type = None
-            resolved.append({
-                "value": value,
-                "index": index,
-                "total": total,
-                "info": info,
-                "resource_type": resource_type,
-                "source": source,
-            })
-    if failures:
-        print(f"[WARN] Resolução concluída com {failures} falha(s); {len(resolved)} arquivo(s) resolvido(s).")
-    return resolved
+            outcome.artifacts.append(_build_artifact(parsed, info, total))
+    if outcome.failures:
+        print(
+            f"[WARN] Resolução com {len(outcome.failures)} falha(s); "
+            f"{len(outcome.artifacts)} arquivo(s) resolvido(s)."
+        )
+    return outcome
 
 
-def queue_contains_checkpoint(resolved: list[dict[str, Any]]) -> bool:
-    """Detecta se há pelo menos um resource_type 'checkpoint' no lote inteiro resolvido."""
-    return any(str(entry.get("resource_type") or "").strip().lower() == "checkpoint" for entry in resolved)
+def print_resolution_summary(outcome: ResolutionOutcome) -> None:
+    """INPUT RESOLUTION SUMMARY: exibido ANTES das perguntas de edição do dataset (item 17)."""
+    print()
+    print("=" * 60)
+    print("INPUT RESOLUTION SUMMARY")
+    print("=" * 60)
+    for position, artifact in enumerate(outcome.artifacts, start=1):
+        label = "Hugging Face" if artifact.provider == "huggingface" else "Civitai"
+        print(f"\n[{position}] {label}")
+        if artifact.provider == "huggingface":
+            print(f"    Repo: {artifact.repo_id}")
+            print(f"    File: {artifact.file_path}")
+            print(f"    Revision: {artifact.revision}")
+        else:
+            print(f"    Input: {artifact.original_input}")
+            print(f"    File: {artifact.filename}")
+        print(f"    Size: {format_size(artifact.size_bytes)}")
+        print(f"    Category: {artifact.category or '(será perguntado)'}")
+        print(f"    Base model: {artifact.base_model or 'N/A'}")
+        if artifact.destination:
+            print(f"    Destination: {artifact.destination}")
+    if outcome.failures:
+        print("\nFAILED:")
+        for position, failure in enumerate(outcome.failures, start=1):
+            print(f"\n{position}. {failure.original_input}")
+            for line in str(failure.reason).splitlines():
+                print(f"    {line}")
+    print()
+    print("=" * 60)
+    print(f"{len(outcome.artifacts)}/{outcome.total} inputs resolved")
+    if outcome.failures:
+        print(f"{len(outcome.failures)} input(s) FAILED.")
+        print("Nenhum arquivo foi modificado.")
+        print("Nenhum download foi iniciado.")
+    else:
+        print("Ready for download.")
+    print("=" * 60)
+    print()
+
+
+def classify_resolved_artifacts(
+    artifacts: list[ResolvedArtifact],
+    input_fn=input,
+    checkpoint_destination: Optional[str] = None,
+) -> None:
+    """Preenche category/destination dos artefatos ainda sem classificação (item 11).
+
+    Roda ENTRE a resolução e o resumo/edições — nenhuma pergunta acontece
+    durante o download. HF já sai da Fase 1 com categoria perguntada; Civitai
+    preenche aqui os tipos que exigem interação (checkpoint/desconhecido),
+    respeitando o checkpoint_destination único do lote.
+    """
+    for artifact in artifacts:
+        if artifact.category is None and artifact.provider == "civitai":
+            artifact.category = classify_civitai_type(
+                artifact.resource_type or "",
+                input_fn=input_fn,
+                checkpoint_destination=checkpoint_destination,
+            )
+        if artifact.category:
+            artifact.destination = f"{artifact.category}/{artifact.filename}"
+            artifact.state = "READY_TO_DOWNLOAD"
+
+
+def queue_contains_checkpoint(resolved: Iterable[Any]) -> bool:
+    """Detecta 'checkpoint' no lote (aceita ResolvedArtifact ou dicts legados)."""
+    for entry in resolved:
+        resource_type = entry.get("resource_type") if isinstance(entry, dict) else getattr(entry, "resource_type", None)
+        if str(resource_type or "").strip().lower() == "checkpoint":
+            return True
+    return False
+
+
+def _queue_entry_view(entry: Any) -> dict[str, Any]:
+    """Normaliza a entrada da fila (ResolvedArtifact novo | dict legado) para leitura única."""
+    if isinstance(entry, ResolvedArtifact):
+        info = entry.info or {}
+        return {
+            "value": entry.original_input,
+            "index": entry.index,
+            "total": entry.total,
+            "info": info,
+            "resource_type": entry.resource_type,
+            "provider": entry.provider,
+            "category": entry.category or info.get("category"),
+            "base_model": entry.base_model or info.get("base_model"),
+            "artifact": entry,
+        }
+    info = entry.get("info") or {}
+    source = entry.get("source", "civitai")  # Default para compatibilidade com mocks de teste antigos
+    return {
+        "value": entry.get("value"),
+        "index": entry.get("index", 0),
+        "total": entry.get("total", 0),
+        "info": info,
+        "resource_type": entry.get("resource_type"),
+        "provider": "huggingface" if source == "hf" else "civitai",
+        "category": info.get("category"),
+        "base_model": info.get("base_model"),
+        "artifact": None,
+    }
 
 
 def download_resolved_queue(
-    resolved: list[dict[str, Any]],
+    resolved: list[Any],
     staging_dir: Path,
     token: str,
     input_fn=input,
     checkpoint_destination: Optional[str] = None,
     hf_token: Optional[str] = None,
-) -> list[DatasetFile]:
-    """Executa os downloads da fila já resolvida, sem nenhum prompt intermediário.
+) -> DownloadOutcome:
+    """Fase 2 (downloader): baixa a fila já resolvida, sem nenhum prompt intermediário.
 
-    ``checkpoint_destination`` é a resposta única do lote para itens do tipo
-    checkpoint; quando None, classify_civitai_type mantém o comportamento
-    interativo por item (compatibilidade).
+    Aceita ResolvedArtifact (formato novo) ou dicts legados. Categorias já
+    vêm resolvidas da Fase 1/classificação; ``classify_civitai_type`` aqui é
+    apenas fallback para entradas legadas sem categoria. ``checkpoint_destination``
+    é a resposta única do lote para itens do tipo checkpoint.
+
+    Tenta todos os itens (retries por item permanecem inalterados). Qualquer
+    falha permanente é registrada em ``DownloadOutcome.failures``; o chamador
+    NÃO deve publicar o dataset se ``outcome.ok`` for falso (publicação
+    transacional: zero falhas ou nenhuma alteração publicada).
     """
     if hf_token is None:
         hf_token = get_secret("HF_TOKEN")
 
     print("[INFO] Iniciando downloads...")
     queue: list[DatasetFile] = []
-    failures = 0
+    failures: list[DownloadFailure] = []
     last_value: Optional[str] = None
+    resolved_count = len(resolved)
     for entry in resolved:
-        value = entry["value"]
+        view = _queue_entry_view(entry)
+        value = view["value"]
+        index, total = view["index"], view["total"]
         if value != last_value:
-            print(f"--- [{entry['index']}/{entry['total']}] {value} ---")
+            print(f"--- [{index}/{total}] {value} ---")
             last_value = value
-        info = entry["info"]
-        source = entry.get("source", "civitai")  # Default para compatibilidade com mocks de teste antigos
+        info = view["info"]
+        provider = view["provider"]
 
         try:
-            if source == "hf":
+            if provider == "huggingface":
                 # HF: categoria e base_model já perguntados na Fase 1
-                repo_id = info["repo_id"]
-                file_path = info["file_path"]
-                category = info["category"]
-                base_model = info["base_model"]
-                revision = info.get("revision", "main")
-                source_url = info.get("source_url")
+                category = view["category"] or info["category"]
                 item = download_hf_file(
-                    repo_id=repo_id,
-                    file_path=file_path,
+                    repo_id=info["repo_id"],
+                    file_path=info["file_path"],
                     category=category,
                     staging_dir=staging_dir,
                     hf_token=hf_token,
-                    revision=revision,
-                    source_url=source_url,
-                    base_model=base_model,
+                    revision=info.get("revision", "main"),
+                    source_url=info.get("source_url"),
+                    base_model=view["base_model"],
                 )
             else:
                 # Civitai
                 air = info.get("air") or {}
-                resource_type = entry["resource_type"]
-                category = classify_civitai_type(resource_type, input_fn, checkpoint_destination=checkpoint_destination)
+                resource_type = view["resource_type"]
+                category = view["category"] or classify_civitai_type(
+                    resource_type, input_fn, checkpoint_destination=checkpoint_destination
+                )
                 file_info = info["file"]
                 base_model = air.get("base_model") or info["version"].get("baseModel") or info["model"].get("baseModel")
                 manifest_input = {
@@ -1004,14 +1538,16 @@ def download_resolved_queue(
                 print(f"[SKIP] já presente na fila e idêntico: {item.path}")
                 continue
             queue.append(item)
+            artifact = view["artifact"]
+            if artifact is not None:
+                artifact.state = "DOWNLOADED"
             print(f"[{len(queue)}] Download concluído: {item.path}")
         except Exception as exc:
-            failures += 1
-            print(f"[ERROR] Download falhou para [{entry['index']}/{entry['total']}] {value}: {exc}")
+            reason = str(exc)
+            failures.append(DownloadFailure(value, index, total, reason=reason))
+            print(f"[ERROR] Download falhou para [{index}/{total}] {value}: {exc}")
             continue
-    if failures:
-        print(f"[WARN] Lote concluído com {failures} falha(s); {len(queue)} arquivo(s) na fila.")
-    return queue
+    return DownloadOutcome(items=queue, failures=failures, resolved_count=resolved_count)
 
 
 def download_input_queue(
@@ -1020,14 +1556,35 @@ def download_input_queue(
     input_fn=input,
     hf_token: Optional[str] = None,
 ) -> list[DatasetFile]:
-    """Fila síncrona AIR/URL/HF: encadeia coleta -> resolução -> download.
+    """Fila síncrona AIR/URL/HF: coleta -> parse/resolução -> classificação -> download.
 
     Mantida como atalho público equivalente; o orquestrador chama as etapas
-    separadamente para antecipar todas as perguntas interativas.
+    separadamente para antecipar todas as perguntas interativas. Se qualquer
+    entrada falhar na resolução, imprime o resumo e aborta ANTES de qualquer
+    download (item 10: nada de dataset parcial). Se qualquer download falhar,
+    imprime o resumo transacional e aborta SEM retornar itens parciais.
     """
     pending = collect_input_queue(input_fn)
-    resolved = resolve_queue_metadata(pending, token, input_fn, hf_token=hf_token)
-    return download_resolved_queue(resolved, staging_dir, token, input_fn, hf_token=hf_token)
+    outcome = resolve_queue_metadata(pending, token, input_fn, hf_token=hf_token)
+    if outcome.failures:
+        print_resolution_summary(outcome)
+        raise RuntimeError(
+            f"Resolução falhou para {len(outcome.failures)} entrada(s); "
+            "nenhum download foi iniciado e o dataset não foi modificado."
+        )
+    if not outcome.artifacts:
+        return []
+    classify_resolved_artifacts(outcome.artifacts, input_fn=input_fn)
+    download_outcome = download_resolved_queue(
+        outcome.artifacts, staging_dir, token, input_fn, hf_token=hf_token
+    )
+    if download_outcome.failures:
+        print_download_failure_summary(download_outcome)
+        raise RuntimeError(
+            f"Download falhou para {len(download_outcome.failures)} arquivo(s); "
+            "nenhuma alteração no dataset foi publicada."
+        )
+    return download_outcome.items
 
 
 def kaggle_files(dataset: str) -> list[dict[str, Any]]:
@@ -1181,7 +1738,14 @@ def publish_staged_state(
         for path, item in read_manifest(manifest_path).items():
             desired[path] = item
     else:
-        for path in sorted(p.relative_to(staging_dir).as_posix() for p in staging_dir.rglob("*") if p.is_file() and p.name not in {MANIFEST_NAME, METADATA_NAME}):
+        for path in sorted(
+            p.relative_to(staging_dir).as_posix()
+            for p in staging_dir.rglob("*")
+            if p.is_file()
+            and p.name not in {MANIFEST_NAME, METADATA_NAME}
+            # Nunca inclui caches ocultos (.cache do kaggle/hf_hub_download)
+            and not any(part.startswith(".") for part in p.relative_to(staging_dir).parts)
+        ):
             file_path = staging_dir / path
             desired[path] = DatasetFile(path, file_path.stat().st_size, sha256_file(file_path))
 
@@ -1210,6 +1774,11 @@ def publish_staged_state(
     for path in list(desired):
         if not (staging_dir / path).exists():
             desired[path] = materialize_dataset_file(dataset, path, staging_dir, staging_dir / ".cache")
+    # Remove caches ocultos (.cache do materialize e do hf_hub_download) antes
+    # de publicar: o staging é enviado como diretório inteiro (itens 8/13).
+    for cache_dir in list(staging_dir.rglob(".cache")):
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir, ignore_errors=True)
     write_manifest(manifest_path, dataset, desired)
     changes = compare_states(current, desired)
     print("\n" + render_preview(dataset, current, desired, changes))

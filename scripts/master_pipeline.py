@@ -28,6 +28,7 @@ Código de saída: 0 em sucesso (ou cancelamento explícito da publicação), 1 
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
@@ -125,10 +126,13 @@ def inspect_environment() -> None:
     civitai_cli = shutil.which("civitai")
     print(f"Civitai CLI: {civitai_cli or 'não instalado (será instalado sob demanda)'}")
     try:
-        import huggingface_hub
+        # importlib.metadata NÃO importa o módulo (sem efeitos colaterais): as
+        # constantes de cache do huggingface_hub precisam continuar configuráveis
+        # via configure_hf_cache antes do primeiro import real (item 8).
+        from importlib import metadata as importlib_metadata
 
-        hf_status = getattr(huggingface_hub, "__version__", "instalado")
-    except ImportError:
+        hf_status = importlib_metadata.version("huggingface_hub")
+    except Exception:
         hf_status = "não instalado (será instalado sob demanda se houver input HF)"
     print(f"huggingface_hub: {hf_status}")
     print(f"Staging: {STAGING_DIR}")
@@ -176,11 +180,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     from kaggle_dataset_manager import (
+        classify_resolved_artifacts,
+        cleanup_hf_cache,
         collect_dataset_edits,
         collect_input_queue,
+        configure_hf_cache,
         download_resolved_queue,
         get_secret,
         is_hf_input,
+        print_download_failure_summary,
+        print_resolution_summary,
         publish_staged_state,
         queue_contains_checkpoint,
         resolve_queue_metadata,
@@ -207,20 +216,42 @@ def main(argv: list[str] | None = None) -> int:
     print("\n[3/5] COLETA E RESOLUÇÃO DE INPUTS")
     pending = collect_input_queue()
     if any(is_hf_input(value) for value in pending):
+        # Cache HF em diretório temporário, configurado ANTES do primeiro import
+        # de huggingface_hub (constantes congeladas na importação); removido ao
+        # sair do processo, qualquer que seja o desfecho (item 8).
+        hf_cache_dir = configure_hf_cache()
+        atexit.register(cleanup_hf_cache, hf_cache_dir)
         try:
             ensure_huggingface_hub()
         except Exception as exc:
             print(f"[WARN] Não foi possível instalar huggingface_hub automaticamente: {exc}")
-    resolved = resolve_queue_metadata(pending, token, hf_token=hf_token)
-    if not resolved:
+    outcome = resolve_queue_metadata(pending, token, hf_token=hf_token)
+
+    if not outcome.artifacts:
+        print_resolution_summary(outcome)
         print("[ERROR] Nenhum item válido resolvido; nada a publicar.")
+        return 1
+    if outcome.failures:
+        # Item 10: com QUALQUER falha, mostra o relatório e finaliza com erro
+        # ANTES de tocar no dataset (sem perguntas de edição, sem downloads).
+        print_resolution_summary(outcome)
+        print(
+            f"[ERROR] {len(outcome.failures)} input(s) falharam na resolução; "
+            "abortando SEM modificar o dataset e SEM iniciar downloads."
+        )
         return 1
 
     checkpoint_destination = None
-    if queue_contains_checkpoint(resolved):
+    if queue_contains_checkpoint(outcome.artifacts):
         choice = input("Checkpoint: 1=checkpoints/ 2=diffusion_models/: ").strip().lower()
         checkpoint_destination = {"1": "checkpoints", "2": "diffusion_models"}.get(choice, choice)
         print(f"[INFO] Destino de checkpoints do lote: {checkpoint_destination}")
+
+    # Completa a classificação pendente (Civitai checkpoint/desconhecido) e
+    # então exibe o INPUT RESOLUTION SUMMARY ANTES de qualquer pergunta de
+    # edição do dataset (itens 11/17).
+    classify_resolved_artifacts(outcome.artifacts, checkpoint_destination=checkpoint_destination)
+    print_resolution_summary(outcome)
 
     try:
         pending_edits = collect_dataset_edits(dataset)
@@ -230,13 +261,18 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n[4/5] DOWNLOAD SEQUENCIAL (Civitai/Hugging Face)")
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    items = download_resolved_queue(
-        resolved,
+    download_outcome = download_resolved_queue(
+        outcome.artifacts,
         STAGING_DIR,
         token,
         checkpoint_destination=checkpoint_destination,
         hf_token=hf_token,
     )
+    if download_outcome.failures:
+        # Publicação transacional: qualquer falha de download impede publicar o lote.
+        print_download_failure_summary(download_outcome)
+        return 1
+    items = download_outcome.items
     if not items:
         print("[ERROR] Nenhum arquivo novo no staging; nada a publicar.")
         return 1
