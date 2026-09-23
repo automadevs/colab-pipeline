@@ -86,16 +86,19 @@ colab_pipeline/
 **Executar no Google Colab:**
 
 ```bash
-# 1. Configure Secrets no Colab (⚙️ → Secrets):
+# 1. Configure Secrets no Colab (⚙️ → Secrets) com "Notebook access" habilitado:
 #    CIVITAI_TOKEN = seu token da Civitai
 #    KAGGLE_USERNAME + KAGGLE_KEY = credenciais Kaggle
+#    KAGGLE_DATASET_NAME = nome do dataset (ex: comfydocs)
 #    HF_TOKEN = token do Hugging Face (opcional; obrigatório só p/ repos privados/gated)
 
-# 2. Abra colab_transfer/00_master_pipeline.ipynb e execute a ÚNICA célula.
-#    Ela roda: setup do repo (clone/pull) → inspeção do ambiente →
-#    download sequencial Civitai/Hugging Face (fila AIR/URL/hf: com validação + retry) →
-#    publicação no Kaggle Dataset (CLI com fallback automático kagglehub).
+# 2. Abra colab_transfer/00_master_pipeline.ipynb e execute as células NA ORDEM.
+#    A 1ª célula de código injeta os Secrets em os.environ (os scripts leem apenas env).
+#    Depois: suíte de testes → pipeline (setup do repo, inspeção do ambiente,
+#    download sequencial Civitai/Hugging Face com validação + retry e publicação
+#    no Kaggle Dataset com fallback automático kagglehub).
 #    Código de saída: 0 = sucesso, 1 = falha crítica (ex: token ausente).
+#    Alternativa ao KAGGLE_DATASET_NAME: --dataset "owner/nome".
 ```
 
 **O PC do usuário NÃO participa da transferência.** Tudo roda na nuvem.
@@ -198,13 +201,16 @@ python scripts/kaggle_drive_sync.py   --action pull   --categories workflows   -
 
 ### Google Colab (Transferência)
 
-1. Abra qualquer notebook em `colab_transfer/`
-2. Configure **Secrets** (ícone de chave ⚙️):
-   - `CIVITAI_TOKEN`: Token da Civitai (Settings → API Keys)
-   - `KAGGLE_USERNAME`: Seu username Kaggle
-   - `KAGGLE_KEY`: Sua API key Kaggle (Account → Create New Token)
+1. Abra `colab_transfer/00_master_pipeline.ipynb`
+2. Configure **Secrets** (ícone de chave ⚙️) e habilite **Notebook access** para cada um:
+   - `CIVITAI_TOKEN`: Token da Civitai (Settings → API Keys) — **obrigatório**
+   - `KAGGLE_USERNAME`: Seu username Kaggle — **obrigatório**
+   - `KAGGLE_KEY`: Sua API key Kaggle (Account → Create New Token) — **obrigatório**
+   - `KAGGLE_DATASET_NAME`: Nome do dataset, ex: `comfydocs` (o alvo final é `KAGGLE_USERNAME/KAGGLE_DATASET_NAME`) — **obrigatório**
    - `HF_TOKEN`: Token do Hugging Face (Settings → Access Tokens). Opcional — só é necessário para repos privados/gated; sem ele apenas repos públicos do HF funcionam
-3. Execute as células
+3. Execute as células na ordem: (1) injeção dos Secrets em `os.environ`, (2) suíte de testes, (3) pipeline. O script lê apenas variáveis de ambiente, por isso a célula de injeção precisa rodar antes (dentro do mesmo runtime).
+
+> Sem `KAGGLE_USERNAME`/`KAGGLE_DATASET_NAME` o pipeline aborta com `Dataset Kaggle não resolvido` — alternativa: `!python /content/colab-pipeline/scripts/master_pipeline.py --dataset "owner/nome"`.
 
 ### Kaggle Notebook (Runtime)
 
@@ -271,6 +277,7 @@ embeddings/            # Textual inversions / embeddings
 | Download 0 bytes | Token Civitai inválido | Verifique `CIVITAI_TOKEN` nos Secrets |
 | HF: repositório não encontrado | Repo/revisão inexistente ou privado | Confira o `hf:org/repo[/arquivo]` e o `HF_TOKEN` |
 | HF: repositório gated | Token sem acesso liberado no site | Aceite os termos no Hugging Face e use um `HF_TOKEN` com acesso |
+| `Dataset Kaggle não resolvido` | Falta `KAGGLE_USERNAME`/`KAGGLE_DATASET_NAME` (ou Secret sem "Notebook access"/não injetado em `os.environ`) | Rode a célula de injeção de Secrets do `00_master_pipeline.ipynb` ou use `--dataset "owner/nome"` |
 | HF: `huggingface_hub não está instalado` | Lib ausente no runtime | O orquestrador instala sob demanda; forçe com `!pip install huggingface_hub` |
 | Modelo não encontrado no dataset | Upload anterior falhou | Re-execute `00_master_pipeline.ipynb` |
 | Tamanho divergente | Download parcial | Delete staging e rebaixe |
@@ -307,6 +314,7 @@ embeddings/            # Textual inversions / embeddings
 - [ ] Kaggle CLI ≥ 1.5.12
 - [ ] `~/.kaggle/kaggle.json` configurado
 - [ ] `CIVITAI_TOKEN` nos Secrets
+- [ ] `KAGGLE_USERNAME`, `KAGGLE_KEY` e `KAGGLE_DATASET_NAME` nos Secrets (com **Notebook access**)
 - [ ] `HF_TOKEN` nos Secrets (opcional; só para repos Hugging Face privados/gated)
 - [ ] Dataset `automamermaid/comfydocs` acessível
 - [ ] Permissão de edição no dataset
