@@ -70,7 +70,7 @@ colab_pipeline/
 │   ├── master_pipeline.py    # Orquestrador Colab: setup repo, inspeção, download, publicação (exit 0/1)
 │   ├── civitai_download.py   # Download robusto da Civitai
 │   ├── kaggle_upload.py      # Upload para Kaggle Dataset (CLI + kagglehub)
-│   ├── kaggle_dataset_manager.py # Helpers AIR, staging, manifest, retry e publicação do Dataset
+│   ├── kaggle_dataset_manager.py # Helpers AIR/Hugging Face, staging, manifest, retry e publicação do Dataset
 │   ├── kaggle_sync.py        # Sync seletivo com exibição de tamanho formatado
 │   ├── kaggle_drive_sync.py  # Sincronização idempotente streaming SHA-256 com Drive
 │   ├── comfyui_setup.py      # Instalação ComfyUI e start com output local no SSD
@@ -89,10 +89,11 @@ colab_pipeline/
 # 1. Configure Secrets no Colab (⚙️ → Secrets):
 #    CIVITAI_TOKEN = seu token da Civitai
 #    KAGGLE_USERNAME + KAGGLE_KEY = credenciais Kaggle
+#    HF_TOKEN = token do Hugging Face (opcional; obrigatório só p/ repos privados/gated)
 
 # 2. Abra colab_transfer/00_master_pipeline.ipynb e execute a ÚNICA célula.
 #    Ela roda: setup do repo (clone/pull) → inspeção do ambiente →
-#    download sequencial Civitai (fila AIR/URL com validação + retry) →
+#    download sequencial Civitai/Hugging Face (fila AIR/URL/hf: com validação + retry) →
 #    publicação no Kaggle Dataset (CLI com fallback automático kagglehub).
 #    Código de saída: 0 = sucesso, 1 = falha crítica (ex: token ausente).
 ```
@@ -126,8 +127,17 @@ O `08_master_pipeline.ipynb`:
 Não existe um notebook separado de Dataset Manager. O fluxo operacional é o orquestrador único:
 
 - `colab_transfer/00_master_pipeline.ipynb`: célula única que executa `scripts/master_pipeline.py`.
-- `scripts/master_pipeline.py`: faz o setup do repositório (`git pull --ff-only` ou clone `--depth 1`), inspeciona o ambiente (Python, Kaggle CLI, Civitai CLI, secrets), coleta e resolve todos os inputs (com todas as perguntas interativas antecipadas), executa a fila de downloads sem pausas e publica.
-- `collect_input_queue()` + `resolve_queue_metadata()` + `download_resolved_queue()` (em `kaggle_dataset_manager.py`): coletam todos os AIRs/URLs primeiro (validando cada entrada com `validate_air`/`validate_civitai_url`, sem interromper o loop em caso de erro), resolvem os metadados Civitai de todo o lote (o destino de checkpoints é perguntado uma única vez por lote, se houver algum) e só depois baixam sequencialmente — um arquivo por vez, com retry automático (`@retry`, 3 tentativas, backoff 2s→4s) em erros transitórios de rede. Falha permanente em um item é logada e o lote continua.
+- `scripts/master_pipeline.py`: faz o setup do repositório (`git pull --ff-only` ou clone `--depth 1`), inspeciona o ambiente (Python, Kaggle CLI, Civitai CLI, huggingface_hub, secrets), coleta e resolve todos os inputs (com todas as perguntas interativas antecipadas), executa a fila de downloads sem pausas e publica.
+- `collect_input_queue()` + `resolve_queue_metadata()` + `download_resolved_queue()` (em `kaggle_dataset_manager.py`): coletam todos os AIRs/URLs/HF primeiro (validando cada entrada com `validate_air`/`validate_civitai_url`/`validate_hf_input`, sem interromper o loop em caso de erro), resolvem os metadados de todo o lote (o destino de checkpoints é perguntado uma única vez por lote, se houver algum) e só depois baixam sequencialmente — um arquivo por vez, com retry automático (`@retry`, 3 tentativas, backoff 2s→4s) em erros transitórios de rede. Falha permanente em um item é logada e o lote continua.
+
+### Fila com duas fontes: Civitai e Hugging Face
+
+- **Detecção da entrada**: `urn:air:...` e URLs `civitai.com` seguem o caminho Civitai; `hf:org/repo[/caminho/arquivo]` ou URLs `huggingface.co` (formato `/resolve/<revisão>/...` ou `/blob/<revisão>/...`) vão para o caminho Hugging Face. Qualquer outra entrada é rejeitada com aviso e a coleta continua.
+- **Fase 1 (coleta/resolução)**: todos os metadados e todas as perguntas acontecem aqui, sem baixar nada. Para Hugging Face a categoria **sempre** é perguntada (`classify_resource_type("")`), pois um repo genérico não permite inferência automática; o `base_model` também é perguntado. Se a entrada apontar só para o repositório (sem arquivo), os arquivos são listados e o usuário escolhe um — o repo inteiro nunca é baixado silenciosamente. O tamanho é obtido via `HfApi` e exibido no formato `Modelo: <repo> | arquivo: <arquivo> | tipo: <categoria> | base model: <base_model>`.
+- **Fase 2 (download)**: `download_hf_file()` usa `hf_hub_download(..., local_dir=<staging>/<categoria>)`, normaliza o destino, calcula SHA-256 com o mesmo `sha256_file()` do Civitai e devolve um `DatasetFile` no mesmo formato, então a checagem de duplicata (`path` + `size` + `sha256`) e a resiliência por item são compartilhadas pelas duas fontes. Erros de `huggingface_hub` (`RepositoryNotFoundError`, `EntryNotFoundError`, `GatedRepoError`) são traduzidos em mensagens claras — `GatedRepoError` indica que o `HF_TOKEN` precisa ter acesso liberado ao repositório.
+- **Autenticação HF**: `HF_TOKEN` vem de variável de ambiente ou Secret do Colab. Sem token o pipeline segue apenas para repositórios públicos e avisa no console que repos privados/gated vão falhar.
+- **Manifest**: `dataset-manifest.json` mantém os campos Civitai (`civitai_model_id`, `civitai_version_id`, `civitai_file_id`, `air`, `base_model`) e adiciona `hf_repo_id`, `hf_revision`, `hf_file_path`, todos opcionais — arquivos antigos do manifest continuam válidos e são lidos sem alteração. Para itens HF, `source` guarda a URL `https://huggingface.co/<repo_id>/resolve/<revisão>/<arquivo>`.
+
 - `collect_dataset_edits()` + `publish_staged_state()`: as edições `remove`/`move` sobre o estado atual do dataset são coletadas antes dos downloads; `publish_staged_state()` aplica as edições coletadas, monta o estado completo, mostra o preview e publica somente após confirmação. Se a CLI falhar, o orquestrador faz fallback automático para `kagglehub.dataset_upload`.
 
 `scripts/kaggle_dataset_manager.py` fornece somente os helpers compartilhados de AIR, Civitai, SHA256, manifest, preview e publicação. Ele não é importado por nenhum runtime Kaggle.
@@ -193,6 +203,7 @@ python scripts/kaggle_drive_sync.py   --action pull   --categories workflows   -
    - `CIVITAI_TOKEN`: Token da Civitai (Settings → API Keys)
    - `KAGGLE_USERNAME`: Seu username Kaggle
    - `KAGGLE_KEY`: Sua API key Kaggle (Account → Create New Token)
+   - `HF_TOKEN`: Token do Hugging Face (Settings → Access Tokens). Opcional — só é necessário para repos privados/gated; sem ele apenas repos públicos do HF funcionam
 3. Execute as células
 
 ### Kaggle Notebook (Runtime)
@@ -258,6 +269,9 @@ embeddings/            # Textual inversions / embeddings
 |---|---|---|
 | Kaggle 403 no upload | Sem permissão de edição | Verifique se é owner/colaborador do dataset `automamermaid/comfydocs` |
 | Download 0 bytes | Token Civitai inválido | Verifique `CIVITAI_TOKEN` nos Secrets |
+| HF: repositório não encontrado | Repo/revisão inexistente ou privado | Confira o `hf:org/repo[/arquivo]` e o `HF_TOKEN` |
+| HF: repositório gated | Token sem acesso liberado no site | Aceite os termos no Hugging Face e use um `HF_TOKEN` com acesso |
+| HF: `huggingface_hub não está instalado` | Lib ausente no runtime | O orquestrador instala sob demanda; forçe com `!pip install huggingface_hub` |
 | Modelo não encontrado no dataset | Upload anterior falhou | Re-execute `00_master_pipeline.ipynb` |
 | Tamanho divergente | Download parcial | Delete staging e rebaixe |
 | ComfyUI não inicia | Dependências faltando | Execute `06_comfyui_setup.ipynb` novamente |
@@ -293,6 +307,7 @@ embeddings/            # Textual inversions / embeddings
 - [ ] Kaggle CLI ≥ 1.5.12
 - [ ] `~/.kaggle/kaggle.json` configurado
 - [ ] `CIVITAI_TOKEN` nos Secrets
+- [ ] `HF_TOKEN` nos Secrets (opcional; só para repos Hugging Face privados/gated)
 - [ ] Dataset `automamermaid/comfydocs` acessível
 - [ ] Permissão de edição no dataset
 - [ ] Upload cria nova versão no Kaggle (sem erro 403)

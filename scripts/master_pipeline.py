@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Orquestrador único Colab: setup do repositório -> inspeção -> coleta/resolução de inputs -> download sequencial -> publicação.
 
-Todas as perguntas interativas (fila AIR/URL, destino único de checkpoints,
+Todas as perguntas interativas (fila AIR/URL/HF, destino único de checkpoints,
 edições remove/move do dataset) acontecem antes de qualquer download; depois o
 pipeline roda sem pausa até o preview final, notas da versão e confirmação de
 publicação.
+
+Fontes de entrada suportadas na fila: AIR (`urn:air:...`), URL Civitai e
+Hugging Face (`hf:org/repo[/arquivo]` ou URL `huggingface.co`). Para HF a
+categoria e o `base_model` são sempre perguntados na fase de coleta, pois não há
+como inferi-los de um repo genérico.
 
 Uso no Colab (célula única, ver colab_transfer/00_master_pipeline.ipynb):
     !python /content/colab-pipeline/scripts/master_pipeline.py
@@ -89,7 +94,23 @@ def inspect_environment() -> None:
     print(f"Kaggle CLI: {kaggle_version if result.returncode == 0 and kaggle_version else 'NÃO DISPONÍVEL'}")
     civitai_cli = shutil.which("civitai")
     print(f"Civitai CLI: {civitai_cli or 'não instalado (será instalado sob demanda)'}")
+    try:
+        import huggingface_hub
+
+        hf_status = getattr(huggingface_hub, "__version__", "instalado")
+    except ImportError:
+        hf_status = "não instalado (será instalado sob demanda se houver input HF)"
+    print(f"huggingface_hub: {hf_status}")
     print(f"Staging: {STAGING_DIR}")
+
+
+def ensure_huggingface_hub() -> None:
+    """Instala huggingface_hub sob demanda (mesmo padrão lazy usado no kagglehub)."""
+    try:
+        import huggingface_hub  # noqa: F401
+    except ImportError:
+        print("[INFO] huggingface_hub não encontrado; instalando (pip -q)...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
 
 
 def publish_via_kagglehub(dataset: str, staging_dir: Path, notes: str) -> None:
@@ -121,6 +142,7 @@ def main() -> int:
         collect_input_queue,
         download_resolved_queue,
         get_secret,
+        is_hf_input,
         publish_staged_state,
         queue_contains_checkpoint,
         resolve_queue_metadata,
@@ -134,6 +156,11 @@ def main() -> int:
         print("[ERROR] CIVITAI_TOKEN não encontrado (Secrets do Colab ou variável de ambiente).")
         return 1
     print("CIVITAI_TOKEN: configurado")
+    hf_token = get_secret("HF_TOKEN")
+    if hf_token:
+        print("HF_TOKEN: configurado")
+    else:
+        print("[WARN] HF_TOKEN não configurado; inputs Hugging Face privados/gated falharão (repos públicos funcionam).")
     if not ensure_kaggle_auth(get_secret):
         print("[ERROR] KAGGLE_USERNAME/KAGGLE_KEY não configurados (Secrets do Colab ou env).")
         return 1
@@ -141,7 +168,12 @@ def main() -> int:
 
     print("\n[3/5] COLETA E RESOLUÇÃO DE INPUTS")
     pending = collect_input_queue()
-    resolved = resolve_queue_metadata(pending, token)
+    if any(is_hf_input(value) for value in pending):
+        try:
+            ensure_huggingface_hub()
+        except Exception as exc:
+            print(f"[WARN] Não foi possível instalar huggingface_hub automaticamente: {exc}")
+    resolved = resolve_queue_metadata(pending, token, hf_token=hf_token)
     if not resolved:
         print("[ERROR] Nenhum item válido resolvido; nada a publicar.")
         return 1
@@ -158,9 +190,15 @@ def main() -> int:
         print(f"[WARN] Não foi possível consultar o dataset remoto para edições: {exc}")
         pending_edits = []
 
-    print("\n[4/5] DOWNLOAD SEQUENCIAL (Civitai)")
+    print("\n[4/5] DOWNLOAD SEQUENCIAL (Civitai/Hugging Face)")
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    items = download_resolved_queue(resolved, STAGING_DIR, token, checkpoint_destination=checkpoint_destination)
+    items = download_resolved_queue(
+        resolved,
+        STAGING_DIR,
+        token,
+        checkpoint_destination=checkpoint_destination,
+        hf_token=hf_token,
+    )
     if not items:
         print("[ERROR] Nenhum arquivo novo no staging; nada a publicar.")
         return 1
