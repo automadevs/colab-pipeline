@@ -122,6 +122,9 @@ class DatasetFile:
     civitai_file_id: Optional[str] = None
     air: Optional[str] = None
     base_model: Optional[str] = None
+    hf_repo_id: Optional[str] = None
+    hf_revision: Optional[str] = None
+    hf_file_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -210,13 +213,166 @@ def validate_civitai_url(value: str) -> Optional[str]:
     return None
 
 
-def classify_civitai_type(resource_type: str, input_fn=input, checkpoint_destination: Optional[str] = None) -> str:
-    """Mapeia o resource_type Civitai para a categoria do dataset.
+def is_hf_input(value: str) -> bool:
+    """Detecta se a entrada é um Hugging Face repo/arquivo: 'hf:' prefixo ou URL huggingface.co."""
+    value = str(value or "").strip().lower()
+    if value.startswith("hf:"):
+        return True
+    parsed = urllib.parse.urlparse(value)
+    host = parsed.netloc.lower()
+    return host == "huggingface.co" or host.endswith(".huggingface.co")
 
-    Para ``checkpoint``, ``checkpoint_destination`` pré-respondido evita o prompt
-    interativo, permitindo decidir o destino uma única vez por lote.
+
+def parse_hf_input(value: str) -> tuple[str, Optional[str], str]:
+    """Parseia entrada HF e retorna (repo_id, file_path ou None, revision).
+
+    Formatos:
+    - hf:org/repo ou hf:org/repo/path/to/arquivo.safetensors
+    - https://huggingface.co/org/repo/resolve/main/arquivo.safetensors
+    - https://huggingface.co/org/repo/blob/main/arquivo.safetensors
     """
-    resource_type = str(resource_type or "").lower()
+    value = str(value or "").strip()
+
+    if value.lower().startswith("hf:"):
+        # hf:org/repo/path/...
+        hf_part = value[3:]  # Remove "hf:"
+        parts = hf_part.split("/")
+        if len(parts) < 2:
+            raise ValueError("Formato HF inválido: use hf:org/repo ou hf:org/repo/path/to/arquivo")
+        repo_id = f"{parts[0]}/{parts[1]}"
+        file_path = "/".join(parts[2:]) if len(parts) > 2 else None
+        return repo_id, file_path, "main"
+
+    # URL format
+    parsed = urllib.parse.urlparse(value)
+    path_parts = [p for p in parsed.path.split("/") if p]
+
+    # Expected: /org/repo/resolve/main/path/to/file ou /org/repo/blob/main/path/to/file
+    if len(path_parts) < 2:
+        raise ValueError("URL HF inválida: esperado /org/repo/resolve/rev/arquivo ou /org/repo/blob/rev/arquivo")
+
+    repo_id = f"{path_parts[0]}/{path_parts[1]}"
+
+    # Detectar resolve/blob
+    if len(path_parts) >= 4 and path_parts[2] in {"resolve", "blob"}:
+        revision = path_parts[3]
+        file_path = "/".join(path_parts[4:]) if len(path_parts) > 4 else None
+    else:
+        # Fallback: tudo após /org/repo é caminho
+        file_path = "/".join(path_parts[2:]) if len(path_parts) > 2 else None
+        revision = "main"
+
+    return repo_id, file_path, revision
+
+
+def validate_hf_input(value: str) -> Optional[str]:
+    """Valida entrada HF; retorna mensagem de erro ou None."""
+    if not is_hf_input(value):
+        return "Entrada não é HF (use hf:org/repo ou URL huggingface.co)"
+    try:
+        parse_hf_input(value)
+        return None
+    except ValueError as exc:
+        return str(exc)
+
+
+def _hf_api_available() -> bool:
+    """Verifica se huggingface_hub está disponível."""
+    try:
+        import huggingface_hub
+        return True
+    except ImportError:
+        return False
+
+
+def _hf_list_repo_files(repo_id: str, revision: str = "main", token: Optional[str] = None) -> list[str]:
+    """Lista arquivos do repositório HF. Retorna nomes dos arquivos."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        raise RuntimeError(
+            "huggingface_hub não está instalado. Execute no Colab:\n"
+            "  !pip install huggingface_hub\n"
+            "ou inclua HF_TOKEN nos Secrets do Colab para repositórios privados."
+        )
+    try:
+        api = HfApi()
+        info = api.model_info(repo_id, revision=revision, token=token)
+        return [f.filename for f in (info.siblings or [])]
+    except Exception as exc:
+        exc_name = type(exc).__name__
+        if exc_name == "RepositoryNotFoundError":
+            raise RuntimeError(f"Repositório não encontrado: {repo_id}")
+        elif exc_name == "GatedRepoError":
+            raise RuntimeError(
+                f"Repositório gated (acesso restrito): {repo_id}\n"
+                f"Configure HF_TOKEN nos Secrets do Colab com acesso a este repositório."
+            )
+        raise RuntimeError(f"Erro ao listar arquivos HF: {exc}")
+
+
+def _hf_file_size(repo_id: str, file_path: str, revision: str = "main", token: Optional[str] = None) -> int:
+    """Obtém tamanho do arquivo HF em bytes."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        raise RuntimeError("huggingface_hub não está instalado (execute !pip install huggingface_hub no Colab)")
+    try:
+        api = HfApi()
+        info = api.model_info(repo_id, revision=revision, token=token)
+        found = False
+        for file_info in (info.siblings or []):
+            if file_info.filename == file_path:
+                found = True
+                if file_info.size:
+                    return file_info.size or 0
+                break
+        # Fallback: metadata direta do arquivo (casos sem size nos siblings)
+        from huggingface_hub import get_hf_file_metadata
+
+        metadata = get_hf_file_metadata(api.hf_hub_url(repo_id, file_path, revision=revision), token=token)
+        if metadata.size:
+            return metadata.size
+        if found:
+            return 0
+        raise FileNotFoundError(f"Arquivo não encontrado: {file_path} em {repo_id}")
+    except Exception as exc:
+        exc_name = type(exc).__name__
+        if exc_name == "RepositoryNotFoundError":
+            raise RuntimeError(f"Repositório não encontrado: {repo_id}")
+        elif exc_name == "GatedRepoError":
+            raise RuntimeError(f"Repositório gated; HF_TOKEN sem acesso: {repo_id}")
+        raise RuntimeError(f"Erro ao obter tamanho do arquivo HF: {exc}")
+
+
+def _hf_hub_download(repo_id: str, filename: str, revision: str = "main", token: Optional[str] = None, local_dir: Optional[str] = None) -> str:
+    """Baixa arquivo HF via hf_hub_download. Retorna o caminho local."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise RuntimeError("huggingface_hub não está instalado")
+    try:
+        return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, token=token, local_dir=local_dir)
+    except Exception as exc:
+        exc_name = type(exc).__name__
+        if exc_name == "RepositoryNotFoundError":
+            raise RuntimeError(f"Repositório não encontrado: {repo_id}")
+        elif exc_name == "GatedRepoError":
+            raise RuntimeError(f"Repositório gated (acesso restrito): {repo_id}. Verifique HF_TOKEN.")
+        elif exc_name == "EntryNotFoundError":
+            raise RuntimeError(f"Arquivo não encontrado: {filename} em {repo_id}")
+        raise RuntimeError(f"Erro ao baixar arquivo HF: {exc}")
+
+
+def classify_resource_type(resource_type: str, input_fn=input, checkpoint_destination: Optional[str] = None) -> str:
+    """Mapeia um resource_type para categoria do dataset, com fallback interativo.
+
+    Para tipo vazio/desconhecido, SEMPRE pergunta ao usuário (usado para HF).
+    """
+    resource_type = str(resource_type or "").strip().lower()
+    if not resource_type:
+        # Tipo não disponível (HF genérico)
+        return normalize_category(input_fn(f"Categoria {CATEGORIES}: "))
     if resource_type in {"lora", "locon", "dora"}:
         return "loras"
     if resource_type == "vae":
@@ -238,8 +394,18 @@ def classify_civitai_type(resource_type: str, input_fn=input, checkpoint_destina
             return normalize_category(checkpoint_destination)
         choice = input_fn("Checkpoint: 1=checkpoints/ 2=diffusion_models/: ").strip().lower()
         return normalize_category({"1": "checkpoints", "2": "diffusion_models"}.get(choice, choice))
-    print(f"[WARN] Tipo Civitai desconhecido: {resource_type}")
+    print(f"[WARN] Tipo desconhecido: {resource_type}")
     return normalize_category(input_fn(f"Destino manual {CATEGORIES}: "))
+
+
+def classify_civitai_type(resource_type: str, input_fn=input, checkpoint_destination: Optional[str] = None) -> str:
+    """Mapeia o resource_type Civitai para a categoria do dataset.
+
+    Para ``checkpoint``, ``checkpoint_destination`` pré-respondido evita o prompt
+    interativo, permitindo decidir o destino uma única vez por lote.
+    Delega a classify_resource_type para evitar duplicação de lógica.
+    """
+    return classify_resource_type(resource_type, input_fn=input_fn, checkpoint_destination=checkpoint_destination)
 
 
 def _expected_sha256(file_info: dict[str, Any]) -> Optional[str]:
@@ -439,6 +605,73 @@ def render_preview(dataset: str, current: dict[str, DatasetFile], desired: dict[
     return "\n".join(lines)
 
 
+def resolve_hf_input(value: str, hf_token: Optional[str] = None, input_fn=input) -> list[dict[str, Any]]:
+    """Resolve entrada HF em uma ou mais filas.
+
+    Retorna [{repo_id, file_path, revision, filename, category, base_model, size, source_url, air: None}].
+    Se arquivo não for especificado no input, lista e pede ao usuário escolher.
+    """
+    value = str(value or "").strip()
+    if not _hf_api_available():
+        print(
+            "[WARN] huggingface_hub não está instalado; instale antes da fase de download: "
+            "!pip install huggingface_hub"
+        )
+    repo_id, file_path, revision = parse_hf_input(value)
+
+    # Se não tem arquivo, listar e pedir
+    if not file_path:
+        files = _hf_list_repo_files(repo_id, revision=revision, token=hf_token)
+        if not files:
+            raise RuntimeError(f"Repositório vazio: {repo_id}")
+        print(f"Arquivos em {repo_id}:")
+        for idx, fname in enumerate(files, start=1):
+            print(f"  {idx}: {fname}")
+        choice = input_fn("Escolha o número do arquivo (ou nome completo): ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(files):
+                file_path = files[idx]
+            else:
+                file_path = choice  # Assume nome completo
+        except ValueError:
+            file_path = choice  # Assume nome completo
+
+    # Obter tamanho
+    size = _hf_file_size(repo_id, file_path, revision=revision, token=hf_token)
+    filename = Path(file_path).name
+
+    # SEMPRE perguntar categoria para HF
+    category = classify_resource_type("", input_fn=input_fn)  # "" -> sempre pergunta
+
+    # SEMPRE perguntar base_model para HF
+    base_model = input_fn("Base model (ex: sdxl, krea2, etc): ").strip() or "unknown"
+
+    # Imprimir no formato esperado
+    print(
+        f"Modelo: {repo_id} | "
+        f"arquivo: {file_path} | "
+        f"tipo: {category} | "
+        f"base model: {base_model}"
+    )
+
+    # Source URL (resolve endpoint)
+    source_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{file_path}"
+
+    return [{
+        "repo_id": repo_id,
+        "file_path": file_path,
+        "revision": revision,
+        "filename": filename,
+        "category": category,
+        "base_model": base_model,
+        "size": size,
+        "source_url": source_url,
+        "air": None,
+        "source": "hf",
+    }]
+
+
 @retry()
 def resolve_civitai_url(url: str, token: str) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
@@ -506,6 +739,70 @@ def resolve_civitai_input(value: str, token: str, input_fn=input) -> list[dict[s
     return [info]
 
 
+def download_hf_file(
+    repo_id: str,
+    file_path: str,
+    category: str,
+    staging_dir: Path,
+    hf_token: Optional[str] = None,
+    revision: str = "main",
+    source_url: Optional[str] = None,
+    base_model: Optional[str] = None,
+) -> DatasetFile:
+    """Baixa arquivo HF e retorna DatasetFile."""
+    destination_dir = Path(staging_dir) / category
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    # Usar hf_hub_download com local_dir
+    try:
+        downloaded_path = _hf_hub_download(
+            repo_id=repo_id,
+            filename=file_path,
+            revision=revision,
+            token=hf_token,
+            local_dir=str(destination_dir),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Erro ao baixar {file_path} de {repo_id}: {exc}")
+
+    # hf_hub_download retorna o caminho completo; normalizar para staging/category/filename
+    downloaded_path = Path(downloaded_path)
+    filename = downloaded_path.name
+    dataset_path = build_dataset_path(category, filename)
+    final_destination = Path(staging_dir) / dataset_path
+
+    # Se o arquivo foi colocado num subdiretório, mover para a raiz da categoria
+    if downloaded_path != final_destination and downloaded_path.exists():
+        final_destination.parent.mkdir(parents=True, exist_ok=True)
+        if final_destination.exists():
+            final_destination.unlink()
+        shutil.move(str(downloaded_path), str(final_destination))
+
+    # Validar tamanho e calcular hash
+    if not final_destination.exists():
+        raise RuntimeError(f"Arquivo não encontrado após download: {final_destination}")
+
+    actual_size = final_destination.stat().st_size
+    actual_hash = sha256_file(final_destination)
+
+    print(f"[{dataset_path}] Tamanho: {format_size(actual_size)}, SHA256: {actual_hash[:16]}...")
+
+    return DatasetFile(
+        dataset_path,
+        actual_size,
+        actual_hash,
+        source_url,
+        None,  # civitai_model_id
+        None,  # civitai_version_id
+        None,  # civitai_file_id
+        None,  # air
+        base_model,
+        repo_id,  # hf_repo_id
+        revision,  # hf_revision
+        file_path,  # hf_file_path
+    )
+
+
 def download_civitai_file(
     info: dict[str, Any],
     category: str,
@@ -550,10 +847,10 @@ def download_civitai_file(
 
 
 def collect_input_queue(input_fn=input) -> list[str]:
-    """Coleta pura da fila AIR/URL: valida cada entrada até o usuário digitar 'done'."""
+    """Coleta pura da fila AIR/URL/HF: valida cada entrada até o usuário digitar 'done'."""
     pending: list[str] = []
     while True:
-        value = input_fn("\nAIR/URL (done para finalizar): ").strip()
+        value = input_fn("\nAIR/URL/HF (done para finalizar): ").strip()
         if value.lower() == "done":
             break
         if not value:
@@ -561,6 +858,8 @@ def collect_input_queue(input_fn=input) -> list[str]:
             continue
         if value.lower().startswith("urn:air:"):
             _, error = validate_air(value)
+        elif is_hf_input(value):
+            error = validate_hf_input(value)
         else:
             error = validate_civitai_url(value)
         if error:
@@ -571,33 +870,49 @@ def collect_input_queue(input_fn=input) -> list[str]:
     return pending
 
 
-def resolve_queue_metadata(pending: list[str], token: str, input_fn=input) -> list[dict[str, Any]]:
-    """Resolve os metadados Civitai de cada item da fila sem baixar nada.
+def resolve_queue_metadata(pending: list[str], token: str, input_fn=input, hf_token: Optional[str] = None) -> list[dict[str, Any]]:
+    """Resolve os metadados Civitai/HF de cada item da fila sem baixar nada.
 
-    Retorna uma entrada por arquivo resolvido, preservando o ``info`` retornado por
-    resolve_civitai_input junto com o ``resource_type``, para que a fase de download
-    não precise chamar a API da Civitai novamente.
+    Retorna uma entrada por arquivo resolvido, preservando os metadados resolvidos,
+    para que a fase de download não precise chamar as APIs da Civitai/HF novamente.
     """
+    if hf_token is None:
+        hf_token = get_secret("HF_TOKEN")
+    if not hf_token:
+        print("[WARN] HF_TOKEN não configurado; repositórios HF privados/gated falharão.")
+
     resolved: list[dict[str, Any]] = []
     failures = 0
     total = len(pending)
     for index, value in enumerate(pending, start=1):
         print(f"[INFO] Resolvendo metadados [{index}/{total}]: {value}")
         try:
-            infos = resolve_civitai_input(value, token, input_fn)
+            if value.lower().startswith("urn:air:") or (not is_hf_input(value)):
+                # Civitai AIR ou URL
+                infos = resolve_civitai_input(value, token, input_fn)
+                source = "civitai"
+            else:
+                # Hugging Face
+                infos = resolve_hf_input(value, hf_token=hf_token, input_fn=input_fn)
+                source = "hf"
         except Exception as exc:
             failures += 1
             print(f"[ERROR] Falha ao resolver [{index}/{total}] {value}: {exc}")
             continue
         for info in infos:
-            air = info.get("air") or {}
-            resource_type = air.get("type") or info["model"].get("type", "unknown")
+            if source == "civitai":
+                air = info.get("air") or {}
+                resource_type = air.get("type") or info["model"].get("type", "unknown")
+            else:
+                # HF
+                resource_type = None
             resolved.append({
                 "value": value,
                 "index": index,
                 "total": total,
                 "info": info,
                 "resource_type": resource_type,
+                "source": source,
             })
     if failures:
         print(f"[WARN] Resolução concluída com {failures} falha(s); {len(resolved)} arquivo(s) resolvido(s).")
@@ -615,6 +930,7 @@ def download_resolved_queue(
     token: str,
     input_fn=input,
     checkpoint_destination: Optional[str] = None,
+    hf_token: Optional[str] = None,
 ) -> list[DatasetFile]:
     """Executa os downloads da fila já resolvida, sem nenhum prompt intermediário.
 
@@ -622,6 +938,9 @@ def download_resolved_queue(
     checkpoint; quando None, classify_civitai_type mantém o comportamento
     interativo por item (compatibilidade).
     """
+    if hf_token is None:
+        hf_token = get_secret("HF_TOKEN")
+
     print("[INFO] Iniciando downloads...")
     queue: list[DatasetFile] = []
     failures = 0
@@ -632,24 +951,47 @@ def download_resolved_queue(
             print(f"--- [{entry['index']}/{entry['total']}] {value} ---")
             last_value = value
         info = entry["info"]
+        source = entry.get("source", "civitai")  # Default para compatibilidade com mocks de teste antigos
+
         try:
-            air = info.get("air") or {}
-            resource_type = entry["resource_type"]
-            category = classify_civitai_type(resource_type, input_fn, checkpoint_destination=checkpoint_destination)
-            file_info = info["file"]
-            base_model = air.get("base_model") or info["version"].get("baseModel") or info["model"].get("baseModel")
-            manifest_input = {
-                **air,
-                "air": air.get("air") or (value if value.lower().startswith("urn:air:") else None),
-                "base_model": base_model,
-            }
-            print(
-                f"Modelo: {info['model'].get('name', 'N/A')} | "
-                f"versão: {info['version'].get('name', info['version'].get('id'))} | "
-                f"arquivo: {file_info.get('name', 'N/A')} | "
-                f"tipo: {resource_type} | base model: {base_model or 'N/A'}"
-            )
-            item = download_civitai_file(info, category, staging_dir, token, source_url=value, air=manifest_input)
+            if source == "hf":
+                # HF: categoria e base_model já perguntados na Fase 1
+                repo_id = info["repo_id"]
+                file_path = info["file_path"]
+                category = info["category"]
+                base_model = info["base_model"]
+                revision = info.get("revision", "main")
+                source_url = info.get("source_url")
+                item = download_hf_file(
+                    repo_id=repo_id,
+                    file_path=file_path,
+                    category=category,
+                    staging_dir=staging_dir,
+                    hf_token=hf_token,
+                    revision=revision,
+                    source_url=source_url,
+                    base_model=base_model,
+                )
+            else:
+                # Civitai
+                air = info.get("air") or {}
+                resource_type = entry["resource_type"]
+                category = classify_civitai_type(resource_type, input_fn, checkpoint_destination=checkpoint_destination)
+                file_info = info["file"]
+                base_model = air.get("base_model") or info["version"].get("baseModel") or info["model"].get("baseModel")
+                manifest_input = {
+                    **air,
+                    "air": air.get("air") or (value if value.lower().startswith("urn:air:") else None),
+                    "base_model": base_model,
+                }
+                print(
+                    f"Modelo: {info['model'].get('name', 'N/A')} | "
+                    f"versão: {info['version'].get('name', info['version'].get('id'))} | "
+                    f"arquivo: {file_info.get('name', 'N/A')} | "
+                    f"tipo: {resource_type} | base model: {base_model or 'N/A'}"
+                )
+                item = download_civitai_file(info, category, staging_dir, token, source_url=value, air=manifest_input)
+
             if any(existing.path == item.path and existing.size == item.size and existing.sha256 == item.sha256 for existing in queue):
                 print(f"[SKIP] já presente na fila e idêntico: {item.path}")
                 continue
@@ -668,15 +1010,16 @@ def download_input_queue(
     staging_dir: Path,
     token: str,
     input_fn=input,
+    hf_token: Optional[str] = None,
 ) -> list[DatasetFile]:
-    """Fila síncrona AIR/URL: encadeia coleta -> resolução -> download.
+    """Fila síncrona AIR/URL/HF: encadeia coleta -> resolução -> download.
 
     Mantida como atalho público equivalente; o orquestrador chama as etapas
     separadamente para antecipar todas as perguntas interativas.
     """
     pending = collect_input_queue(input_fn)
-    resolved = resolve_queue_metadata(pending, token, input_fn)
-    return download_resolved_queue(resolved, staging_dir, token, input_fn)
+    resolved = resolve_queue_metadata(pending, token, input_fn, hf_token=hf_token)
+    return download_resolved_queue(resolved, staging_dir, token, input_fn, hf_token=hf_token)
 
 
 def kaggle_files(dataset: str) -> list[dict[str, Any]]:
@@ -843,7 +1186,7 @@ def publish_staged_state(
                 print(f"[WARN] path inexistente: {old}")
                 continue
             item = desired.pop(old)
-            desired[new] = DatasetFile(new, item.size, item.sha256, item.source, item.civitai_model_id, item.civitai_version_id, item.civitai_file_id, item.air, item.base_model)
+            desired[new] = DatasetFile(new, item.size, item.sha256, item.source, item.civitai_model_id, item.civitai_version_id, item.civitai_file_id, item.air, item.base_model, item.hf_repo_id, item.hf_revision, item.hf_file_path)
             source, target = staging_dir / old, staging_dir / new
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.exists() and not target.exists():
