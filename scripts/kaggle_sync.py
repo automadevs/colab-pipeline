@@ -36,13 +36,20 @@ def resolve_dataset_name(override: str | None = None) -> str:
             "Dataset Kaggle não resolvido. Configure os secrets/env:\n"
             "  - KAGGLE_USERNAME: seu username Kaggle\n"
             "  - KAGGLE_DATASET_NAME: nome do dataset (ex: comfydocs)\n"
+            "No Colab/Kaggle, confira se os Secrets existem e estão habilitados para o notebook.\n"
             "Ou passe o dataset explicitamente via --dataset \"owner/nome\"."
         )
 
     return f"{username}/{dataset_name}"
 
 
-DEFAULT_DATASET = resolve_dataset_name()
+try:
+    DEFAULT_DATASET: str | None = resolve_dataset_name()
+except ValueError:
+    # Sem KAGGLE_USERNAME/KAGGLE_DATASET_NAME o módulo continua importável (a suíte de
+    # testes roda sem secrets); a resolução acontece em runtime (CLI `--dataset` ou
+    # notebooks, que passam o dataset explicitamente).
+    DEFAULT_DATASET = None
 DEFAULT_TARGET_DIR = Path("/kaggle/working/ComfyUI/models")
 MODEL_CATEGORIES = [
     "checkpoints", "diffusion_models", "loras", "vae", "text_encoders",
@@ -376,12 +383,13 @@ def main():
     args = parser.parse_args()
 
     try:
-        files = get_dataset_files(args.dataset)
+        dataset = args.dataset or resolve_dataset_name()
+        files = get_dataset_files(dataset)
         if args.list_only:
             print(json.dumps(files, ensure_ascii=False, indent=2))
             return
         stats = sync_dataset_to_local(
-            dataset=args.dataset,
+            dataset=dataset,
             target_dir=Path(args.target_dir),
             categories=args.categories,
             model_names=args.model_names,

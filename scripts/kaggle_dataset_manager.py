@@ -40,13 +40,20 @@ def resolve_dataset_name(override: Optional[str] = None) -> str:
             "Dataset Kaggle não resolvido. Configure os secrets/env:\n"
             "  - KAGGLE_USERNAME: seu username Kaggle\n"
             "  - KAGGLE_DATASET_NAME: nome do dataset (ex: comfydocs)\n"
+            "No Colab, confira se os Secrets existem, se estão com \"Notebook access\"\n"
+            "habilitado e se foram injetados em os.environ (ver colab_transfer/00_master_pipeline.ipynb).\n"
             "Ou passe o dataset explicitamente via --dataset \"owner/nome\"."
         )
 
     return f"{username}/{dataset_name}"
 
 
-DEFAULT_DATASET = resolve_dataset_name()
+try:
+    DEFAULT_DATASET: Optional[str] = resolve_dataset_name()
+except ValueError:
+    # Sem KAGGLE_USERNAME/KAGGLE_DATASET_NAME o módulo continua importável (a suíte de
+    # testes roda sem secrets); a publicação resolve o dataset explicitamente em runtime.
+    DEFAULT_DATASET = None
 DEFAULT_STAGING = Path("/content/kaggle_dataset_manager")
 CATEGORIES = (
     "checkpoints", "diffusion_models", "loras", "vae", "text_encoders",

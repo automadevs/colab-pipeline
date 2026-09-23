@@ -13,11 +13,21 @@ como inferi-los de um repo genérico.
 
 Uso no Colab (célula única, ver colab_transfer/00_master_pipeline.ipynb):
     !python /content/colab-pipeline/scripts/master_pipeline.py
+    !python /content/colab-pipeline/scripts/master_pipeline.py --dataset "owner/nome"
+
+Variáveis de ambiente / Secrets do Colab (obrigatórias):
+    CIVITAI_TOKEN, KAGGLE_USERNAME, KAGGLE_KEY, KAGGLE_DATASET_NAME
+Opcional: HF_TOKEN (repos Hugging Face privados/gated).
+
+O dataset alvo é resolvido no início de main(): ``--dataset`` tem prioridade sobre
+``KAGGLE_USERNAME``/``KAGGLE_DATASET_NAME``. Sem nenhum dos dois o pipeline aborta
+com mensagem explicativa antes de clonar o repositório.
 
 Código de saída: 0 em sucesso (ou cancelamento explícito da publicação), 1 em falha crítica.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -47,16 +57,36 @@ def resolve_dataset_name(override: str | None = None) -> str:
             "Dataset Kaggle não resolvido. Configure os secrets/env:\n"
             "  - KAGGLE_USERNAME: seu username Kaggle\n"
             "  - KAGGLE_DATASET_NAME: nome do dataset (ex: comfydocs)\n"
+            "No Colab, confira se os Secrets existem, se estão com \"Notebook access\"\n"
+            "habilitado e se foram injetados em os.environ (ver colab_transfer/00_master_pipeline.ipynb).\n"
             "Ou passe o dataset explicitamente via --dataset \"owner/nome\"."
         )
 
     return f"{username}/{dataset_name}"
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """CLI mínima: permite sobrescrever o dataset alvo.
+
+    Sem ``--dataset`` o alvo vem de ``KAGGLE_USERNAME``/``KAGGLE_DATASET_NAME``
+    (variáveis de ambiente ou Secrets do Colab).
+    """
+    parser = argparse.ArgumentParser(
+        description="Orquestrador Colab: Civitai/Hugging Face -> Kaggle Dataset",
+    )
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help='Dataset Kaggle no formato "owner/nome" (default: KAGGLE_USERNAME/KAGGLE_DATASET_NAME)',
+    )
+    return parser.parse_args(argv)
+
+
 REPO_URL = "https://github.com/automadevs/colab-pipeline.git"
 REPO_DIR = Path("/content/colab-pipeline")
 SCRIPTS_DIR = REPO_DIR / "scripts"
-DATASET = resolve_dataset_name()
+# Resolvido em main() (aceita --dataset ou KAGGLE_USERNAME/KAGGLE_DATASET_NAME).
+DATASET: str | None = None
 STAGING_DIR = Path("/content/kaggle_staging")
 
 
@@ -125,10 +155,18 @@ def publish_via_kagglehub(dataset: str, staging_dir: Path, notes: str) -> None:
     print(f"[INFO] Fallback kagglehub concluído: {dataset}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
-    print("MASTER PIPELINE: CIVITAI -> KAGGLE DATASET")
+    print("MASTER PIPELINE: CIVITAI/HUGGING FACE -> KAGGLE DATASET")
     print("=" * 60)
+
+    args = parse_args(argv)
+    try:
+        dataset = args.dataset or resolve_dataset_name()
+    except ValueError as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+    print(f"[INFO] Dataset alvo: {dataset}")
 
     print("\n[1/5] SETUP DO REPOSITÓRIO")
     try:
@@ -185,7 +223,7 @@ def main() -> int:
         print(f"[INFO] Destino de checkpoints do lote: {checkpoint_destination}")
 
     try:
-        pending_edits = collect_dataset_edits(DATASET)
+        pending_edits = collect_dataset_edits(dataset)
     except Exception as exc:
         print(f"[WARN] Não foi possível consultar o dataset remoto para edições: {exc}")
         pending_edits = []
@@ -202,17 +240,17 @@ def main() -> int:
     if not items:
         print("[ERROR] Nenhum arquivo novo no staging; nada a publicar.")
         return 1
-    write_manifest(STAGING_DIR / "dataset-manifest.json", DATASET, {item.path: item for item in items})
+    write_manifest(STAGING_DIR / "dataset-manifest.json", dataset, {item.path: item for item in items})
     print(f"[INFO] {len(items)} arquivo(s) prontos no staging: {STAGING_DIR}")
 
     print("\n[5/5] PUBLICAÇÃO NO KAGGLE")
     try:
-        result = publish_staged_state(DATASET, STAGING_DIR, pending_edits=pending_edits)
+        result = publish_staged_state(dataset, STAGING_DIR, pending_edits=pending_edits)
     except Exception as exc:
         print(f"[WARN] Publicação via Kaggle CLI falhou: {exc}")
         print("[INFO] Tentando fallback via kagglehub...")
         try:
-            publish_via_kagglehub(DATASET, STAGING_DIR, "Update Dataset state (kagglehub fallback)")
+            publish_via_kagglehub(dataset, STAGING_DIR, "Update Dataset state (kagglehub fallback)")
         except Exception as fallback_exc:
             print(f"[ERROR] Fallback kagglehub também falhou: {fallback_exc}")
             return 1
