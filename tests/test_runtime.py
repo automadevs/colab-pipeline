@@ -1810,6 +1810,52 @@ class TestT_AssertOnlyAllowedPersistentArtifactAllowsStaticFiles(unittest.TestCa
             finally:
                 self._restore_working_roots(*orig)
 
+    def test_rebuild_snapshot_allows_packaged_node_assets(self):
+        """Re-baseline APOS provisionamento com nodes contendo imagens/docs e .pt/.npz/.gz."""
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = self._set_working_roots(tmp)
+            try:
+                comfyui_setup.record_working_snapshot()
+                aux = Path(tmp) / "ComfyUI" / "custom_nodes" / "comfyui_controlnet_aux"
+                imgs = aux / "examples"
+                imgs.mkdir(parents=True, exist_ok=True)
+                (imgs / "example_depth_anything.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                for rel, contents in (
+                    ("src/custom_mesh_graphormer/modeling/data/mano_195_adjmat_values.pt", b"\x00" * 32),
+                    ("src/custom_mesh_graphormer/modeling/data/mano_downsampling.npz", b"PK\x03\x04" + b"\x00" * 32),
+                    ("src/custom_controlnet_aux/diffusion_edge/taming/modules/autoencoder/lpips/vgg.pth", b"\x00" * 32),
+                ):
+                    target = aux / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(contents)
+                rmbg = Path(tmp) / "ComfyUI" / "custom_nodes" / "ComfyUI-RMBG"
+                workflows = rmbg / "example_workflows"
+                workflows.mkdir(parents=True, exist_ok=True)
+                (workflows / "florence2_node.jpg").write_bytes(b"\xff\xd8\xff" + b"\x00" * 32)
+                vocab = rmbg / "models" / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+                vocab.parent.mkdir(parents=True, exist_ok=True)
+                vocab.write_bytes(b"\x1f\x8b" + b"\x00" * 32)
+                cg = Path(tmp) / "ComfyUI" / "custom_nodes" / "cg-use-everywhere" / "tests"
+                cg.mkdir(parents=True, exist_ok=True)
+                (cg / "compare.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                env = os.environ.copy()
+                env["GIT_AUTHOR_NAME"] = "Test"
+                env["GIT_AUTHOR_EMAIL"] = "test@test.com"
+                env["GIT_COMMITTER_NAME"] = "Test"
+                env["GIT_COMMITTER_EMAIL"] = "test@test.com"
+                for node in (aux, rmbg, cg.parent):
+                    subprocess.run(["git", "init"], cwd=str(node), capture_output=True, env=env, check=True)
+                    subprocess.run(["git", "add", "-A"], cwd=str(node), capture_output=True, env=env, check=True)
+                    subprocess.run(["git", "commit", "-m", "init"], cwd=str(node), capture_output=True, env=env, check=True)
+                comfyui_setup.rebuild_working_snapshot_after_provisioning(label="TEST-POST-SETUP")
+                comfyui_setup.assert_only_allowed_persistent_artifact()
+                self.assertTrue(any(str(p).endswith("mano_195_adjmat_values.pt")
+                                    for p in comfyui_setup._WORKING_SNAPSHOT))
+                self.assertTrue(any(str(p).endswith("bpe_simple_vocab_16e6.txt.gz")
+                                    for p in comfyui_setup._WORKING_SNAPSHOT))
+            finally:
+                self._restore_working_roots(*orig)
+
     def test_rebuild_snapshot_allows_authorized_install_files(self):
         """Re-baseline APOS o provisionamento cobre custom nodes + yaml (fix dos 8 arquivos)."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -2094,6 +2140,167 @@ class TestU_GitBasedAudit(unittest.TestCase):
                 comfyui_setup._clear_git_cache()
                 comfyui_setup.assert_no_persistent_images(label="TEST")
                 comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_allowed_node_data_extensions_subset_of_sensitive_layers(self):
+        """Carve-out não amplia a superfície: cada extensão já era tratada."""
+        for ext in comfyui_setup.ALLOWED_NODE_DATA_EXTENSIONS:
+            self.assertTrue(
+                ext in comfyui_setup.ALWAYS_BLOCKED_EXTENSIONS
+                or ext in comfyui_setup.SENSITIVE_ARCHIVES
+                or ext in comfyui_setup.SENSITIVE_NON_IMAGE_EXTENSIONS
+                or ext == ".npz",  # .npz pega na Camada 5 (magic bytes PK/ZIP)
+                ext,
+            )
+        for ext in (
+            ".safetensors", ".ckpt", ".gguf", ".bin", ".onnx", ".tflite",
+            ".zip", ".7z", ".rar", ".tar",
+        ):
+            self.assertNotIn(ext, comfyui_setup.ALLOWED_NODE_DATA_EXTENSIONS)
+
+    def test_node_example_image_tracked_limpa_passa(self):
+        """custom_nodes/<node>/examples/workflow.png tracked-e-limpo → PASSA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_image(tmp, subdir="example_workflows", tracked=True)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_tests_image_tracked_limpa_passa(self):
+        """custom_nodes/<node>/tests/test.png tracked-e-limpo → PASSA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_image(
+                tmp, node_name="cg-use-everywhere", subdir="tests", tracked=True
+            )
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def _create_node_with_data_asset(self, tmp, node_name="comfyui_controlnet_aux",
+                                     rel="src/custom_mesh_graphormer/modeling/data/mano_195_adjmat_values.pt",
+                                     contents=b"\x00" * 32, tracked=True):
+        """Cria asset de dados em node ANINHADO com .git proprio; commita se tracked."""
+        asset = Path(tmp) / "ComfyUI" / "custom_nodes" / node_name / rel
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_bytes(contents)
+        node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / node_name
+        if tracked:
+            self._git_commit_all(node_dir)
+        return asset
+
+    def test_node_data_asset_tracked_limpo_passa(self):
+        """Data assets tracked-e-limpos dos paths do erro real → PASSA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_data_asset(
+                tmp, rel="src/custom_mesh_graphormer/modeling/data/mano_195_adjmat_values.pt")
+            self._create_node_with_data_asset(
+                tmp, rel="src/custom_mesh_graphormer/modeling/data/mano_downsampling.npz",
+                contents=b"PK\x03\x04" + b"\x00" * 32)
+            self._create_node_with_data_asset(
+                tmp,
+                rel="src/custom_controlnet_aux/diffusion_edge/taming/modules/autoencoder/lpips/vgg.pth")
+            self._create_node_with_data_asset(
+                tmp, node_name="ComfyUI-RMBG",
+                rel="models/sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+                contents=b"\x1f\x8b" + b"\x00" * 32)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_data_asset_fora_da_allowlist_reprova(self):
+        """Mesmo arquivo de dados tracked-e-limpo em node fora da allowlist → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_data_asset(
+                tmp, node_name="evil-node",
+                rel="src/data/mano_195_adjmat_values.pt")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_data_asset_untracked_reprova(self):
+        """Arquivo .pt criado manualmente (untracked) em node autorizado → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_data_asset(
+                tmp, rel="src/data/dropped.pt", tracked=False)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_data_asset_modificado_reprova(self):
+        """Arquivo .pt tracked mas MODIFICADO depois do commit → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            asset = self._create_node_with_data_asset(tmp)
+            asset.write_bytes(b"\x00" * 33)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_data_asset_safetensors_mesmo_tracked_reprova(self):
+        """.safetensors tracked-e-limpo em node autorizado continua BLOQUEADO."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / "comfyui_controlnet_aux"
+            asset = node_dir / "model.safetensors"
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            asset.write_bytes(b"\x00" * 32)
+            self._git_commit_all(node_dir)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
             finally:
                 comfyui_setup.PERSISTENT_AUDIT_PATHS = original
                 comfyui_setup._clear_git_cache()
