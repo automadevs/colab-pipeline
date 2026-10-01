@@ -9,7 +9,9 @@ publicação.
 Fontes de entrada suportadas na fila: AIR (`urn:air:...`), URL Civitai e
 Hugging Face (`hf:org/repo[/arquivo]` ou URL `huggingface.co`). Para HF a
 categoria e o `base_model` são sempre perguntados na fase de coleta, pois não há
-como inferi-los de um repo genérico.
+como inferi-los de um repo genérico. Uma entrada pode ser prefixada com
+`/makedir <PASTA>` (ex.: `/makedir SEEDVR2 hf:org/repo/modelo.safetensors`) para
+definir uma pasta própria e PULAR a pergunta de categoria.
 
 Uso no Colab (célula única, ver colab_transfer/00_master_pipeline.ipynb):
     !python /content/colab-pipeline/scripts/master_pipeline.py
@@ -193,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         publish_staged_state,
         queue_contains_checkpoint,
         resolve_queue_metadata,
+        split_makedir_command,
         write_manifest,
     )
 
@@ -215,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n[3/5] COLETA E RESOLUÇÃO DE INPUTS")
     pending = collect_input_queue()
-    if any(is_hf_input(value) for value in pending):
+    if any(is_hf_input(split_makedir_command(value)[1]) for value in pending):
         # Cache HF em diretório temporário, configurado ANTES do primeiro import
         # de huggingface_hub (constantes congeladas na importação); removido ao
         # sair do processo, qualquer que seja o desfecho (item 8).

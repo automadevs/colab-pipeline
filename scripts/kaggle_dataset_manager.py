@@ -59,6 +59,10 @@ CATEGORIES = (
     "checkpoints", "diffusion_models", "loras", "vae", "text_encoders",
     "clip", "controlnet", "upscale_models", "video_models", "embeddings",
 )
+# Modificador de categoria opcional: "/makedir <PASTA> <entrada Civitai/HF>"
+# cria/usa uma pasta própria em ComfyUI/models/ (ex.: SEEDVR2) mesmo fora de
+# CATEGORIES. É reconhecido ANTES do roteamento normal (não é uma fonte nova).
+MAKEDIR_COMMAND = "/makedir"
 MANIFEST_NAME = "dataset-manifest.json"
 METADATA_NAME = "dataset-metadata.json"
 CIVITAI_CLI_PACKAGE = "@civitai/cli@0.1.104"
@@ -170,8 +174,89 @@ def format_size(size: int) -> str:
     return f"{size} B"
 
 
-def build_dataset_path(category: str, filename: str) -> str:
-    if category not in CATEGORIES:
+def validate_custom_category(name: str) -> str:
+    """Valida o nome de pasta customizada de "/makedir" (categoria ad-hoc).
+
+    Preserva a capitalização exatamente como digitada (ex.: "SEEDVR2"). Rejeita
+    só o que é inseguro para o filesystem — separadores de path, "..", caminho
+    absoluto e caracteres de controle — replicando a checagem mínima de
+    ``validate_runtime_path`` (comfyui_setup.py). Diferente daquele helper (que
+    também exige uma raiz permitida e aborta o processo), aqui o objetivo é só
+    avisar e pedir a entrada de novo durante a coleta, sem derrubar a sessão.
+    Não exige que o nome pertença a nenhuma lista pré-definida.
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        raise ValueError("Nome de pasta customizada vazio em /makedir")
+    if "/" in raw or "\\" in raw:
+        raise ValueError(f"Nome de pasta customizada não pode conter separadores de path: {raw!r}")
+    if ".." in raw:
+        raise ValueError(f"Nome de pasta customizada não pode conter '..': {raw!r}")
+    if Path(raw).is_absolute() or re.match(r"^[A-Za-z]:", raw):
+        raise ValueError(f"Nome de pasta customizada não pode ser um caminho absoluto: {raw!r}")
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise ValueError(f"Nome de pasta customizada contém caracteres de controle: {raw!r}")
+    return raw
+
+
+def custom_category_warnings(name: str) -> list[str]:
+    """Avisos (não bloqueantes) para uma pasta customizada de /makedir.
+
+    H4: /makedir continua aceitando o nome; estes avisos só tornam visíveis duas
+    armadilhas silenciosas:
+      - "." resolve para a raiz do staging (o arquivo não cai em subpasta);
+      - colisão só de capitalização com categoria padrão (ex.: "Loras" cria uma
+        pasta SEPARADA de "loras/"; no Linux são diretórios distintos).
+    """
+    name = str(name or "")
+    warnings: list[str] = []
+    if name == ".":
+        warnings.append(
+            "Pasta customizada '.' aponta para a raiz do staging: o arquivo NÃO irá "
+            "para uma subpasta própria do modelo."
+        )
+    folded = name.lower()
+    if folded in CATEGORIES and name != folded:
+        warnings.append(
+            f"Pasta customizada '{name}' difere só na capitalização da categoria padrão "
+            f"'{folded}': será uma pasta SEPARADA (não funde com '{folded}/')."
+        )
+    return warnings
+
+
+def split_makedir_command(value: str) -> tuple[Optional[str], str]:
+    """Separa o prefixo ``/makedir <PASTA>`` de uma entrada, preservando o resto.
+
+    Retorna ``(pasta, entrada)`` quando o comando está presente e ``(None, value)``
+    caso contrário. Não valida a pasta (responsabilidade de ``parse_input``) nem a
+    entrada — serve apenas para reconhecer o modificador de categoria ANTES do
+    roteamento normal (Civitai vs Hugging Face). O split usa no máximo 3 partes:
+    comando, nome da pasta e o resto (a entrada).
+    """
+    text = str(value or "").strip()
+    parts = text.split(maxsplit=2)
+    if not parts or parts[0] != MAKEDIR_COMMAND:
+        return None, text
+    folder = parts[1].strip() if len(parts) > 1 else ""
+    remainder = parts[2].strip() if len(parts) > 2 else ""
+    return folder, remainder
+
+
+def is_custom_category(category: Optional[str]) -> bool:
+    """True quando a categoria não é uma das CATEGORIES fixas (pasta de /makedir)."""
+    return bool(category) and category not in CATEGORIES
+
+
+def build_dataset_path(category: str, filename: str, *, custom: bool = False) -> str:
+    """Monta o destino ``<categoria>/<arquivo>`` dentro do dataset.
+
+    ``custom=False`` (padrão) mantém a allowlist CATEGORIES; ``custom=True`` aceita
+    uma categoria ad-hoc (pasta customizada de /makedir), validada apenas quanto à
+    segurança de filesystem via ``validate_custom_category``.
+    """
+    if custom:
+        category = validate_custom_category(category)
+    elif category not in CATEGORIES:
         raise ValueError(f"Categoria inválida: {category}")
     name = Path(filename).name
     if not name or name in {".", ".."}:
@@ -816,7 +901,12 @@ def _hf_is_candidate_file(name: str) -> bool:
     return Path(lowered).suffix in HF_ALLOWED_EXTENSIONS
 
 
-def resolve_hf_input(value: str, hf_token: Optional[str] = None, input_fn=input) -> list[dict[str, Any]]:
+def resolve_hf_input(
+    value: str,
+    hf_token: Optional[str] = None,
+    input_fn=input,
+    custom_category: Optional[str] = None,
+) -> list[dict[str, Any]]:
     """Fase 1 (metadados) de uma entrada HF: validação/listagem/metadata + prompts.
 
     NÃO baixa nada (download só na Fase 2).
@@ -832,7 +922,9 @@ def resolve_hf_input(value: str, hf_token: Optional[str] = None, input_fn=input)
       3) pede categoria; 4) pede base_model.
 
     Categoria e base_model são SEMPRE perguntados para HF — não existe
-    auto-classificação a partir de um repo genérico.
+    auto-classificação a partir de um repo genérico. Exceção: ``custom_category``
+    (vindo de "/makedir <PASTA>") define a pasta explicitamente e PULA a pergunta
+    de categoria (o base_model continua sendo perguntado).
     """
     value = str(value or "").strip()
     if not _hf_api_available():
@@ -875,8 +967,12 @@ def resolve_hf_input(value: str, hf_token: Optional[str] = None, input_fn=input)
         raise RuntimeError(f"Tamanho inválido (0 bytes) para {file_path} em {repo_id}")
     filename = Path(file_path).name
 
-    # SEMPRE perguntar categoria para HF (sem fallback automático)
-    category = classify_resource_type("", input_fn=input_fn)
+    # Categoria SEMPRE perguntada para HF (sem fallback automático) — exceto
+    # quando vem de /makedir, que já define a pasta customizada explicitamente.
+    if custom_category:
+        category = validate_custom_category(custom_category)
+    else:
+        category = classify_resource_type("", input_fn=input_fn)
 
     # SEMPRE perguntar base_model para HF (não inferível de repo genérico)
     base_model = input_fn("Base model (ex: sdxl, krea2, etc): ").strip() or "unknown"
@@ -983,8 +1079,12 @@ def download_hf_file(
     revision: str = "main",
     source_url: Optional[str] = None,
     base_model: Optional[str] = None,
+    custom: bool = False,
 ) -> DatasetFile:
     """Baixa arquivo HF e retorna DatasetFile."""
+    if custom:
+        # Valida a pasta ad-hoc ANTES de criar diretório (nunca fora do staging).
+        category = validate_custom_category(category)
     destination_dir = Path(staging_dir) / category
     destination_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1003,7 +1103,7 @@ def download_hf_file(
     # hf_hub_download retorna o caminho completo; normalizar para staging/category/filename
     downloaded_path = Path(downloaded_path)
     filename = downloaded_path.name
-    dataset_path = build_dataset_path(category, filename)
+    dataset_path = build_dataset_path(category, filename, custom=custom)
     final_destination = Path(staging_dir) / dataset_path
 
     # Se o arquivo foi colocado num subdiretório, mover para a raiz da categoria
@@ -1057,10 +1157,11 @@ def download_civitai_file(
     token: str,
     source_url: Optional[str] = None,
     air: Optional[dict[str, Any]] = None,
+    custom: bool = False,
 ) -> DatasetFile:
     file_info = info["file"]
     filename = Path(file_info.get("name") or "model.safetensors").name
-    dataset_path = build_dataset_path(category, filename)
+    dataset_path = build_dataset_path(category, filename, custom=custom)
     destination = Path(staging_dir) / dataset_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     expected_size = int(float(file_info.get("sizeKB") or 0) * 1024)
@@ -1108,10 +1209,15 @@ def collect_input_queue(input_fn=input) -> list[str]:
             print("[WARN] Entrada vazia")
             continue
         try:
-            parse_input(value, len(pending) + 1)
+            parsed = parse_input(value, len(pending) + 1)
         except ValueError as exc:
             print(f"[WARN] Entrada inválida: {exc}")
             continue
+        if parsed.custom_category:
+            # H4: avisos não bloqueantes ('.' e colisão de capitalização com categoria
+            # padrão) — emitidos uma única vez, aqui na coleta.
+            for warning in custom_category_warnings(parsed.custom_category):
+                print(f"[WARN] {warning}")
         pending.append(value)
     print(f"[INFO] Lista fechada com {len(pending)} item(ns).")
     return pending
@@ -1128,6 +1234,8 @@ class ParsedInput:
     file_path: Optional[str] = None    # HF
     revision: Optional[str] = None     # HF
     state: str = "PARSED"
+    custom_category: Optional[str] = None  # pasta ad-hoc de /makedir (nome exato)
+    resource_input: Optional[str] = None   # entrada sem o prefixo /makedir
 
 
 @dataclass
@@ -1237,32 +1345,55 @@ def parse_input(value: str, index: int = 0) -> ParsedInput:
 
     Roteia por provider: HF (prefixo hf:/URL huggingface.co) vs Civitai
     (urn:air:/URL civitai.com). 'done' é exclusivamente o marcador de fim da
-    coleta (nunca vira artefato); entradas não reconhecidas são erro.
+    coleta (nunca vira artefato); entradas não reconhecidas são erro. Um prefixo
+    opcional "/makedir <PASTA>" define a categoria ad-hoc ANTES do roteamento e é
+    removido para a detecção (a pasta fica em ``custom_category``).
     """
     value = str(value or "").strip()
     if not value:
         raise ValueError("Entrada vazia")
     if value.lower() == "done":
         raise ValueError("'done' é o marcador de fim da coleta, não um input")
-    if is_hf_input(value):
-        repo_id, file_path, revision = parse_hf_input(value)
-        return ParsedInput("huggingface", value, index, repo_id, file_path, revision)
-    if value.lower().startswith("urn:air:"):
-        _, error = validate_air(value)
+    # Modificador de categoria opcional reconhecido ANTES do roteamento normal:
+    # "/makedir <PASTA> <entrada Civitai/HF>" define a pasta explicitamente e não
+    # é uma terceira fonte — o resto é roteado como qualquer entrada já suportada.
+    custom_category = None
+    resource_input = value
+    folder, remainder = split_makedir_command(value)
+    if folder is not None:
+        if not folder or not remainder:
+            raise ValueError(
+                "Entrada /makedir malformada: use '/makedir <NOME_DA_PASTA> <entrada Civitai/HF>'. "
+                "Ex.: /makedir SEEDVR2 hf:org/repo/modelo.safetensors"
+            )
+        custom_category = validate_custom_category(folder)
+        resource_input = remainder
+    if is_hf_input(resource_input):
+        repo_id, file_path, revision = parse_hf_input(resource_input)
+        return ParsedInput(
+            "huggingface", value, index, repo_id, file_path, revision,
+            custom_category=custom_category, resource_input=resource_input,
+        )
+    if resource_input.lower().startswith("urn:air:"):
+        _, error = validate_air(resource_input)
         if error:
             raise ValueError(error)
     else:
-        error = validate_civitai_url(value)
+        error = validate_civitai_url(resource_input)
         if error:
             raise ValueError(error)
-    return ParsedInput("civitai", value, index)
+    return ParsedInput(
+        "civitai", value, index,
+        custom_category=custom_category, resource_input=resource_input,
+    )
 
 
 def _build_artifact(parsed: ParsedInput, info: dict[str, Any], total: int) -> ResolvedArtifact:
     """Converte a resposta específica do provider em um ResolvedArtifact comum (item 15)."""
     if parsed.provider == "huggingface":
         filename = str(info.get("filename") or Path(str(info.get("file_path") or "model.safetensors")).name)
-        category = info.get("category")
+        # /makedir tem prioridade (categoria explícita do usuário; pula a pergunta)
+        category = parsed.custom_category or info.get("category")
         return ResolvedArtifact(
             provider="huggingface",
             original_input=parsed.original_input,
@@ -1283,9 +1414,10 @@ def _build_artifact(parsed: ParsedInput, info: dict[str, Any], total: int) -> Re
     model = info.get("model") or {}
     file_info = info.get("file") or {}
     resource_type = str(air.get("type") or model.get("type") or "unknown")
+    # /makedir: categoria explícita do usuário — não classifica.
     # Mapeamento puro (sem prompt): checkpoint/desconhecido ficam para
     # classify_resolved_artifacts, depois que o destino do lote for conhecido.
-    category = guess_category(resource_type)
+    category = parsed.custom_category or guess_category(resource_type)
     filename = Path(file_info.get("name") or "model.safetensors").name
     base_model = air.get("base_model") or (info.get("version") or {}).get("baseModel")
     return ResolvedArtifact(
@@ -1328,11 +1460,20 @@ def resolve_queue_metadata(pending: list[str], token: str, input_fn=input, hf_to
             outcome.failures.append(ResolutionFailure(value, index, "unknown", str(technical), technical))
             print(f"[ERROR] Falha ao resolver [{index}/{total}] {value}: {technical}")
             continue
+        resolve_value = parsed.resource_input or value
         try:
             if parsed.provider == "huggingface":
-                infos = resolve_hf_input(value, hf_token=hf_token, input_fn=input_fn)
+                if parsed.custom_category:
+                    infos = resolve_hf_input(
+                        resolve_value,
+                        hf_token=hf_token,
+                        input_fn=input_fn,
+                        custom_category=parsed.custom_category,
+                    )
+                else:
+                    infos = resolve_hf_input(resolve_value, hf_token=hf_token, input_fn=input_fn)
             else:
-                infos = resolve_civitai_input(value, token, input_fn)
+                infos = resolve_civitai_input(resolve_value, token, input_fn)
         except Exception as exc:
             technical = redact_secrets(exc, [token, hf_token])
             if parsed.provider == "huggingface":
@@ -1460,6 +1601,15 @@ def _queue_entry_view(entry: Any) -> dict[str, Any]:
     }
 
 
+def _custom_path_flag(category: Optional[str]) -> dict[str, bool]:
+    """Kwargs de montagem de path para categorias ad-hoc (/makedir).
+
+    Vazio para categorias padrão: mantém as chamadas de download idênticas ao
+    comportamento já existente (sem regressão para Civitai/HF normais).
+    """
+    return {"custom": True} if is_custom_category(category) else {}
+
+
 def download_resolved_queue(
     resolved: list[Any],
     staging_dir: Path,
@@ -1473,7 +1623,8 @@ def download_resolved_queue(
     Aceita ResolvedArtifact (formato novo) ou dicts legados. Categorias já
     vêm resolvidas da Fase 1/classificação; ``classify_civitai_type`` aqui é
     apenas fallback para entradas legadas sem categoria. ``checkpoint_destination``
-    é a resposta única do lote para itens do tipo checkpoint.
+    é a resposta única do lote para itens do tipo checkpoint. Categorias fora de
+    CATEGORIES (pasta ad-hoc de /makedir) são montadas com ``custom=True``.
 
     Tenta todos os itens (retries por item permanecem inalterados). Qualquer
     falha permanente é registrada em ``DownloadOutcome.failures``; o chamador
@@ -1511,6 +1662,7 @@ def download_resolved_queue(
                     revision=info.get("revision", "main"),
                     source_url=info.get("source_url"),
                     base_model=view["base_model"],
+                    **_custom_path_flag(category),
                 )
             else:
                 # Civitai
@@ -1532,7 +1684,15 @@ def download_resolved_queue(
                     f"arquivo: {file_info.get('name', 'N/A')} | "
                     f"tipo: {resource_type} | base model: {base_model or 'N/A'}"
                 )
-                item = download_civitai_file(info, category, staging_dir, token, source_url=value, air=manifest_input)
+                item = download_civitai_file(
+                    info,
+                    category,
+                    staging_dir,
+                    token,
+                    source_url=value,
+                    air=manifest_input,
+                    **_custom_path_flag(category),
+                )
 
             if any(existing.path == item.path and existing.size == item.size and existing.sha256 == item.sha256 for existing in queue):
                 print(f"[SKIP] já presente na fila e idêntico: {item.path}")
@@ -1542,6 +1702,9 @@ def download_resolved_queue(
             if artifact is not None:
                 artifact.state = "DOWNLOADED"
             print(f"[{len(queue)}] Download concluído: {item.path}")
+            if is_custom_category(category):
+                folder_count = sum(1 for existing in queue if existing.path.startswith(f"{category}/"))
+                print(f"[INFO] Pasta customizada '{category}' ({folder_count} arquivo(s) nela até agora)")
         except Exception as exc:
             reason = str(exc)
             failures.append(DownloadFailure(value, index, total, reason=reason))

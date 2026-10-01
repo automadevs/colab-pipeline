@@ -57,7 +57,11 @@ from kaggle_dataset_manager import (
     _expected_sha256,
     download_with_civitai_cli,
     is_hf_input,
+    is_custom_category,
+    custom_category_warnings,
     parse_hf_input,
+    split_makedir_command,
+    validate_custom_category,
     validate_hf_input,
     resolve_hf_input,
     download_hf_file,
@@ -1598,6 +1602,260 @@ class DatasetManagerTests(unittest.TestCase):
         self.assertIn("Category: loras", out)
         self.assertIn("1/1 inputs resolved", out)
         self.assertIn("Ready for download.", out)
+
+
+class MakedirCustomCategoryTests(unittest.TestCase):
+    """"/makedir <PASTA> <entrada>": categoria ad-hoc para qualquer fonte.
+
+    Reconhecido ANTES do roteamento normal (não é uma fonte nova): define a pasta
+    explicitamente (sem pergunta de categoria) preservando a capitalização, e não
+    altera o comportamento de entradas sem o comando.
+    """
+
+    def test_split_makedir_command_preserves_case_and_remainder(self):
+        folder, remainder = split_makedir_command("/makedir SEEDVR2 hf://org/repo/arquivo.safetensors")
+        self.assertEqual(folder, "SEEDVR2")
+        self.assertEqual(remainder, "hf://org/repo/arquivo.safetensors")
+        # Entrada sem o comando: (None, valor original)
+        self.assertEqual(split_makedir_command("hf:org/repo/f.safetensors"), (None, "hf:org/repo/f.safetensors"))
+        # /makedir sem entrada -> folder definido, resto vazio (malformada)
+        self.assertEqual(split_makedir_command("/makedir SEEDVR2"), ("SEEDVR2", ""))
+        self.assertEqual(split_makedir_command("/makedir"), ("", ""))
+
+    def test_validate_custom_category_preserves_case_and_rejects_unsafe(self):
+        self.assertEqual(validate_custom_category("SEEDVR2"), "SEEDVR2")
+        self.assertEqual(validate_custom_category("  SeedVR2  "), "SeedVR2")
+        for bad in ("", "..", "../etc", "a/b", "a\\b", "/abs", "C:\\x", "..\tetc"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    validate_custom_category(bad)
+
+    def test_build_dataset_path_custom_accepts_adhoc_category(self):
+        self.assertEqual(build_dataset_path("SEEDVR2", "model.safetensors", custom=True), "SEEDVR2/model.safetensors")
+        with self.assertRaises(ValueError):
+            build_dataset_path("../etc", "model.safetensors", custom=True)
+        with self.assertRaises(ValueError):
+            build_dataset_path("a/b", "model.safetensors", custom=True)
+        # Sem custom=True a allowlist continua valendo (sem regressão).
+        with self.assertRaises(ValueError):
+            build_dataset_path("SEEDVR2", "model.safetensors")
+
+    def test_is_custom_category(self):
+        self.assertFalse(is_custom_category("loras"))
+        self.assertFalse(is_custom_category(None))
+        self.assertTrue(is_custom_category("SEEDVR2"))
+
+
+    def test_parse_input_makedir_sets_custom_category_and_strips_prefix(self):
+        hf = parse_input("/makedir SEEDVR2 hf://org/repo/arquivo.safetensors", 1)
+        self.assertEqual(hf.provider, "huggingface")
+        self.assertEqual(hf.custom_category, "SEEDVR2")
+        self.assertEqual(hf.resource_input, "hf://org/repo/arquivo.safetensors")
+        self.assertEqual(hf.repo_id, "org/repo")
+        self.assertEqual(hf.original_input, "/makedir SEEDVR2 hf://org/repo/arquivo.safetensors")
+
+        air = parse_input("/makedir SEEDVR2 urn:air:krea2:lora:civitai:2761113@3139172+3019297", 2)
+        self.assertEqual(air.provider, "civitai")
+        self.assertEqual(air.custom_category, "SEEDVR2")
+        self.assertEqual(air.resource_input, "urn:air:krea2:lora:civitai:2761113@3139172+3019297")
+
+        # Entrada normal: nenhuma categoria customizada (sem regressão)
+        plain = parse_input("hf:org/repo/f.safetensors", 3)
+        self.assertIsNone(plain.custom_category)
+        self.assertEqual(plain.resource_input, "hf:org/repo/f.safetensors")
+
+    def test_parse_input_makedir_malformed_raises(self):
+        for bad in (
+            "/makedir",
+            "/makedir SEEDVR2",
+            "/makedir ../etc hf:org/repo/f.safetensors",
+            "/makedir a/b hf:org/repo/f.safetensors",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_input(bad)
+
+    def test_collect_input_queue_accepts_makedir_and_retries_malformed(self):
+        entries = [
+            "/makedir SEEDVR2 hf://org/repo/a.safetensors",
+            "/makedir SEEDVR2",                                # malformada
+            "/makedir ../etc hf://org/repo/b.safetensors",     # path traversal
+            "/makedir SEEDVR2 hf://org/repo/b.safetensors",
+            "done",
+        ]
+        inputs = iter(entries)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            queue = collect_input_queue(input_fn=lambda prompt="": next(inputs))
+        self.assertEqual(
+            queue,
+            [
+                "/makedir SEEDVR2 hf://org/repo/a.safetensors",
+                "/makedir SEEDVR2 hf://org/repo/b.safetensors",
+            ],
+        )
+        # As malformadas/traversal foram avisadas, sem derrubar a Fase 1.
+        self.assertIn("[WARN] Entrada inválida", stdout.getvalue())
+
+
+    def test_makedir_hf_skips_category_prompt_and_sets_folder(self):
+        prompts = []
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            if "Base model" in prompt:
+                return "sdxl"
+            return ""
+
+        pending = ["/makedir SEEDVR2 hf:org/repo/model.safetensors"]
+        with patch.object(kaggle_dataset_manager, "_hf_file_size", return_value=1000), \
+             patch.object(kaggle_dataset_manager, "classify_resource_type") as classify_mock:
+            outcome = resolve_queue_metadata(pending, "token", input_fn=fake_input, hf_token="tok")
+
+        classify_mock.assert_not_called()
+        self.assertFalse(any("Categoria" in p for p in prompts))
+        self.assertTrue(any("Base model" in p for p in prompts))
+        self.assertEqual(outcome.failures, [])
+        self.assertEqual(len(outcome.artifacts), 1)
+        artifact = outcome.artifacts[0]
+        self.assertEqual(artifact.category, "SEEDVR2")
+        self.assertEqual(artifact.destination, "SEEDVR2/model.safetensors")
+
+    def test_makedir_civitai_sets_custom_category_without_classify(self):
+        captured = {}
+        info = [{
+            "model": {"type": "Checkpoint", "name": "m"},
+            "version": {"id": 2, "baseModel": "krea2"},
+            "file": {"id": 5, "name": "f.safetensors"},
+            "model_id": "1",
+            "air": {"air": "urn:air:krea2:checkpoint:civitai:1@2", "type": "checkpoint", "base_model": "krea2"},
+        }]
+
+        def fake_resolve(value, token, input_fn):
+            captured["value"] = value
+            return info
+
+        pending = ["/makedir SEEDVR2 urn:air:krea2:checkpoint:civitai:1@2"]
+        with patch.object(kaggle_dataset_manager, "resolve_civitai_input", side_effect=fake_resolve), \
+             patch.object(kaggle_dataset_manager, "classify_civitai_type") as classify_mock, \
+             patch.object(kaggle_dataset_manager, "classify_resource_type") as classify_res_mock:
+            outcome = resolve_queue_metadata(pending, "token", input_fn=lambda p="": "")
+
+        classify_mock.assert_not_called()
+        classify_res_mock.assert_not_called()
+        # O AIR chegou sem o prefixo /makedir no roteamento de resolução.
+        self.assertEqual(captured["value"], "urn:air:krea2:checkpoint:civitai:1@2")
+        self.assertEqual(len(outcome.artifacts), 1)
+        artifact = outcome.artifacts[0]
+        self.assertEqual(artifact.category, "SEEDVR2")
+        self.assertEqual(artifact.destination, "SEEDVR2/f.safetensors")
+
+
+    def test_download_two_makedir_items_land_in_same_folder_without_prompts(self):
+        def art(file_path, index):
+            return ResolvedArtifact(
+                provider="huggingface",
+                original_input=f"/makedir SEEDVR2 hf:org/repo/{file_path}",
+                index=index,
+                total=2,
+                filename=file_path,
+                size_bytes=1,
+                category="SEEDVR2",
+                base_model="sdxl",
+                destination=f"SEEDVR2/{file_path}",
+                repo_id="org/repo",
+                file_path=file_path,
+                revision="main",
+                state="READY_TO_DOWNLOAD",
+                info={
+                    "repo_id": "org/repo",
+                    "file_path": file_path,
+                    "revision": "main",
+                    "category": "SEEDVR2",
+                    "base_model": "sdxl",
+                },
+            )
+
+        def boom(prompt=""):
+            raise AssertionError(f"prompt inesperado na Fase 2: {prompt}")
+
+        def fake_download(repo_id, file_path, category, staging_dir, hf_token=None, revision="main",
+                          source_url=None, base_model=None, custom=False):
+            return DatasetFile(f"{category}/{file_path}", 1, "h", None, None, None, None, None,
+                               base_model, repo_id, revision, file_path)
+
+        with patch.object(kaggle_dataset_manager, "download_hf_file", side_effect=fake_download) as hf_download:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                outcome = download_resolved_queue(
+                    [art("model.safetensors", 1), art("vae.safetensors", 2)],
+                    Path("staging"), "token", input_fn=boom, hf_token="tok",
+                )
+
+        self.assertTrue(outcome.ok)
+        self.assertEqual(
+            [item.path for item in outcome.items],
+            ["SEEDVR2/model.safetensors", "SEEDVR2/vae.safetensors"],
+        )
+        self.assertTrue(all(call.kwargs["custom"] is True for call in hf_download.call_args_list))
+        self.assertIn("[INFO] Pasta customizada 'SEEDVR2' (1 arquivo(s) nela até agora)", stdout.getvalue())
+        self.assertIn("[INFO] Pasta customizada 'SEEDVR2' (2 arquivo(s) nela até agora)", stdout.getvalue())
+
+    def test_download_standard_category_passes_no_custom_flag(self):
+        """Categoria padrão (sem /makedir) não sinaliza path customizado (sem regressão)."""
+        entry = {
+            "value": "urn:air:krea2:lora:civitai:1@2",
+            "index": 1,
+            "total": 1,
+            "info": {"model": {"type": "lora", "name": "m"}, "version": {"id": 2, "baseModel": "krea2"},
+                     "file": {"id": 5, "name": "f.safetensors"}, "air": {"type": "lora"}},
+            "resource_type": "lora",
+            "source": "civitai",
+        }
+
+        def fake_download(info, category, staging_dir, token, source_url=None, air=None):
+            return DatasetFile(f"{category}/f.safetensors", 1, "h")
+
+        with patch.object(kaggle_dataset_manager, "download_civitai_file", side_effect=fake_download) as civ_download:
+            outcome = download_resolved_queue([entry], Path("staging"), "token")
+
+        self.assertTrue(outcome.ok)
+        self.assertNotIn("custom", civ_download.call_args.kwargs)
+
+
+    def test_custom_category_warnings_flags_dot_and_capitalization_collision(self):
+        # Nome normal: nenhum aviso
+        self.assertEqual(custom_category_warnings("SEEDVR2"), [])
+        # Categoria padrão exata: usa a categoria padrão, sem aviso
+        self.assertEqual(custom_category_warnings("loras"), [])
+        # Colisão só de capitalização (pasta SEPARADA)
+        self.assertEqual(len(custom_category_warnings("Loras")), 1)
+        self.assertEqual(len(custom_category_warnings("LORAS")), 1)
+        self.assertIn("SEPARADA", custom_category_warnings("Loras")[0])
+        # '.' -> raiz do staging
+        dot = custom_category_warnings(".")
+        self.assertEqual(len(dot), 1)
+        self.assertIn("raiz do staging", dot[0])
+
+    def test_collect_input_queue_warns_on_collision_and_dot_but_accepts(self):
+        entries = [
+            "/makedir SEEDVR2 hf://org/repo/a.safetensors",   # sem aviso
+            "/makedir Loras hf://org/repo/b.safetensors",    # aviso de capitalização
+            "/makedir . hf://org/repo/c.safetensors",        # aviso de '.'
+            "done",
+        ]
+        inputs = iter(entries)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            queue = collect_input_queue(input_fn=lambda prompt="": next(inputs))
+
+        # /makedir continua aceitando os três (nenhum foi rejeitado)
+        self.assertEqual(queue, entries[:-1])
+        out = stdout.getvalue()
+        self.assertIn("SEPARADA", out)
+        self.assertIn("raiz do staging", out)
+        # Somente nos dois itens problemáticos (SEEDVR2 não gera aviso)
+        self.assertEqual(out.count("[WARN] Pasta customizada"), 2)
 
 
 if __name__ == "__main__":

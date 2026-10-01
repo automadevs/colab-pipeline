@@ -633,6 +633,20 @@ class TestJ_FinalFilesystemCheck(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestK_CustomNodeAllowlist(unittest.TestCase):
+    # Nodes pedidos explicitamente (notebooks 06/08); guarda anti-drift abaixo.
+    EXPECTED_KAGGLE_NODES = [
+        "cubiq/ComfyUI_essentials",
+        "lbouaraba/comfyui-krea2edit",
+        "rgthree/rgthree-comfy",
+        "1038lab/ComfyUI-QwenVL",
+        "1038lab/ComfyUI-RMBG",
+        "chrisgoringe/cg-use-everywhere",
+        "Fannovel16/comfyui_controlnet_aux",
+        "yolain/Comfyui-Easy-Use",
+        "kijai/ComfyUI-KJNodes",
+        "ostris/ComfyUI-Krea2-Ostris-Edit",
+    ]
+
     def test_unknown_node_raises_security_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             custom_dir = Path(tmp) / "custom_nodes"
@@ -777,6 +791,41 @@ class TestK_CustomNodeAllowlist(unittest.TestCase):
                 node_name, comfyui_setup.ALLOWED_CUSTOM_NODES,
                 f"spec '{spec}' deriva pasta '{node_name}' fora da allowlist",
             )
+
+    def test_requested_kaggle_nodes_map_to_allowlist(self):
+        """Cada node pedido deriva uma pasta autorizada (branch main)."""
+        for spec in self.EXPECTED_KAGGLE_NODES:
+            with self.subTest(spec=spec):
+                _repo, branch, node_name = comfyui_setup.parse_custom_node_spec(spec)
+                self.assertEqual(branch, "main")
+                self.assertIn(node_name, comfyui_setup.ALLOWED_CUSTOM_NODES)
+
+    def test_notebooks_custom_nodes_are_allowlisted(self):
+        """Guarda anti-drift: CUSTOM_NODES dos notebooks 06/08 ⊆ ALLOWED_CUSTOM_NODES."""
+        import ast
+        root = Path(__file__).parents[1]
+        notebooks = (
+            "kaggle_runtime/06_comfyui_setup.ipynb",
+            "kaggle_runtime/08_master_pipeline.ipynb",
+        )
+        for nb in notebooks:
+            doc = json.loads((root / nb).read_text(encoding="utf-8"))
+            specs = None
+            for cell in doc["cells"]:
+                src = "".join(cell.get("source", []))
+                if "CUSTOM_NODES = [" not in src:
+                    continue
+                for node in ast.walk(ast.parse(src)):
+                    if isinstance(node, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == "CUSTOM_NODES" for t in node.targets
+                    ):
+                        specs = ast.literal_eval(node.value)
+                break
+            self.assertIsNotNone(specs, f"{nb}: CUSTOM_NODES não encontrado")
+            self.assertGreaterEqual(len(specs), len(self.EXPECTED_KAGGLE_NODES), nb)
+            for spec in specs:
+                node_name = comfyui_setup.parse_custom_node_spec(spec)[2]
+                self.assertIn(node_name, comfyui_setup.ALLOWED_CUSTOM_NODES, f"{nb}: {spec}")
 
     def test_allowlist_passes_with_qwenvl_folders(self):
         """Pastas simuladas dos nodes de captioning passam em strict=True."""

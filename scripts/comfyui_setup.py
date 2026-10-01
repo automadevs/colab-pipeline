@@ -733,6 +733,12 @@ ALLOWED_CUSTOM_NODES: frozenset[str] = frozenset([
     "ComfyUI-Krea2T-Enhancer",
     "rgthree-comfy",
     "ComfyUI-QwenVL",               # 1038lab/ComfyUI-QwenVL (captioning fallback A)
+    "ComfyUI-RMBG",                 # 1038lab/ComfyUI-RMBG (remoção de fundo/segmentação)
+    "cg-use-everywhere",            # chrisgoringe/cg-use-everywhere
+    "comfyui_controlnet_aux",       # Fannovel16/comfyui_controlnet_aux (preprocessadores ControlNet)
+    "Comfyui-Easy-Use",             # yolain/Comfyui-Easy-Use
+    "ComfyUI-KJNodes",              # kijai/ComfyUI-KJNodes
+    "ComfyUI-Krea2-Ostris-Edit",    # ostris/ComfyUI-Krea2-Ostris-Edit
     # "ComfyUI_QwenVL_PromptCaption" DESABILITADO (fallback B, WingeD123):
     # a pasta do node ficaria em ComfyUI/models/text_encoders/<FOLDER>/ e o README
     # exige renomear o peso para 'model.safetensors' + config HF dentro de uma pasta
