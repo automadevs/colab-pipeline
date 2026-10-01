@@ -806,6 +806,17 @@ PERSISTENT_AUDIT_PATHS: Tuple[Path, ...] = (
 # destes segmentos. Qualquer imagem tracked-e-limpa fora deles continua bloqueada.
 NODE_DOC_IMAGE_DIR_NAMES: frozenset[str] = frozenset({
     "docs", "web", "src_web", "assets", "images",
+    "examples", "example_workflows", "tests",
+})
+# Extensões de dados auxiliares empacotadas dentro dos repositórios dos custom
+# nodes (matrizes de adjacência/downsampling, pesos mínimos de LPIPS embutidos,
+# vocabulários compactados e arquivos .txt.gz). São assets do próprio clone —
+# NUNCA checkpoints/modelos baixados em runtime — e só são tolerados quando o
+# arquivo está tracked E limpo no git DAQUELE node (ver
+# _is_tracked_node_data_asset). .safetensors/.ckpt/.gguf/.bin/.onnx/.tflite
+# continuam SEMPRE bloqueados, mesmo tracked.
+ALLOWED_NODE_DATA_EXTENSIONS: frozenset[str] = frozenset({
+    ".pt", ".pth", ".npz", ".gz",
 })
 ALLOWED_STATIC_FILES: frozenset[str] = frozenset({
     "ComfyUI/input/example.png",
@@ -1135,7 +1146,8 @@ def _is_packaged_node_doc_image(rel_path: str, scan_root: Path) -> bool:
     1. O path está em ComfyUI/custom_nodes/<node>/... (nunca raiz do ComfyUI,
        nunca input/output/temp/user, nunca o próprio colab-pipeline).
     2. Abaixo do dir do node há um segmento de documentação/asset conhecido
-       (docs/, web/, src_web/, assets/, images/) — ver NODE_DOC_IMAGE_DIR_NAMES.
+       (docs/, web/, src_web/, assets/, images/, examples/, example_workflows/,
+       tests/) — ver NODE_DOC_IMAGE_DIR_NAMES.
     3. O arquivo está tracked E limpo no repo git DAQUELE custom node
        (git ls-files + git status do node, não do ComfyUI pai).
 
@@ -1172,8 +1184,63 @@ def _is_packaged_node_doc_image(rel_path: str, scan_root: Path) -> bool:
     return not _matches_git_changed_path(rel_inside_node, changed)
 
 
+def _is_tracked_node_data_asset(rel_path: str, scan_root: Path) -> bool:
+    """Exceção NARROW para assets de dados empacotados em custom nodes.
+
+    Alguns custom nodes permitem carregar, direto do próprio repositório,
+    arquivos auxiliares de dados (.pt/.pth de adjacência/downsampling, .npz,
+    .txt.gz de vocabulário). Eles NÃO são checkpoints/modelos baixados em
+    runtime; fazem parte do clone aprovado. Retorna True SOMENTE quando TODAS
+    as condições valem:
+
+    1. O path está em ComfyUI/custom_nodes/<node>/... (nunca raiz do ComfyUI,
+       nunca input/output/temp/user, nunca o próprio colab-pipeline).
+    2. <node> está em ALLOWED_CUSTOM_NODES (só nodes explicitamente
+       autorizados ganham o carve-out).
+    3. A extensão está em ALLOWED_NODE_DATA_EXTENSIONS (.pt/.pth/.npz/.gz).
+       .safetensors/.ckpt/.gguf/.bin/.onnx/.tflite continuam SEMPRE bloqueados,
+       mesmo tracked (.zip/.7z/.rar/.tar também não entram aqui).
+    4. O arquivo está tracked E limpo no repo git DAQUELE custom node
+       (git ls-files + git status do node, não do ComfyUI pai). Arquivo
+       baixado/gerado em runtime aparece como untracked ou modified e continua
+       bloqueado (fail-closed).
+
+    Fail-closed: repo ausente/ilegível, git indisponível, node fora da
+    allowlist, extensão fora da lista, arquivo untracked ou modificado → False.
+    """
+    normalized = rel_path.replace("\\", "/")
+    parts = Path(normalized).parts
+    # Condicao 1: dentro de ComfyUI/custom_nodes/<node>/ (minimo 4 segmentos)
+    if (
+        len(parts) < 4
+        or parts[0] != "ComfyUI"
+        or parts[1] != "custom_nodes"
+        or parts[2] in ("", ".", "..")
+    ):
+        return False
+    # Condicao 2: apenas nodes explicitamente autorizados
+    if parts[2] not in ALLOWED_CUSTOM_NODES:
+        return False
+    # Condicao 3: extensao de dados auxiliares (nunca checkpoint/modelo real)
+    if Path(normalized).suffix.lower() not in ALLOWED_NODE_DATA_EXTENSIONS:
+        return False
+    # Condicao 4: tracked-e-limpo no repo git do node
+    node_dir = scan_root / "ComfyUI" / "custom_nodes" / parts[2]
+    sets = _get_nested_node_git_sets(scan_root, node_dir)
+    if sets is None:
+        return False
+    tracked, changed = sets
+    rel_inside_node = "/".join(parts[3:])
+    if rel_inside_node not in tracked:
+        return False
+    return not _matches_git_changed_path(rel_inside_node, changed)
+
+
 # Extensões de modelo que são SEMPRE bloqueadas, mesmo se tracked pelo git
-# (camada extra de defesa contra vazamento de modelos).
+# (camada extra de defesa contra vazamento de modelos). A única exceção é o
+# carve-out NARROW de assets de dados empacotados
+# (_is_tracked_node_data_asset): .pt/.pth/.npz/.gz tracked-e-limpos dentro de
+# nodes explicitamente autorizados.
 # NOTA: Extensões de imagem (.png, .jpg, etc.) e archive (.zip) NÃO estão aqui
 # porque o ComfyUI tem imagens de exemplo legítimas (example.png, comfy_types/examples/)
 # que são tracked pelo git. Essas extensões são tratadas na Camada 2 apenas quando
@@ -1279,9 +1346,13 @@ def _scan_working_violations(
 
             # Camada 1: checagem git-based + allowlist estático
             if _is_file_allowed(rel_normalized, scan_root):
-                # Mesmo se permitido, verificar extensões sempre bloqueadas
+                # Mesmo se permitido, verificar extensões sempre bloqueadas.
+                # Exceção NARROW: assets de dados empacotados tracked-e-limpos
+                # dentro de nodes autorizados (ver _is_tracked_node_data_asset).
                 ext = item.suffix.lower()
-                if ext in ALWAYS_BLOCKED_EXTENSIONS:
+                if ext in ALWAYS_BLOCKED_EXTENSIONS and not _is_tracked_node_data_asset(
+                    rel_normalized, scan_root
+                ):
                     violations.append({
                         "path": str(item), "type": "always_blocked_extension",
                         "ext": ext, "size": item.stat().st_size,
@@ -1315,6 +1386,11 @@ def _scan_working_violations(
             ):
                 continue
 
+            # Exceção NARROW: assets de dados empacotados tracked-e-limpos dentro
+            # de nodes autorizados (ver _is_tracked_node_data_asset).
+            if _is_tracked_node_data_asset(rel_normalized, scan_root):
+                continue
+
             # Camada 2: extensões sensíveis (imagem/archive/modelo)
             if ext in SENSITIVE_EXTENSIONS or ext in SENSITIVE_ARCHIVES or ext in ALWAYS_BLOCKED_EXTENSIONS:
                 violation_type = "always_blocked_extension" if ext in ALWAYS_BLOCKED_EXTENSIONS else "extension"
@@ -1333,12 +1409,25 @@ def _scan_working_violations(
                 })
                 continue
 
+            # Exceção NARROW: assets de dados empacotados tracked-e-limpos dentro
+            # de nodes autorizados (ver _is_tracked_node_data_asset). Precisa vir
+            # antes da Camada 4 porque .pt/.pth/.npz/.gz são extensões
+            # não-imagem sensíveis.
+            if _is_tracked_node_data_asset(rel_normalized, scan_root):
+                continue
+
             # Camada 4: extensões não-imagem sensíveis (.json, .log, .db, etc.)
             if check_non_image_sensitive and ext in SENSITIVE_NON_IMAGE_EXTENSIONS:
                 violations.append({
                     "path": str(item), "type": "non_image_sensitive",
                     "ext": ext, "size": stat.st_size, "mtime": stat.st_mtime,
                 })
+                continue
+
+            # Exceção NARROW: assets de dados empacotados tracked-e-limpos dentro
+            # de nodes autorizados (ver _is_tracked_node_data_asset). Precisa vir
+            # antes da Camada 5 porque arquivos .npz (ZIP) têm magic bytes de PK.
+            if _is_tracked_node_data_asset(rel_normalized, scan_root):
                 continue
 
             # Camada 5: verificação por magic bytes
