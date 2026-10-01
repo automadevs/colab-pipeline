@@ -1625,17 +1625,29 @@ class MakedirCustomCategoryTests(unittest.TestCase):
     def test_validate_custom_category_preserves_case_and_rejects_unsafe(self):
         self.assertEqual(validate_custom_category("SEEDVR2"), "SEEDVR2")
         self.assertEqual(validate_custom_category("  SeedVR2  "), "SeedVR2")
-        for bad in ("", "..", "../etc", "a/b", "a\\b", "/abs", "C:\\x", "..\tetc"):
+        # Aninhamento aceito: no máximo um "/" separando DOIS segmentos.
+        self.assertEqual(
+            validate_custom_category("video_models/SEEDVR2"), "video_models/SEEDVR2")
+        for bad in (
+            "", ".", "..", "../etc", "a/..", "a/b/c", "loras/../../etc",
+            "a\\b", "/abs", "SEEDVR2/", "a//b", "C:\\x", "..\tetc",
+        ):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     validate_custom_category(bad)
 
     def test_build_dataset_path_custom_accepts_adhoc_category(self):
         self.assertEqual(build_dataset_path("SEEDVR2", "model.safetensors", custom=True), "SEEDVR2/model.safetensors")
+        # Aninhado em categoria padrão: aceito, e cai na subpasta.
+        self.assertEqual(
+            build_dataset_path("video_models/SEEDVR2", "model.safetensors", custom=True),
+            "video_models/SEEDVR2/model.safetensors",
+        )
         with self.assertRaises(ValueError):
             build_dataset_path("../etc", "model.safetensors", custom=True)
+        # ".." que só aparece DEPOIS do split continua barrado.
         with self.assertRaises(ValueError):
-            build_dataset_path("a/b", "model.safetensors", custom=True)
+            build_dataset_path("loras/..", "model.safetensors", custom=True)
         # Sem custom=True a allowlist continua valendo (sem regressão).
         with self.assertRaises(ValueError):
             build_dataset_path("SEEDVR2", "model.safetensors")
@@ -1669,11 +1681,22 @@ class MakedirCustomCategoryTests(unittest.TestCase):
             "/makedir",
             "/makedir SEEDVR2",
             "/makedir ../etc hf:org/repo/f.safetensors",
-            "/makedir a/b hf:org/repo/f.safetensors",
+            # ">2 segmentos": aninhamento deeper que "<categoria>/<subpasta>"
+            "/makedir a/b/c hf:org/repo/f.safetensors",
+            # ".." que só emerge depois do split
+            "/makedir loras/../etc hf:org/repo/f.safetensors",
         ):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     parse_input(bad)
+
+    def test_parse_input_makedir_accepts_nested_category(self):
+        """/makedir <categoria>/<subpasta> é aceito e preservado como categoria."""
+        parsed = parse_input("/makedir video_models/SEEDVR2 hf://org/repo/f.safetensors", 1)
+        self.assertEqual(parsed.custom_category, "video_models/SEEDVR2")
+        self.assertEqual(parsed.resource_input, "hf://org/repo/f.safetensors")
+        self.assertEqual(
+            parsed.original_input, "/makedir video_models/SEEDVR2 hf://org/repo/f.safetensors")
 
     def test_collect_input_queue_accepts_makedir_and_retries_malformed(self):
         entries = [
@@ -1823,7 +1846,7 @@ class MakedirCustomCategoryTests(unittest.TestCase):
         self.assertNotIn("custom", civ_download.call_args.kwargs)
 
 
-    def test_custom_category_warnings_flags_dot_and_capitalization_collision(self):
+    def test_custom_category_warnings_flags_capitalization_and_nested_root(self):
         # Nome normal: nenhum aviso
         self.assertEqual(custom_category_warnings("SEEDVR2"), [])
         # Categoria padrão exata: usa a categoria padrão, sem aviso
@@ -1832,16 +1855,19 @@ class MakedirCustomCategoryTests(unittest.TestCase):
         self.assertEqual(len(custom_category_warnings("Loras")), 1)
         self.assertEqual(len(custom_category_warnings("LORAS")), 1)
         self.assertIn("SEPARADA", custom_category_warnings("Loras")[0])
-        # '.' -> raiz do staging
-        dot = custom_category_warnings(".")
-        self.assertEqual(len(dot), 1)
-        self.assertIn("raiz do staging", dot[0])
+        # Aninhado em categoria PADRÃO: a subpasta é alcançada, sem aviso
+        self.assertEqual(custom_category_warnings("video_models/SEEDVR2"), [])
+        # Aninhado em pasta que NÃO é categoria padrão: aviso de pasta invisível na UI
+        nested = custom_category_warnings("SEEDVR2/sub")
+        self.assertEqual(len(nested), 1)
+        self.assertIn("custom_models.json", nested[0])
 
-    def test_collect_input_queue_warns_on_collision_and_dot_but_accepts(self):
+    def test_collect_input_queue_warns_on_collision_and_rejects_dot(self):
         entries = [
             "/makedir SEEDVR2 hf://org/repo/a.safetensors",   # sem aviso
             "/makedir Loras hf://org/repo/b.safetensors",    # aviso de capitalização
-            "/makedir . hf://org/repo/c.safetensors",        # aviso de '.'
+            "/makedir . hf://org/repo/c.safetensors",        # REJEITADO: não chega a aviso
+            "/makedir Foo/Bar hf://org/repo/d.safetensors",  # aviso de raiz não-padrão
             "done",
         ]
         inputs = iter(entries)
@@ -1849,12 +1875,13 @@ class MakedirCustomCategoryTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout):
             queue = collect_input_queue(input_fn=lambda prompt="": next(inputs))
 
-        # /makedir continua aceitando os três (nenhum foi rejeitado)
-        self.assertEqual(queue, entries[:-1])
+        # '.' é recusado na validação e nunca vira item; os outros três entram.
+        self.assertEqual(queue, [entries[0], entries[1], entries[3]])
         out = stdout.getvalue()
         self.assertIn("SEPARADA", out)
-        self.assertIn("raiz do staging", out)
-        # Somente nos dois itens problemáticos (SEEDVR2 não gera aviso)
+        self.assertIn("Entrada inválida", out)
+        self.assertIn("custom_models.json", out)
+        # Somente nos dois itens com aviso (SEEDVR2 não gera aviso)
         self.assertEqual(out.count("[WARN] Pasta customizada"), 2)
 
 

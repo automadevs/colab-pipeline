@@ -177,49 +177,80 @@ def format_size(size: int) -> str:
 def validate_custom_category(name: str) -> str:
     """Valida o nome de pasta customizada de "/makedir" (categoria ad-hoc).
 
-    Preserva a capitalização exatamente como digitada (ex.: "SEEDVR2"). Rejeita
-    só o que é inseguro para o filesystem — separadores de path, "..", caminho
-    absoluto e caracteres de controle — replicando a checagem mínima de
-    ``validate_runtime_path`` (comfyui_setup.py). Diferente daquele helper (que
-    também exige uma raiz permitida e aborta o processo), aqui o objetivo é só
-    avisar e pedir a entrada de novo durante a coleta, sem derrubar a sessão.
-    Não exige que o nome pertença a nenhuma lista pré-definida.
+    Preserva a capitalização exatamente como digitada (ex.: "SEEDVR2"). Aceita NO
+    MÁXIMO um "/" separando DOIS segmentos — "<categoria>/<subpasta>", para aninhar
+    dentro de uma categoria padrão (ex.: "video_models/SEEDVR2").
+
+    Rejeita o que é inseguro para o filesystem — "..", ".", caminho absoluto,
+    separadores extras, segmentos vazios e caracteres de controle — replicando a
+    checagem mínima de ``validate_runtime_path`` (comfyui_setup.py). Diferente
+    daquele helper (que também exige uma raiz permitida e aborta o processo), aqui
+    o objetivo é só avisar e pedir a entrada de novo durante a coleta, sem derrubar
+    a sessão. Não exige que o nome pertença a nenhuma lista pré-definida.
+
+    A checagem roda POR SEGMENTO, DEPOIS do split por "/". Validar o nome inteiro
+    antes de dividir seria insuficiente: "loras/../../etc" não contém ".." como
+    nome completo rejeitável por igualdade, e os ".." só aparecem depois do split.
     """
     raw = str(name or "").strip()
     if not raw:
         raise ValueError("Nome de pasta customizada vazio em /makedir")
-    if "/" in raw or "\\" in raw:
-        raise ValueError(f"Nome de pasta customizada não pode conter separadores de path: {raw!r}")
-    if ".." in raw:
-        raise ValueError(f"Nome de pasta customizada não pode conter '..': {raw!r}")
-    if Path(raw).is_absolute() or re.match(r"^[A-Za-z]:", raw):
-        raise ValueError(f"Nome de pasta customizada não pode ser um caminho absoluto: {raw!r}")
-    if any(ord(char) < 32 or ord(char) == 127 for char in raw):
-        raise ValueError(f"Nome de pasta customizada contém caracteres de controle: {raw!r}")
+    if "\\" in raw:
+        raise ValueError(f"Nome de pasta customizada não pode conter '\\': {raw!r}")
+    segments = raw.split("/")
+    if len(segments) > 2:
+        raise ValueError(
+            "Nome de pasta customizada aceita no máximo um '/' "
+            f"('<categoria>/<subpasta>'): {raw!r}"
+        )
+    for segment in segments:
+        if not segment or segment != segment.strip():
+            raise ValueError(
+                f"Nome de pasta customizada tem segmento vazio ou com espaço nas "
+                f"bordas: {raw!r}"
+            )
+        if segment in {".", ".."}:
+            raise ValueError(
+                f"Nome de pasta customizada não pode conter o segmento {segment!r}: {raw!r}"
+            )
+        if Path(segment).is_absolute() or re.match(r"^[A-Za-z]:", segment):
+            raise ValueError(
+                f"Nome de pasta customizada não pode ser um caminho absoluto: {raw!r}"
+            )
+        if any(ord(char) < 32 or ord(char) == 127 for char in segment):
+            raise ValueError(
+                f"Nome de pasta customizada contém caracteres de controle: {raw!r}"
+            )
     return raw
 
 
 def custom_category_warnings(name: str) -> list[str]:
     """Avisos (não bloqueantes) para uma pasta customizada de /makedir.
 
-    H4: /makedir continua aceitando o nome; estes avisos só tornam visíveis duas
-    armadilhas silenciosas:
-      - "." resolve para a raiz do staging (o arquivo não cai em subpasta);
+    H4: /makedir continua aceitando o nome; estes avisos só tornam visíveis as
+    armadilhas silenciosas restantes. O nome JÁ foi validado por
+    ``validate_custom_category`` antes de chegar aqui, então "." e ".." não
+    aparecem mais neste ponto:
       - colisão só de capitalização com categoria padrão (ex.: "Loras" cria uma
-        pasta SEPARADA de "loras/"; no Linux são diretórios distintos).
+        pasta SEPARADA de "loras/"; no Linux são diretórios distintos);
+      - aninhamento cuja categoria raiz não é padrão: o ComfyUI só expõe pastas
+        alcançáveis por MODEL_CATEGORIES ou declaradas em custom_models.json.
     """
     name = str(name or "")
     warnings: list[str] = []
-    if name == ".":
-        warnings.append(
-            "Pasta customizada '.' aponta para a raiz do staging: o arquivo NÃO irá "
-            "para uma subpasta própria do modelo."
-        )
     folded = name.lower()
     if folded in CATEGORIES and name != folded:
         warnings.append(
             f"Pasta customizada '{name}' difere só na capitalização da categoria padrão "
             f"'{folded}': será uma pasta SEPARADA (não funde com '{folded}/')."
+        )
+    root_segment = name.split("/")[0]
+    if "/" in name and root_segment not in CATEGORIES:
+        warnings.append(
+            f"Pasta customizada '{name}' aninha em '{root_segment}', que NÃO é uma "
+            f"categoria padrão do ComfyUI: a subpasta não aparecerá na UI a menos que "
+            f"'{root_segment}' esteja em CATEGORIES ou que o tipo correspondente esteja "
+            f"declarado no custom_models.json do Dataset."
         )
     return warnings
 
