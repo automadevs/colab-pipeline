@@ -65,6 +65,11 @@ CATEGORIES = (
 MAKEDIR_COMMAND = "/makedir"
 MANIFEST_NAME = "dataset-manifest.json"
 METADATA_NAME = "dataset-metadata.json"
+# Declaração de tipos de modelo customizados, publicada na RAIZ do Dataset. Mesmo
+# nome/contrato de comfyui_setup.CUSTOM_MODELS_FILENAME (duplicado aqui de propósito:
+# kaggle_dataset_manager não importa comfyui_setup no topo, e o módulo é usado
+# isolado nos testes). Espelha a linha do extra_model_paths.yaml: {tipo: pasta}.
+CUSTOM_MODELS_FILENAME = "custom_models.json"
 CIVITAI_CLI_PACKAGE = "@civitai/cli@0.1.104"
 # Extenções aceitas para arquivos de pesos baixados do Hugging Face.
 HF_ALLOWED_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx", ".npz"}
@@ -1225,11 +1230,21 @@ def download_civitai_file(
     )
 
 
-def collect_input_queue(input_fn=input) -> list[str]:
+def collect_input_queue(
+    input_fn=input,
+    declared_folders: Optional[set[str]] = None,
+    custom_types_out: Optional[dict[str, str]] = None,
+) -> list[str]:
     """Coleta pura da fila AIR/URL/HF: valida cada entrada via parser até 'done'.
 
     A validação é delegada a parse_input (mesma regra usada na resolução);
     'done' fecha a lista e nunca vira artefato. Sem downloads nem outros prompts.
+
+    Para cada ``/makedir`` cuja pasta raiz ainda NÃO esteja declarada no
+    custom_models.json do Dataset, pergunta o tipo do ComfyUI e anota em
+    ``custom_types_out`` (mapa ``{tipo: pasta}``), que a publicação funde no
+    arquivo. Pastas já declaradas não são perguntadas e nenhum parâmetro é
+    obrigatório — quem chama sem eles (notebook 08) não vê prompt algum.
     """
     pending: list[str] = []
     while True:
@@ -1249,6 +1264,9 @@ def collect_input_queue(input_fn=input) -> list[str]:
             # padrão) — emitidos uma única vez, aqui na coleta.
             for warning in custom_category_warnings(parsed.custom_category):
                 print(f"[WARN] {warning}")
+            _ask_custom_model_type(
+                parsed.custom_category, declared_folders, custom_types_out, input_fn
+            )
         pending.append(value)
     print(f"[INFO] Lista fechada com {len(pending)} item(ns).")
     return pending
@@ -1824,6 +1842,164 @@ def materialize_dataset_file(dataset: str, dataset_file: str, staging_dir: Path,
     return DatasetFile(dataset_file, destination.stat().st_size, sha256_file(destination))
 
 
+def fetch_custom_models(dataset: str, cache_dir: Path) -> dict[str, str]:
+    """Baixa o custom_models.json do Dataset e devolve ``{tipo: pasta}``.
+
+    FAIL-SOFT: dataset sem o arquivo, kaggle indisponível, timeout ou JSON
+    inválido => ``{}`` (nenhuma pasta declarada). Serve para a coleta perguntar o
+    tipo do ComfyUI apenas das pastas que AINDA não foram declaradas.
+    """
+    cache_dir = Path(cache_dir)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["kaggle", "datasets", "download", dataset,
+             "-f", CUSTOM_MODELS_FILENAME, "-p", str(cache_dir), "--unzip"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            print(
+                f"[INFO] {CUSTOM_MODELS_FILENAME} ainda não existe no Dataset; "
+                f"nenhuma pasta ad-hoc declarada."
+            )
+            return {}
+        matches = list(cache_dir.rglob(CUSTOM_MODELS_FILENAME))
+        if not matches:
+            return {}
+        data = json.loads(matches[0].read_text(encoding="utf-8"))
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(
+            f"[WARN] Não foi possível ler {CUSTOM_MODELS_FILENAME} do Dataset ({exc}); "
+            f"tratando como nenhuma pasta declarada."
+        )
+        return {}
+    if not isinstance(data, dict):
+        print(
+            f"[WARN] {CUSTOM_MODELS_FILENAME} do Dataset não é um objeto JSON; "
+            f"tratando como nenhuma pasta declarada."
+        )
+        return {}
+    return {str(key): str(value) for key, value in data.items()}
+
+
+def declared_folder_names(custom_models: Optional[dict[str, str]]) -> set[str]:
+    """Pastas (os VALORES do mapa ``{tipo: pasta}``) já declaradas, em caixa baixa.
+
+    Case-insensitive de propósito: o Dataset roda em Linux, onde o nome da pasta
+    é case-sensitive, mas o usuário pode ter escrito a chave com outra
+    capitalização — e reprguntar de novo seria ruído.
+    """
+    return {str(value).strip().lower() for value in (custom_models or {}).values()}
+
+
+def undeclared_custom_folders(staging_dir: Path, declared: set[str]) -> list[str]:
+    """Pastas ad-hoc do staging que ainda NÃO estão declaradas (ordem estável)."""
+    staging_dir = Path(staging_dir)
+    if not staging_dir.is_dir():
+        return []
+    skip = {MANIFEST_NAME, METADATA_NAME, CUSTOM_MODELS_FILENAME}
+    found: list[str] = []
+    for child in sorted(staging_dir.iterdir()):
+        if not child.is_dir() or child.name in skip or child.name.startswith("."):
+            continue
+        if child.name in CATEGORIES or child.name.lower() in declared:
+            continue
+        found.append(child.name)
+    return found
+
+
+def apply_custom_models(
+    staging_dir: Path, custom_types: Optional[dict[str, str]]
+) -> dict[str, str]:
+    """Grava o custom_models.json no staging MESCLANDO com o que já estiver lá.
+
+    Preserva verbatim as entradas já existentes — inclusive as ajustadas à mão pelo
+    usuário na interface do Kaggle — e aplica por cima os tipos respondidos na
+    coleta desta sessão.
+
+    Nunca remove entrada: pasta vazia não existe no Dataset do Kaggle, então podar
+    apagaria justamente a declaração feita antes de o peso ser publicado; e
+    entrada órfã é inofensiva (o ComfyUI ignora diretório inexistente).
+
+    Não cria o arquivo quando não há nada a declarar, para que uma sessão sem
+    /makedir não polua o Dataset com um custom_models.json vazio.
+    """
+    staging_dir = Path(staging_dir)
+    path = staging_dir / CUSTOM_MODELS_FILENAME
+    existing: dict[str, str] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = {str(k): str(v) for k, v in loaded.items()}
+        except (OSError, ValueError) as exc:
+            print(
+                f"[WARN] {CUSTOM_MODELS_FILENAME} existente no staging ilegível ({exc}); "
+                f"será sobrescrito pelas declarações desta sessão."
+            )
+    merged = dict(existing)
+    merged.update({str(k): str(v) for k, v in (custom_types or {}).items()})
+    if not merged or merged == existing:
+        return merged
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(f"[INFO] {CUSTOM_MODELS_FILENAME} no Dataset: {merged}")
+    return merged
+
+
+def _validate_custom_model_type(model_type: str, folder: str) -> tuple[str, str]:
+    """Valida um par ``{tipo: pasta}`` reutilizando as regras do comfyui_setup.
+
+    Import preguiçoso: kaggle_dataset_manager roda isolado (sem ComfyUI
+    instalado) nos testes, e comfyui_setup é um módulo pesado no topo.
+    """
+    from comfyui_setup import validate_custom_model_type
+
+    return validate_custom_model_type(model_type, folder)
+
+
+def _ask_custom_model_type(
+    folder: str,
+    declared_folders: Optional[set[str]],
+    custom_types_out: Optional[dict[str, str]],
+    input_fn,
+) -> None:
+    """Pergunta o tipo do ComfyUI para a pasta raiz de um /makedir ainda nova.
+
+    Só pergunta para a PASTA RAIZ: quando ela é uma categoria padrão
+    (``video_models/SEEDVR2``) o ComfyUI já a expõe sozinho e não há o que
+    declarar. Pastas já declaradas no Dataset são puladas, para preservar a
+    correção manual feita pela interface do Kaggle.
+    """
+    root = str(folder).split("/")[0]
+    if root in CATEGORIES or custom_types_out is None:
+        return
+    if root.lower() in (declared_folders or set()):
+        print(f"[INFO] Pasta '{root}' já declarada no Dataset; tipo preservado.")
+        return
+    if any(v.lower() == root.lower() for v in custom_types_out.values()):
+        return
+    suggested = root.lower()
+    for attempt in range(1, 4):
+        answer = input_fn(f"Tipo ComfyUI para a pasta '{root}' [{suggested}]: ").strip()
+        try:
+            norm_type, norm_folder = _validate_custom_model_type(answer or suggested, root)
+        except ValueError as exc:
+            print(f"[WARN] {exc}")
+            if attempt == 3:
+                print(
+                    f"[WARN] Tipo não confirmado para '{root}'; a pasta será criada, "
+                    f"mas NÃO será registrada automaticamente no custom_models.json."
+                )
+                return
+            continue
+        custom_types_out[norm_type] = norm_folder
+        print(f'[INFO] {CUSTOM_MODELS_FILENAME}: {{"{norm_type}": "{norm_folder}"}}')
+        return
+
+
 def get_secret(name: str) -> Optional[str]:
     value = os.environ.get(name)
     if value:
@@ -1917,12 +2093,17 @@ def publish_staged_state(
     staging_dir: Path,
     input_fn=input,
     pending_edits: Iterable[tuple[str, ...]] = (),
+    custom_types: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Constrói o estado completo a partir do staging e publica após preview.
 
     ``pending_edits`` são as operações remove/move coletadas antecipadamente por
     collect_dataset_edits; são aplicadas aqui sobre o estado desejado já montado
     (staging + manifest), sem nenhum prompt adicional.
+
+    ``custom_types`` são os pares ``{tipo: pasta}`` respondidos na coleta. São
+    fundidos no custom_models.json DEPOIS do materialize (é ali que o arquivo do
+    Dataset remoto chega ao staging), preservando o que já estava declarado.
     """
     staging_dir = Path(staging_dir)
     current = parse_current_files(kaggle_files(dataset))
@@ -1973,6 +2154,24 @@ def publish_staged_state(
     for cache_dir in list(staging_dir.rglob(".cache")):
         if cache_dir.is_dir():
             shutil.rmtree(cache_dir, ignore_errors=True)
+    # Declaração de tipos customizados: só aqui o staging tem o custom_models.json
+    # remoto materializado, que é o ponto seguro para fundir sem perder o que já
+    # estava publicado. O desired recebe o hash NOVO — do contrário o manifest
+    # descreveria a versão antiga do arquivo.
+    merged_custom = apply_custom_models(staging_dir, custom_types)
+    custom_path = staging_dir / CUSTOM_MODELS_FILENAME
+    if custom_path.is_file():
+        undeclared = undeclared_custom_folders(
+            staging_dir, declared_folder_names(merged_custom)
+        )
+        if undeclared:
+            print(
+                "[WARN] Pastas ad-hoc sem tipo declarado (o node pode não "
+                f"encontrá-las no ComfyUI): {', '.join(undeclared)}"
+            )
+        desired[CUSTOM_MODELS_FILENAME] = DatasetFile(
+            CUSTOM_MODELS_FILENAME, custom_path.stat().st_size, sha256_file(custom_path)
+        )
     write_manifest(manifest_path, dataset, desired)
     changes = compare_states(current, desired)
     print("\n" + render_preview(dataset, current, desired, changes))

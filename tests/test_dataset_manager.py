@@ -14,12 +14,14 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 from kaggle_dataset_manager import (
     CATEGORIES,
+    CUSTOM_MODELS_FILENAME,
     DatasetFile,
     DownloadFailure,
     DownloadOutcome,
     ResolutionFailure,
     ResolutionOutcome,
     ResolvedArtifact,
+    apply_custom_models,
     build_dataset_path,
     classify_resolved_artifacts,
     collect_dataset_edits,
@@ -27,8 +29,10 @@ from kaggle_dataset_manager import (
     compare_states,
     configure_hf_cache,
     cleanup_hf_cache,
+    declared_folder_names,
     download_input_queue,
     download_resolved_queue,
+    fetch_custom_models,
     format_hf_resolution_error,
     format_size,
     guess_category,
@@ -61,6 +65,7 @@ from kaggle_dataset_manager import (
     custom_category_warnings,
     parse_hf_input,
     split_makedir_command,
+    undeclared_custom_folders,
     validate_custom_category,
     validate_hf_input,
     resolve_hf_input,
@@ -1883,6 +1888,218 @@ class MakedirCustomCategoryTests(unittest.TestCase):
         self.assertIn("custom_models.json", out)
         # Somente nos dois itens com aviso (SEEDVR2 não gera aviso)
         self.assertEqual(out.count("[WARN] Pasta customizada"), 2)
+
+
+class CustomModelsDeclarationTests(unittest.TestCase):
+    """Declaração de tipos de modelo customizados (custom_models.json no Dataset).
+
+    O par {tipo: pasta} é o que permite a um node que registra o seu PRÓPRIO tipo
+    (add_model_folder_path) enxergar os pesos do /kaggle/input. A pasta vem do
+    /makedir; o tipo só existe no código do node — daí a pergunta na coleta.
+    """
+
+    def test_declared_folder_names_usa_os_valores(self):
+        self.assertEqual(
+            declared_folder_names({"seedvr2": "SEEDVR2", "llm": "LLM"}),
+            {"seedvr2", "llm"},
+        )
+        self.assertEqual(declared_folder_names(None), set())
+        self.assertEqual(declared_folder_names({}), set())
+
+    def test_undeclared_custom_folders_ignora_categorias_arquivos_e_ocultos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "SEEDVR2").mkdir()
+            (root / "loras").mkdir()
+            (root / ".cache").mkdir()
+            (root / CUSTOM_MODELS_FILENAME).write_text("{}", encoding="utf-8")
+            self.assertEqual(undeclared_custom_folders(root, set()), ["SEEDVR2"])
+            self.assertEqual(undeclared_custom_folders(root, {"seedvr2"}), [])
+        self.assertEqual(undeclared_custom_folders(Path("/nao/existe"), set()), [])
+
+    def test_apply_cria_arquivo_quando_ha_tipos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(apply_custom_models(root, {"seedvr2": "SEEDVR2"}), {"seedvr2": "SEEDVR2"})
+            self.assertEqual(
+                json.loads((root / CUSTOM_MODELS_FILENAME).read_text(encoding="utf-8")),
+                {"seedvr2": "SEEDVR2"},
+            )
+
+    def test_apply_nao_cria_arquivo_vazio(self):
+        """Sessão sem /makedir não pode poluir o Dataset com um arquivo vazio."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(apply_custom_models(root, {}), {})
+            self.assertFalse((root / CUSTOM_MODELS_FILENAME).exists())
+            self.assertEqual(apply_custom_models(root, None), {})
+            self.assertFalse((root / CUSTOM_MODELS_FILENAME).exists())
+
+    def test_apply_preserva_entradas_existentes(self):
+        """O ajuste manual feito na interface do Kaggle sobrevive à publicação."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / CUSTOM_MODELS_FILENAME).write_text('{"llm": "LLM"}', encoding="utf-8")
+            merged = apply_custom_models(root, {"seedvr2": "SEEDVR2"})
+            self.assertEqual(merged, {"llm": "LLM", "seedvr2": "SEEDVR2"})
+
+    def test_apply_reescreve_json_ilegivel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / CUSTOM_MODELS_FILENAME).write_text("{quebrado", encoding="utf-8")
+            self.assertEqual(apply_custom_models(root, {"seedvr2": "SEEDVR2"}), {"seedvr2": "SEEDVR2"})
+
+    def _collect(self, answers, declared=(), out=None):
+        inputs = iter(answers)
+        prompts = []
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            queue = collect_input_queue(
+                input_fn=lambda prompt="": (prompts.append(prompt), next(inputs))[1],
+                declared_folders=set(declared),
+                custom_types_out=out,
+            )
+        return queue, stdout.getvalue(), prompts
+
+    def test_coleta_pergunta_tipo_da_pasta_nova_e_aceita_default(self):
+        custom_types = {}
+        queue, out, prompts = self._collect(
+            ["/makedir SEEDVR2 hf://org/repo/a.safetensors", "", "done"],
+            out=custom_types,
+        )
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(custom_types, {"seedvr2": "SEEDVR2"})
+        # O default oferecido é a pasta em caixa baixa, que é o caso comum.
+        self.assertTrue(
+            any("Tipo ComfyUI para a pasta 'SEEDVR2' [seedvr2]" in p for p in prompts)
+        )
+
+    def test_coleta_aceita_tipo_explicito(self):
+        custom_types = {}
+        self._collect(
+            ["/makedir SEEDVR2 hf://org/repo/a.safetensors", "seedvr2_v2", "done"],
+            out=custom_types,
+        )
+        self.assertEqual(custom_types, {"seedvr2_v2": "SEEDVR2"})
+
+    def test_coleta_nao_pergunta_pasta_ja_declarada(self):
+        custom_types = {}
+        queue, out, prompts = self._collect(
+            ["/makedir SEEDVR2 hf://org/repo/a.safetensors", "done"],
+            declared={"seedvr2"},
+            out=custom_types,
+        )
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(custom_types, {})
+        self.assertFalse(any("Tipo ComfyUI" in p for p in prompts))
+        self.assertIn("já declarada", out)
+
+    def test_coleta_nao_pergunta_categoria_padrao_aninhada(self):
+        """video_models/SEEDVR2 já é exposto pelo ComfyUI: nada a declarar."""
+        custom_types = {}
+        self._collect(
+            ["/makedir video_models/SEEDVR2 hf://org/repo/a.safetensors", "done"],
+            out=custom_types,
+        )
+        self.assertEqual(custom_types, {})
+
+    def test_coleta_repergunta_tipo_invalido(self):
+        custom_types = {}
+        _, out, _ = self._collect(
+            [
+                "/makedir SEEDVR2 hf://org/repo/a.safetensors",
+                "base_path",   # reservada pelo ComfyUI
+                "seedvr2",
+                "done",
+            ],
+            out=custom_types,
+        )
+        self.assertEqual(custom_types, {"seedvr2": "SEEDVR2"})
+        self.assertIn("reservado", out)
+
+    def test_coleta_desiste_apos_tantas_tentativas(self):
+        """Sem tipo confirmado a pasta é criada, mas NÃO é declarada."""
+        custom_types = {}
+        _, out, _ = self._collect(
+            [
+                "/makedir SEEDVR2 hf://org/repo/a.safetensors",
+                "base_path", "checkpoints", "video_models",
+                "done",
+            ],
+            out=custom_types,
+        )
+        self.assertEqual(custom_types, {})
+        self.assertIn("NÃO será registrada", out)
+
+    def test_coleta_sem_kwarg_opcional_nao_prompta(self):
+        """O notebook 08 chama sem os novos kwargs: comportamento inalterado."""
+        inputs = iter(["/makedir SEEDVR2 hf://org/repo/a.safetensors", "done"])
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            queue = collect_input_queue(input_fn=lambda prompt="": next(inputs))
+        self.assertEqual(len(queue), 1)
+        self.assertNotIn("Tipo ComfyUI", stdout.getvalue())
+
+    def test_publish_funde_tipos_e_atualiza_o_hash_no_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp)
+            (staging / "SEEDVR2").mkdir()
+            (staging / "SEEDVR2" / "m.safetensors").write_bytes(b"abc")
+            kaggle_dataset_manager.write_manifest(
+                staging / "dataset-manifest.json",
+                "owner/dataset",
+                {"SEEDVR2/m.safetensors": DatasetFile("SEEDVR2/m.safetensors", 3, "x")},
+            )
+
+            def fake_input(prompt=""):
+                return "n" if "Publicar" in prompt else ""
+
+            with patch.object(
+                kaggle_dataset_manager, "kaggle_files", return_value=[]
+            ), patch.object(kaggle_dataset_manager, "publish", return_value="ok"):
+                publish_staged_state(
+                    "owner/dataset", staging, input_fn=fake_input,
+                    custom_types={"seedvr2": "SEEDVR2"},
+                )
+
+            self.assertEqual(
+                json.loads((staging / CUSTOM_MODELS_FILENAME).read_text(encoding="utf-8")),
+                {"seedvr2": "SEEDVR2"},
+            )
+            manifest = json.loads((staging / "dataset-manifest.json").read_text(encoding="utf-8"))
+            entry = next(e for e in manifest["files"] if e["path"] == CUSTOM_MODELS_FILENAME)
+            # O hash precisa ser o do arquivo NOVO, não o do remoto materializado.
+            self.assertEqual(entry["size"], (staging / CUSTOM_MODELS_FILENAME).stat().st_size)
+            self.assertEqual(
+                entry["sha256"],
+                kaggle_dataset_manager.sha256_file(staging / CUSTOM_MODELS_FILENAME),
+            )
+
+    def test_fetch_custom_models_le_o_arquivo_do_dataset(self):
+        def fake_run(cmd, **kwargs):
+            target = Path(cmd[cmd.index("-p") + 1])
+            target.mkdir(parents=True, exist_ok=True)
+            (target / CUSTOM_MODELS_FILENAME).write_text(
+                '{"seedvr2": "SEEDVR2"}', encoding="utf-8")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("kaggle_dataset_manager.subprocess.run", side_effect=fake_run):
+                self.assertEqual(
+                    fetch_custom_models("owner/dataset", Path(tmp) / "cache"),
+                    {"seedvr2": "SEEDVR2"},
+                )
+
+    def test_fetch_custom_models_fail_soft(self):
+        fail = type("R", (), {"returncode": 1, "stdout": "", "stderr": "nao existe"})()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("kaggle_dataset_manager.subprocess.run", return_value=fail):
+                self.assertEqual(fetch_custom_models("owner/dataset", Path(tmp)), {})
+            broken = Path(tmp) / "b"
+            broken.mkdir()
+            (broken / CUSTOM_MODELS_FILENAME).write_text("{quebrado", encoding="utf-8")
+            with patch("kaggle_dataset_manager.subprocess.run", return_value=fail):
+                self.assertEqual(fetch_custom_models("owner/dataset", broken), {})
 
 
 if __name__ == "__main__":

@@ -740,6 +740,12 @@ ALLOWED_CUSTOM_NODES: frozenset[str] = frozenset([
     "Comfyui-Easy-Use",             # yolain/Comfyui-Easy-Use
     "ComfyUI-KJNodes",              # kijai/ComfyUI-KJNodes
     "ComfyUI-Krea2-Ostris-Edit",    # ostris/ComfyUI-Krea2-Ostris-Edit
+    # numz/ComfyUI-SeedVR2_VideoUpscaler (restauração/upscale de vídeo). Registra o
+    # PRÓPRIO tipo de modelo via folder_paths.add_model_folder_path("seedvr2", ...)
+    # e procura por esse tipo — NUNCA pelas categorias padrão. Para o modelo do
+    # Dataset ser visível ao node, a pasta SEEDVR2/ precisa estar mapeada em
+    # custom_models.json ({"seedvr2": "SEEDVR2"}) na raiz do Kaggle Dataset.
+    "ComfyUI-SeedVR2_VideoUpscaler",
     # "ComfyUI_QwenVL_PromptCaption" DESABILITADO (fallback B, WingeD123):
     # a pasta do node ficaria em ComfyUI/models/text_encoders/<FOLDER>/ e o README
     # exige renomear o peso para 'model.safetensors' + config HF dentro de uma pasta
