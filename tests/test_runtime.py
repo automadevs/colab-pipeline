@@ -2499,5 +2499,104 @@ class TestU_GitBasedAudit(unittest.TestCase):
                 comfyui_setup.PERSISTENT_AUDIT_PATHS = original
 
 
+class TestV_CustomModelTypesFromDataset(unittest.TestCase):
+    """Tipos de modelo customizados declarados no Dataset via custom_models.json.
+
+    O node SeedVR2 registra o seu PRÓPRIO tipo ("seedvr2") via
+    folder_paths.add_model_folder_path e nunca procura em video_models/&c — sem a
+    entrada correspondente no extra_model_paths.yaml ele não acha o modelo, ainda
+    que a pasta exista no /kaggle/input.
+
+    O arquivo é OPTIONAL e FAIL-SOFT de propósito (ao contrário do fail-closed das
+    camadas de auditoria): mora no Dataset, montado read-only, e é editado pelo
+    usuário na interface do Kaggle. Ausente/malformado não pode derrubar a sessão.
+    """
+
+    def _write(self, root: Path, payload: str) -> None:
+        (Path(root) / comfyui_setup.CUSTOM_MODELS_FILENAME).write_text(
+            payload, encoding="utf-8")
+
+    def test_ausente_devolve_vazio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(comfyui_setup.load_custom_model_types(Path(tmp)), {})
+
+    def test_json_invalido_nao_aborta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "{nao e json")
+            self.assertEqual(comfyui_setup.load_custom_model_types(Path(tmp)), {})
+
+    def test_json_nao_objeto_nao_aborta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, '["seedvr2"]')
+            self.assertEqual(comfyui_setup.load_custom_model_types(Path(tmp)), {})
+
+    def test_le_par_tipo_para_pasta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, '{"seedvr2": "SEEDVR2", "llm": "LLM"}')
+            self.assertEqual(
+                comfyui_setup.load_custom_model_types(Path(tmp)),
+                {"seedvr2": "SEEDVR2", "llm": "LLM"},
+            )
+
+    def test_entradas_invalidas_sao_puladas_sem_perder_as_validas(self):
+        payload = {
+            "seedvr2": "SEEDVR2",      # válida
+            "base_path": "etc",        # reservada pelo ComfyUI
+            "checkpoints": "SEEDVR2",  # colide com categoria padrão
+            "bad type": "X",           # tipo com espaço
+            "trav": "../etc",           # travessia no valor
+            "neste": "a/b",            # valor com separador
+            "vazio": "",               # valor vazio
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, json.dumps(payload))
+            self.assertEqual(
+                comfyui_setup.load_custom_model_types(Path(tmp)),
+                {"seedvr2": "SEEDVR2"},
+            )
+
+    def test_yaml_emite_tipo_customizado_em_cada_raiz(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "dataset"
+            root.mkdir()
+            self._write(root, '{"seedvr2": "SEEDVR2"}')
+            yaml_text = comfyui_setup.build_extra_model_paths_yaml(
+                Path("/kaggle/working/ComfyUI/models"),
+                [("dataset_models", root)],
+                comfyui_setup.collect_custom_model_types([("dataset_models", root)]),
+            )
+        # As 10 categorias padrão continuam lá...
+        for cat in comfyui_setup.MODEL_CATEGORIES:
+            self.assertIn(f"  {cat}: {cat}\n", yaml_text)
+        # ...e o tipo customizado aparece na seção do Dataset.
+        self.assertIn("dataset_models:", yaml_text)
+        self.assertIn("  seedvr2: SEEDVR2\n", yaml_text)
+
+    def test_sem_arquivo_o_yaml_fica_como_antes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "dataset"
+            root.mkdir()
+            yaml_text = comfyui_setup.build_extra_model_paths_yaml(
+                Path("/kaggle/working/ComfyUI/models"),
+                [("dataset_models", root)],
+                comfyui_setup.collect_custom_model_types([("dataset_models", root)]),
+            )
+        self.assertEqual(comfyui_setup.collect_custom_model_types(None), {})
+        self.assertNotIn("seedvr2", yaml_text)
+        # Uma vez por seção (kaggle_models + dataset_models), sem duplicar
+        self.assertEqual(yaml_text.count("  checkpoints: checkpoints\n"), 2)
+
+    def test_tipo_invalido_passado_ao_yaml_e_ignorado(self):
+        """Uma chave 'base_path' injetada geraria YAML com chave duplicada."""
+        yaml_text = comfyui_setup.build_extra_model_paths_yaml(
+            Path("/kaggle/working/ComfyUI/models"),
+            None,
+            {"base_path": "etc", "seedvr2": "SEEDVR2"},
+        )
+        self.assertIn("  seedvr2: SEEDVR2\n", yaml_text)
+        self.assertEqual(yaml_text.count("  base_path: "), 1)
+
+
+
 if __name__ == "__main__":
     unittest.main()

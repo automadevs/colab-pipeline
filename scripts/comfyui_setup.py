@@ -36,13 +36,14 @@ import gc
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 DEFAULT_COMFYUI_DIR = Path("/kaggle/working/ComfyUI")
 DEFAULT_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
@@ -739,6 +740,12 @@ ALLOWED_CUSTOM_NODES: frozenset[str] = frozenset([
     "Comfyui-Easy-Use",             # yolain/Comfyui-Easy-Use
     "ComfyUI-KJNodes",              # kijai/ComfyUI-KJNodes
     "ComfyUI-Krea2-Ostris-Edit",    # ostris/ComfyUI-Krea2-Ostris-Edit
+    # numz/ComfyUI-SeedVR2_VideoUpscaler (restauração/upscale de vídeo). Registra o
+    # PRÓPRIO tipo de modelo via folder_paths.add_model_folder_path("seedvr2", ...)
+    # e procura por esse tipo — NUNCA pelas categorias padrão. Para o modelo do
+    # Dataset ser visível ao node, a pasta SEEDVR2/ precisa estar mapeada em
+    # custom_models.json ({"seedvr2": "SEEDVR2"}) na raiz do Kaggle Dataset.
+    "ComfyUI-SeedVR2_VideoUpscaler",
     # "ComfyUI_QwenVL_PromptCaption" DESABILITADO (fallback B, WingeD123):
     # a pasta do node ficaria em ComfyUI/models/text_encoders/<FOLDER>/ e o README
     # exige renomear o peso para 'model.safetensors' + config HF dentro de uma pasta
@@ -2399,13 +2406,163 @@ def install_manager_requirements(comfyui_dir: Path) -> bool:
 # extra_model_paths.yaml
 # ---------------------------------------------------------------------------
 
+# Arquivo OPCIONAL que declara tipos de modelo customizados. Mora na RAIZ do
+# Kaggle Dataset (montado read-only em /kaggle/input/<slug>), junto das pastas de
+# categoria — e NÃO no repositório: o usuário adiciona uma linha e sobe o Dataset
+# pela própria interface do Kaggle, sem editar/commit/push deste repo.
+CUSTOM_MODELS_FILENAME = "custom_models.json"
+
+# Chaves reservadas pelo loader do ComfyUI
+# (utils/extra_config.py::load_extra_path_config): não são caminhos de modelo,
+# logo não podem ser tipos customizados.
+RESERVED_MODEL_PATH_KEYS = frozenset({"base_path", "is_default"})
+
+# Tipo customizado aceito. Deliberadamente conservador: a chave vira uma chave
+# YAML e um tipo em folder_paths.folder_names_and_paths.
+_CUSTOM_MODEL_TYPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def validate_custom_model_type(model_type: str, folder: str) -> Tuple[str, str]:
+    """Valida UMA entrada de custom_models.json -> ``(tipo, pasta)`` normalizados.
+
+    O par espelha 1:1 a linha gerada no extra_model_paths.yaml
+    (``<tipo>: <pasta>``), com ``<pasta>`` relativa ao ``base_path`` da seção.
+    O ``<tipo>`` é o nome que o custom node registra via
+    ``folder_paths.add_model_folder_path`` e procura depois — o node SeedVR2,
+    por exemplo, registra e busca o tipo ``seedvr2``, que NÃO está em
+    MODEL_CATEGORIES e por isso nunca é alcançado pelas categorias padrão.
+    O ``<tipo>`` é comparado case-insensitively pelo node, mas a ``<pasta>`` é
+    lida direto do disco e por isso preserva a capitalização (ex.: ``SEEDVR2``).
+
+    Levanta ValueError se a chave ou o valor forem inseguros/ambíguos. Quem chama
+    (load_custom_model_types) é fail-soft e apenas registra um warning.
+    """
+    key = str(model_type or "").strip()
+    if not key:
+        raise ValueError("tipo de modelo customizado vazio")
+    if not _CUSTOM_MODEL_TYPE_RE.match(key):
+        raise ValueError(
+            f"tipo de modelo customizado inválido {key!r}: use apenas [A-Za-z0-9_.-], "
+            f"começando por letra, dígito ou '_'"
+        )
+    if key.lower() in RESERVED_MODEL_PATH_KEYS:
+        raise ValueError(f"tipo de modelo customizado reservado pelo ComfyUI: {key!r}")
+    if key in MODEL_CATEGORIES:
+        raise ValueError(
+            f"tipo de modelo customizado {key!r} colide com uma categoria padrão "
+            f"(que já é emitida automaticamente no YAML)"
+        )
+
+    name = str(folder or "").strip()
+    if not name:
+        raise ValueError(f"pasta vazia para o tipo de modelo customizado {key!r}")
+    if "/" in name or "\\" in name:
+        raise ValueError(
+            f"pasta do tipo {key!r} deve ser um único segmento relativo à raiz do "
+            f"Dataset (sem '/' nem '\\'): {name!r}"
+        )
+    if name in {".", ".."}:
+        raise ValueError(f"pasta do tipo {key!r} não pode ser {name!r}")
+    if Path(name).is_absolute() or re.match(r"^[A-Za-z]:", name):
+        raise ValueError(f"pasta do tipo {key!r} não pode ser caminho absoluto: {name!r}")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError(f"pasta do tipo {key!r} contém caracteres de controle: {name!r}")
+    return key, name
+
+
+def load_custom_model_types(root: Path) -> Dict[str, str]:
+    """Lê ``<root>/custom_models.json`` e devolve ``{tipo_comfyui: pasta}``.
+
+    FAIL-SOFT — e este é o ponto. Diferente do fail-closed das camadas de
+    auditoria deste módulo, aqui a ausência do arquivo NÃO é um incidente: ele é
+    opcional, vive no Dataset (montado read-only) e é editado pelo usuário na
+    própria interface do Kaggle. Ausente, ilegível, JSON inválido ou com entradas
+    inválidas => devolve ``{}`` e o pipeline segue normalmente com as
+    MODEL_CATEGORIES. Esta função nunca levanta exceção.
+
+    Formato (objeto JSON plano, tipo -> nome da pasta)::
+
+        {"seedvr2": "SEEDVR2", "llm": "LLM"}
+    """
+    path = Path(root) / CUSTOM_MODELS_FILENAME
+    try:
+        if not path.is_file():
+            return {}
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"[WARN] {CUSTOM_MODELS_FILENAME} ilegível em {root} ({exc}); ignorando.")
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        print(f"[WARN] {CUSTOM_MODELS_FILENAME} com JSON inválido em {root} ({exc}); ignorando.")
+        return {}
+
+    if not isinstance(data, dict):
+        print(f"[WARN] {CUSTOM_MODELS_FILENAME} em {root} não é um objeto JSON; ignorando.")
+        return {}
+
+    resolved: Dict[str, str] = {}
+    for key, value in data.items():
+        try:
+            norm_key, norm_folder = validate_custom_model_type(key, value)
+        except ValueError as exc:
+            print(f"[WARN] Entrada ignorada em {CUSTOM_MODELS_FILENAME}: {exc}")
+            continue
+        resolved[norm_key] = norm_folder
+
+    if resolved:
+        print(f"[INFO] Tipos de modelo customizados de {CUSTOM_MODELS_FILENAME}: {resolved}")
+    return resolved
+
+
+def collect_custom_model_types(
+    roots: Optional[List[Tuple[str, Path]]],
+) -> Dict[str, str]:
+    """Une os custom_models.json de várias raízes (fail-soft; a última vence)."""
+    merged: Dict[str, str] = {}
+    for _, root in roots or []:
+        merged.update(load_custom_model_types(root))
+    return merged
+
+
 def build_extra_model_paths_yaml(
     models_dir: Path,
     additional_roots: Optional[List[Tuple[str, Path]]] = None,
+    custom_model_types: Optional[Mapping[str, str]] = None,
 ) -> str:
+    """Monta o extra_model_paths.yaml consumido pelo ComfyUI.
+
+    As entradas de ``MODEL_CATEGORIES`` são sempre emitidas. ``custom_model_types``
+    (vindo do custom_models.json do Dataset) acrescenta tipos que NÃO estão nessa
+    lista — e são justamente os que os custom nodes registram por conta própria via
+    ``folder_paths.add_model_folder_path`` (ex.: ``seedvr2``). Sem essa seção o
+    node não acha o modelo, por mais que a pasta exista no Dataset.
+
+    As entradas são aplicadas ao ``base_path`` do models_dir E ao de cada raiz
+    adicional, para que funcione tanto o modelo vindo do Dataset quanto o baixado
+    localmente pelo fluxo "Civitai -> Local".
+
+    Entradas inválidas são ignoradas com warning (fail-soft): um custom_models.json
+    opcional e do usuário nunca deve derrubar a montagem do ambiente.
+    """
+    custom: Dict[str, str] = {}
+    for key, folder in (custom_model_types or {}).items():
+        try:
+            norm_key, norm_folder = validate_custom_model_type(key, folder)
+        except ValueError as exc:
+            print(f"[WARN] Tipo de modelo customizado ignorado no YAML: {exc}")
+            continue
+        custom[norm_key] = norm_folder
+
+    def _entries() -> List[str]:
+        emitted = [f"  {cat}: {cat}" for cat in MODEL_CATEGORIES]
+        emitted.extend(f"  {key}: {folder}" for key, folder in custom.items())
+        return emitted
+
     lines = ["kaggle_models:", f"  base_path: {models_dir}"]
-    for cat in MODEL_CATEGORIES:
-        lines.append(f"  {cat}: {cat}")
+    lines.extend(_entries())
     if additional_roots:
         for name, root in additional_roots:
             root_path = Path(root)
@@ -2414,8 +2571,7 @@ def build_extra_model_paths_yaml(
                 continue
             lines.append(f"{name}:")
             lines.append(f"  base_path: {root_path}")
-            for cat in MODEL_CATEGORIES:
-                lines.append(f"  {cat}: {cat}")
+            lines.extend(_entries())
     return "\n".join(lines) + "\n"
 
 
@@ -2505,9 +2661,17 @@ def setup_comfyui(
     check_custom_nodes_allowlist(comfyui_dir, strict=strict_allowlist)
 
     extra_paths = comfyui_dir / "extra_model_paths.yaml"
-    yaml_content = build_extra_model_paths_yaml(models_dir, additional_model_roots)
+    # Tipos de modelo customizados declarados pelo próprio Dataset (fail-soft):
+    # é o que permite a um node que registra o seu próprio tipo (ex.: seedvr2)
+    # enxergar os pesos que vivem no /kaggle/input, sem copiar para /kaggle/working.
+    custom_types = collect_custom_model_types(additional_model_roots)
+    yaml_content = build_extra_model_paths_yaml(
+        models_dir, additional_model_roots, custom_types
+    )
     extra_paths.write_text(yaml_content, encoding="utf-8")
     print(f"[INFO] (Re)escrito {extra_paths}")
+    if custom_types:
+        print(f"[INFO] Tipos de modelo customizados expostos: {sorted(custom_types)}")
 
     print(f"[INFO] ComfyUI: {comfyui_dir} | Manager: {'sim' if enable_manager else 'não'}")
     print(f"[SECURITY] INPUT  → {input_dir}")

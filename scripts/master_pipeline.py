@@ -187,7 +187,9 @@ def main(argv: list[str] | None = None) -> int:
         collect_dataset_edits,
         collect_input_queue,
         configure_hf_cache,
+        declared_folder_names,
         download_resolved_queue,
+        fetch_custom_models,
         get_secret,
         is_hf_input,
         print_download_failure_summary,
@@ -217,7 +219,19 @@ def main(argv: list[str] | None = None) -> int:
     print("Kaggle auth: configurado")
 
     print("\n[3/5] COLETA E RESOLUÇÃO DE INPUTS")
-    pending = collect_input_queue()
+    # Pré-fetch do custom_models.json do Dataset: só assim a coleta sabe quais
+    # pastas ad-hoc JÁ têm tipo declarado e não precisa perguntar de novo (e não
+    # sobrescreve o ajuste manual feito pela interface do Kaggle). Fail-soft.
+    try:
+        declared = declared_folder_names(
+            fetch_custom_models(dataset, STAGING_DIR / ".custom_models_probe")
+        )
+        shutil.rmtree(STAGING_DIR / ".custom_models_probe", ignore_errors=True)
+    except Exception as exc:
+        print(f"[WARN] Pré-fetch do custom_models.json falhou ({exc}); nenhuma pasta declarada.")
+        declared = set()
+    custom_types: dict[str, str] = {}
+    pending = collect_input_queue(declared_folders=declared, custom_types_out=custom_types)
     if any(is_hf_input(split_makedir_command(value)[1]) for value in pending):
         # Cache HF em diretório temporário, configurado ANTES do primeiro import
         # de huggingface_hub (constantes congeladas na importação); removido ao
@@ -284,7 +298,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n[5/5] PUBLICAÇÃO NO KAGGLE")
     try:
-        result = publish_staged_state(dataset, STAGING_DIR, pending_edits=pending_edits)
+        result = publish_staged_state(
+            dataset, STAGING_DIR, pending_edits=pending_edits, custom_types=custom_types
+        )
     except Exception as exc:
         print(f"[WARN] Publicação via Kaggle CLI falhou: {exc}")
         print("[INFO] Tentando fallback via kagglehub...")
