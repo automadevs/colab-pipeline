@@ -1635,17 +1635,46 @@ def _hash_file(path: Path, chunk_size: int = 65536) -> str:
 IGNORED_NODE_PATTERNS: frozenset[str] = RUNTIME_GENERATED_DIR_NAMES
 IGNORED_NODE_EXTENSIONS: frozenset[str] = RUNTIME_GENERATED_EXTENSIONS
 
+# Arquivos de scaffolding que alguns nodes CRIAM NO PRÓPRIO DIRETÓRIO ao serem
+# importados, só para indicar onde o usuário deve colocar o que é seu.
+# Caso real: Comfyui-Easy-Use escreve styles/your_styles.json.example e
+# wildcards/example.txt no primeiro import. Sem esta carve-out,
+# verify_custom_nodes_unchanged(strict=True) aborta a sessão com NEW_FILE sempre
+# que o node roda pela primeira vez — falso positivo de integridade: não é
+# instalação via Manager nem alteração do conteúdo do node.
+#
+# Carve-out ESTREITO de propósito: só template/exemplo. Qualquer .py/.js novo,
+# arquivo tracked-modificado ou node desconhecido continua reprovando — o
+# fail-closed das camadas de auditoria permanece intacto.
+NODE_SCAFFOLDING_SUFFIXES: frozenset[str] = frozenset({".example"})
+NODE_SCAFFOLDING_STEMS: frozenset[str] = frozenset({"example", "sample", "template"})
+
+
+def _is_node_scaffolding_file(rel_path: str) -> bool:
+    """True para templates que o próprio node gera ao ser importado.
+
+    Reconhece o sufixo ``.example`` (ex.: ``your_styles.json.example``) e o stem
+    ``example``/``sample``/``template`` (ex.: ``wildcards/example.txt``).
+    """
+    path = Path(rel_path)
+    if path.suffix.lower() in NODE_SCAFFOLDING_SUFFIXES:
+        return True
+    return path.stem.lower() in NODE_SCAFFOLDING_STEMS
+
 
 def _should_ignore_node_file(rel_path: str) -> bool:
     """Verifica se um arquivo relativo deve ser ignorado no snapshot do node.
 
-    Reusa _is_ephemeral_internal_path (.git/ + __pycache__/bytecode) e
-    adiciona a checagem de extensao compilada.
+    Reusa _is_ephemeral_internal_path (.git/ + __pycache__/bytecode), a checagem
+    de extensao compilada e a carve-out de scaffolding do node.
     """
     if _is_ephemeral_internal_path(rel_path):
         return True
     # Ignorar por extensão
     if Path(rel_path).suffix in IGNORED_NODE_EXTENSIONS:
+        return True
+    # Template criado pelo próprio node no import (ver _is_node_scaffolding_file)
+    if _is_node_scaffolding_file(rel_path):
         return True
     return False
 

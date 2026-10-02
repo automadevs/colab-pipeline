@@ -2597,6 +2597,77 @@ class TestV_CustomModelTypesFromDataset(unittest.TestCase):
         self.assertEqual(yaml_text.count("  base_path: "), 1)
 
 
+class TestV_NodeScaffoldingIsNotTampering(unittest.TestCase):
+    """Templates que o próprio node cria no import não são instalação via Manager.
+
+    Caso real (SeedVR2 session): Comfyui-Easy-Use escreve
+    styles/your_styles.json.example e wildcards/example.txt ao ser importado pela
+    primeira vez, e verify_custom_nodes_unchanged(strict=True) abortava com
+    NEW_FILE. A carve-out é estreita: código novo e arquivo alterado seguem
+    reprovando.
+    """
+
+    def _make_comfyui(self, tmp, node_name="Comfyui-Easy-Use"):
+        comfyui = Path(tmp) / "ComfyUI"
+        node = comfyui / "custom_nodes" / node_name
+        node.mkdir(parents=True)
+        (node / "__init__.py").write_text("# node original", encoding="utf-8")
+        return comfyui, node
+
+    def test_carve_out_reconhece_templates(self):
+        for rel in (
+            "styles/your_styles.json.example",
+            "wildcards/example.txt",
+            "styles/template.json",
+            "samples/sample.png",
+        ):
+            with self.subTest(rel=rel):
+                self.assertTrue(comfyui_setup._is_node_scaffolding_file(rel))
+
+    def test_carve_out_nao_cobre_codigo_ou_dados_do_usuario(self):
+        for rel in (
+            "evil.py",
+            "nodes/new_node.py",
+            "__init__.py",
+            "styles/custom_styles.json",
+            "wildcards/meus.txt",
+        ):
+            with self.subTest(rel=rel):
+                self.assertFalse(comfyui_setup._is_node_scaffolding_file(rel))
+
+    def test_scaffolding_nao_aborta_o_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_comfyui(tmp)
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            self.assertIn("Comfyui-Easy-Use", snapshot["nodes"])
+
+            # O node roda e escreve o proprio scaffolding
+            (node / "styles").mkdir()
+            (node / "styles" / "your_styles.json.example").write_text("{}", encoding="utf-8")
+            (node / "wildcards").mkdir()
+            (node / "wildcards" / "example.txt").write_text("texto", encoding="utf-8")
+
+            self.assertEqual(
+                comfyui_setup.verify_custom_nodes_unchanged(comfyui, snapshot, strict=True),
+                [],
+            )
+
+    def test_arquivo_de_codigo_novo_ainda_aborta(self):
+        """A carve-out não pode virar brecha para contrabandear código."""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_comfyui(tmp)
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            (node / "evil_payload.py").write_text("import os", encoding="utf-8")
+            with self.assertRaises(comfyui_setup.SecurityError):
+                comfyui_setup.verify_custom_nodes_unchanged(comfyui, snapshot, strict=True)
+
+    def test_modificar_arquivo_existente_ainda_aborta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_comfyui(tmp)
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            (node / "__init__.py").write_text("# alterado", encoding="utf-8")
+            with self.assertRaises(comfyui_setup.SecurityError):
+                comfyui_setup.verify_custom_nodes_unchanged(comfyui, snapshot, strict=True)
 
 if __name__ == "__main__":
     unittest.main()
