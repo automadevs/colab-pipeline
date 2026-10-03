@@ -2176,6 +2176,77 @@ class TestU_GitBasedAudit(unittest.TestCase):
                 comfyui_setup.PERSISTENT_AUDIT_PATHS = original
                 comfyui_setup._clear_git_cache()
 
+    def test_node_workflows_image_tracked_limpa_passa(self):
+        """custom_nodes/<node>/workflows/wf.png tracked-e-limpo → PASSA.
+
+        Caso real: RES4LYF versiona 30 screenshots (~60 MB) em workflows/.
+        Sem 'workflows' em NODE_DOC_IMAGE_DIR_NAMES a Camada 2 aborta a sessão.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_image(
+                tmp, node_name="RES4LYF", subdir="workflows", tracked=True
+            )
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_workflows_image_untracked_reprova(self):
+        """workflows/leaked.png criado manualmente (untracked) → REPROVA.
+
+        Trava anti-brecha: adicionar 'workflows' NÃO pode transformar o
+        carve-out em um ponto cego — um PNGsolto no dir continua bloqueado.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            wf = Path(tmp) / "ComfyUI" / "custom_nodes" / "RES4LYF" / "workflows"
+            wf.mkdir(parents=True, exist_ok=True)
+            (wf / "leaked.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_workflows_image_modificada_reprova(self):
+        """workflows/x.png tracked mas MODIFICADA depois do commit → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            img = self._create_node_with_image(
+                tmp, node_name="RES4LYF", subdir="workflows", tracked=True
+            )
+            img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"alterada")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_res4lyf_autorizado_sem_tipo_proprio(self):
+        """RES4LYF na allowlist e NÃO exige entrada em custom_models.json."""
+        self.assertIn("RES4LYF", comfyui_setup.ALLOWED_CUSTOM_NODES)
+        # O node lê apenas categorias padrão expostas pelo Dataset — logo não
+        # há pasta/tipo customizado a declarar (ao contrário do SeedVR2).
+        for cat in ("checkpoints", "diffusion_models"):
+            self.assertIn(cat, comfyui_setup.MODEL_CATEGORIES, cat)
+
     def test_node_tests_image_tracked_limpa_passa(self):
         """custom_nodes/<node>/tests/test.png tracked-e-limpo → PASSA."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -2597,6 +2668,77 @@ class TestV_CustomModelTypesFromDataset(unittest.TestCase):
         self.assertEqual(yaml_text.count("  base_path: "), 1)
 
 
+class TestV_NodeScaffoldingIsNotTampering(unittest.TestCase):
+    """Templates que o próprio node cria no import não são instalação via Manager.
+
+    Caso real (SeedVR2 session): Comfyui-Easy-Use escreve
+    styles/your_styles.json.example e wildcards/example.txt ao ser importado pela
+    primeira vez, e verify_custom_nodes_unchanged(strict=True) abortava com
+    NEW_FILE. A carve-out é estreita: código novo e arquivo alterado seguem
+    reprovando.
+    """
+
+    def _make_comfyui(self, tmp, node_name="Comfyui-Easy-Use"):
+        comfyui = Path(tmp) / "ComfyUI"
+        node = comfyui / "custom_nodes" / node_name
+        node.mkdir(parents=True)
+        (node / "__init__.py").write_text("# node original", encoding="utf-8")
+        return comfyui, node
+
+    def test_carve_out_reconhece_templates(self):
+        for rel in (
+            "styles/your_styles.json.example",
+            "wildcards/example.txt",
+            "styles/template.json",
+            "samples/sample.png",
+        ):
+            with self.subTest(rel=rel):
+                self.assertTrue(comfyui_setup._is_node_scaffolding_file(rel))
+
+    def test_carve_out_nao_cobre_codigo_ou_dados_do_usuario(self):
+        for rel in (
+            "evil.py",
+            "nodes/new_node.py",
+            "__init__.py",
+            "styles/custom_styles.json",
+            "wildcards/meus.txt",
+        ):
+            with self.subTest(rel=rel):
+                self.assertFalse(comfyui_setup._is_node_scaffolding_file(rel))
+
+    def test_scaffolding_nao_aborta_o_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_comfyui(tmp)
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            self.assertIn("Comfyui-Easy-Use", snapshot["nodes"])
+
+            # O node roda e escreve o proprio scaffolding
+            (node / "styles").mkdir()
+            (node / "styles" / "your_styles.json.example").write_text("{}", encoding="utf-8")
+            (node / "wildcards").mkdir()
+            (node / "wildcards" / "example.txt").write_text("texto", encoding="utf-8")
+
+            self.assertEqual(
+                comfyui_setup.verify_custom_nodes_unchanged(comfyui, snapshot, strict=True),
+                [],
+            )
+
+    def test_arquivo_de_codigo_novo_ainda_aborta(self):
+        """A carve-out não pode virar brecha para contrabandear código."""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_comfyui(tmp)
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            (node / "evil_payload.py").write_text("import os", encoding="utf-8")
+            with self.assertRaises(comfyui_setup.SecurityError):
+                comfyui_setup.verify_custom_nodes_unchanged(comfyui, snapshot, strict=True)
+
+    def test_modificar_arquivo_existente_ainda_aborta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_comfyui(tmp)
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            (node / "__init__.py").write_text("# alterado", encoding="utf-8")
+            with self.assertRaises(comfyui_setup.SecurityError):
+                comfyui_setup.verify_custom_nodes_unchanged(comfyui, snapshot, strict=True)
 
 if __name__ == "__main__":
     unittest.main()

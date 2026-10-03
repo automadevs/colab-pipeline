@@ -746,6 +746,19 @@ ALLOWED_CUSTOM_NODES: frozenset[str] = frozenset([
     # Dataset ser visível ao node, a pasta SEEDVR2/ precisa estar mapeada em
     # custom_models.json ({"seedvr2": "SEEDVR2"}) na raiz do Kaggle Dataset.
     "ComfyUI-SeedVR2_VideoUpscaler",
+    # ClownsharkBatwing/RES4LYF (samplers ODE/SDE RES para Diffusion). Diferente
+    # do SeedVR2, o node NÃO registra tipo próprio de modelo: loaders.py lê apenas
+    # as categorias padrão "checkpoints" e "diffusion_models" via
+    # folder_paths.get_filename_list — logo NÃO precisa de entrada no
+    # custom_models.json nem de pasta própria no Dataset.
+    # ATENÇÃO: o repo embarca 144 imagens de workflow (~222 MB) em
+    # example_workflows/ (114) e workflows/ (30). As de example_workflows/ já
+    # eram aceitas; as de workflows/ exigem "workflows" em
+    # NODE_DOC_IMAGE_DIR_NAMES — sem isso a auditoria aborta a sessão.
+    # requirements.txt: opencv-python (mesmo pacote do comfyui_controlnet_aux,
+    # sem conflito), matplotlib, pywavelets, numpy>=1.26.4 — instalados
+    # automaticamente por install_or_update_custom_node().
+    "RES4LYF",
     # "ComfyUI_QwenVL_PromptCaption" DESABILITADO (fallback B, WingeD123):
     # a pasta do node ficaria em ComfyUI/models/text_encoders/<FOLDER>/ e o README
     # exige renomear o peso para 'model.safetensors' + config HF dentro de uma pasta
@@ -814,6 +827,12 @@ PERSISTENT_AUDIT_PATHS: Tuple[Path, ...] = (
 NODE_DOC_IMAGE_DIR_NAMES: frozenset[str] = frozenset({
     "docs", "web", "src_web", "assets", "images",
     "examples", "example_workflows", "tests",
+    # "workflows": screenshots dos workflows de exemplo que o próprio node
+    # versiona. Caso real: RES4LYF traz 30 PNGs (~60 MB) em workflows/ — sem
+    # esta entrada, _is_packaged_node_doc_image() reprova o arquivo e a Camada 2
+    # bloqueia a sessão inteira, embora sejam imagens do clone aprovado.
+    # Igual às demais entradas, exige tracked E limpo no git do próprio node.
+    "workflows",
 })
 # Extensões de dados auxiliares empacotadas dentro dos repositórios dos custom
 # nodes (matrizes de adjacência/downsampling, pesos mínimos de LPIPS embutidos,
@@ -1635,17 +1654,46 @@ def _hash_file(path: Path, chunk_size: int = 65536) -> str:
 IGNORED_NODE_PATTERNS: frozenset[str] = RUNTIME_GENERATED_DIR_NAMES
 IGNORED_NODE_EXTENSIONS: frozenset[str] = RUNTIME_GENERATED_EXTENSIONS
 
+# Arquivos de scaffolding que alguns nodes CRIAM NO PRÓPRIO DIRETÓRIO ao serem
+# importados, só para indicar onde o usuário deve colocar o que é seu.
+# Caso real: Comfyui-Easy-Use escreve styles/your_styles.json.example e
+# wildcards/example.txt no primeiro import. Sem esta carve-out,
+# verify_custom_nodes_unchanged(strict=True) aborta a sessão com NEW_FILE sempre
+# que o node roda pela primeira vez — falso positivo de integridade: não é
+# instalação via Manager nem alteração do conteúdo do node.
+#
+# Carve-out ESTREITO de propósito: só template/exemplo. Qualquer .py/.js novo,
+# arquivo tracked-modificado ou node desconhecido continua reprovando — o
+# fail-closed das camadas de auditoria permanece intacto.
+NODE_SCAFFOLDING_SUFFIXES: frozenset[str] = frozenset({".example"})
+NODE_SCAFFOLDING_STEMS: frozenset[str] = frozenset({"example", "sample", "template"})
+
+
+def _is_node_scaffolding_file(rel_path: str) -> bool:
+    """True para templates que o próprio node gera ao ser importado.
+
+    Reconhece o sufixo ``.example`` (ex.: ``your_styles.json.example``) e o stem
+    ``example``/``sample``/``template`` (ex.: ``wildcards/example.txt``).
+    """
+    path = Path(rel_path)
+    if path.suffix.lower() in NODE_SCAFFOLDING_SUFFIXES:
+        return True
+    return path.stem.lower() in NODE_SCAFFOLDING_STEMS
+
 
 def _should_ignore_node_file(rel_path: str) -> bool:
     """Verifica se um arquivo relativo deve ser ignorado no snapshot do node.
 
-    Reusa _is_ephemeral_internal_path (.git/ + __pycache__/bytecode) e
-    adiciona a checagem de extensao compilada.
+    Reusa _is_ephemeral_internal_path (.git/ + __pycache__/bytecode), a checagem
+    de extensao compilada e a carve-out de scaffolding do node.
     """
     if _is_ephemeral_internal_path(rel_path):
         return True
     # Ignorar por extensão
     if Path(rel_path).suffix in IGNORED_NODE_EXTENSIONS:
+        return True
+    # Template criado pelo próprio node no import (ver _is_node_scaffolding_file)
+    if _is_node_scaffolding_file(rel_path):
         return True
     return False
 
