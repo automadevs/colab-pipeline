@@ -2239,6 +2239,100 @@ class TestU_GitBasedAudit(unittest.TestCase):
                 comfyui_setup.PERSISTENT_AUDIT_PATHS = original
                 comfyui_setup._clear_git_cache()
 
+    def test_node_config_json_gitignored_nao_conta_new_file(self):
+        """Arquivo que o proprio node declara no .gitignore dele → ignorado.
+
+        Caso real: RES4LYF escreve res4lyf.config.json na raiz do node ao ser
+        importado e declara *.config.json no .gitignore. Sem esta carve-out,
+        verify_custom_nodes_unchanged(strict=True) aborta com NEW_FILE.
+        Reproduz o erro reportado em producao.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / "RES4LYF"
+            node_dir.mkdir(parents=True, exist_ok=True)
+            (node_dir / "__init__.py").write_text("# node\n")
+            gi = node_dir / ".gitignore"
+            gi.write_text("*.config.json\n__pycache__/\n")
+            self._git_commit_all(node_dir)
+            # Config criado em runtime, depois do snapshot de startup
+            (node_dir / "res4lyf.config.json").write_text('{"displayCategory": false}')
+
+            comfyui = Path(tmp) / "ComfyUI"
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            before = set(snapshot["nodes"]["RES4LYF"]["files"])
+            self.assertNotIn("res4lyf.config.json", before)
+
+            # Arquivo real do node continua no snapshot (fail-closed preservado)
+            self.assertIn("__init__.py", before)
+
+            # verify_custom_nodes_unchanged não deve abortar
+            comfyui_setup._clear_git_cache()
+            changes = comfyui_setup.verify_custom_nodes_unchanged(
+                comfyui, snapshot, strict=True
+            )
+            self.assertEqual(changes, [])
+
+    def test_node_ignored_py_ainda_conta_new_file(self):
+        """TRAVA ANTI-BRECHA: .py NO gitignore do node NÃO é poupado.
+
+        Se um atacante escribir um .py no node e o .gitignore o declarar
+        ignorado, o NODE_NEVER_IGNORED_EXTENSIONS impede a fuga e o
+        NEW_FILE continua abortando.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / "RES4LYF"
+            node_dir.mkdir(parents=True, exist_ok=True)
+            (node_dir / "__init__.py").write_text("# node\n")
+            (node_dir / ".gitignore").write_text("*.py\n*.config.json\n")
+            self._git_commit_all(node_dir)
+
+            comfyui = Path(tmp) / "ComfyUI"
+            snapshot = comfyui_setup.snapshot_custom_nodes(comfyui)
+            (node_dir / "evil.py").write_text("import os\nos.system('x')\n")
+
+            comfyui_setup._clear_git_cache()
+            with self.assertRaises(comfyui_setup.SecurityError):
+                comfyui_setup.verify_custom_nodes_unchanged(
+                    comfyui, snapshot, strict=True
+                )
+
+    def test_node_ignored_safetensors_ainda_aborta_auditoria(self):
+        """TRAVA ANTI-BRECHA: .safetensors ignorado pelo node ainda ABORTA.
+
+        A carve-out de .gitignore vale SÓ para o snapshot de integridade.
+        A auditoria de /kaggle/working não a usa — ALWAYS_BLOCKED_EXTENSIONS
+        continua fail-closed mesmo para arquivo que o node gitignora.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            node_dir = Path(tmp) / "ComfyUI" / "custom_nodes" / "comfyui-krea2-controlnet"
+            node_dir.mkdir(parents=True, exist_ok=True)
+            (node_dir / "nodes.py").write_text("# node\n")
+            # .gitignore real do repo: declara *.safetensors e a pasta Krea-2-controlnet/
+            (node_dir / ".gitignore").write_text(
+                "Krea-2-controlnet/\n*.safetensors\n*.ckpt\n*.pt\n*.pth\n"
+            )
+            self._git_commit_all(node_dir)
+            (node_dir / "pesos.safetensors").write_bytes(b"\x00" * 64)
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_krea2_controlnet_autorizado(self):
+        """facok/comfyui-krea2-controlnet na allowlist, sem tipo proprio."""
+        self.assertIn("comfyui-krea2-controlnet", comfyui_setup.ALLOWED_CUSTOM_NODES)
+        # Lê apenas "loras" (categoria padrão) — sem custom_models.json.
+        self.assertIn("loras", comfyui_setup.MODEL_CATEGORIES)
+
     def test_res4lyf_autorizado_sem_tipo_proprio(self):
         """RES4LYF na allowlist e NÃO exige entrada em custom_models.json."""
         self.assertIn("RES4LYF", comfyui_setup.ALLOWED_CUSTOM_NODES)

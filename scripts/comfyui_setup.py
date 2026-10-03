@@ -759,6 +759,17 @@ ALLOWED_CUSTOM_NODES: frozenset[str] = frozenset([
     # sem conflito), matplotlib, pywavelets, numpy>=1.26.4 — instalados
     # automaticamente por install_or_update_custom_node().
     "RES4LYF",
+    # facok/comfyui-krea2-controlnet (LoRA de controle para Krea-2). Repo
+    # MINIMO: 5 arquivos, ZERO imagens, ZERO downloads em runtime e __init__.py
+    # que so reexporta os mappings — nada a acrescentar nas carve-outs de imagem.
+    # Le SOMENTE a categoria padrao "loras" (folder_paths.get_filename_list) e
+    # nao registra tipo proprio: nao precisa de custom_models.json no Dataset.
+    # ATENCAO: o .gitignore dele declara *.safetensors/*.ckpt/*.pt/*.pth e a
+    # pasta Krea-2-controlnet/ — sao pesos que o USUARIO pode colocar la. Isso NAO
+    # e carve-out: um .safetensors em /kaggle/working continua abortando via
+    # ALWAYS_BLOCKED_EXTENSIONS, porque a auditoria nao usa a carve-out de
+    # .gitignore do node (que so vale para o snapshot de integridade).
+    "comfyui-krea2-controlnet",
     # "ComfyUI_QwenVL_PromptCaption" DESABILITADO (fallback B, WingeD123):
     # a pasta do node ficaria em ComfyUI/models/text_encoders/<FOLDER>/ e o README
     # exige renomear o peso para 'model.safetensors' + config HF dentro de uma pasta
@@ -1046,6 +1057,7 @@ def _clear_git_cache() -> None:
     """Limpa o cache de git tracked/untracked. Usado em testes."""
     _git_tracked_cache.clear()
     _nested_node_git_cache.clear()
+    _node_ignored_cache.clear()
 
 
 def _matches_git_changed_path(rel_path: str, changed_paths: frozenset[str]) -> bool:
@@ -1668,6 +1680,89 @@ IGNORED_NODE_EXTENSIONS: frozenset[str] = RUNTIME_GENERATED_EXTENSIONS
 NODE_SCAFFOLDING_SUFFIXES: frozenset[str] = frozenset({".example"})
 NODE_SCAFFOLDING_STEMS: frozenset[str] = frozenset({"example", "sample", "template"})
 
+# Cache dos paths que o .gitignore DO PRÓPRIO NODE declara como não-repositório.
+# Chave = path absoluto do node resolvido. NUNCA confunde nodes entre si.
+_node_ignored_cache: Dict[Path, Optional[frozenset[str]]] = {}
+
+# Extensões que NUNCA são poupadas pela carve-out de .gitignore, mesmo que o
+# node declare o arquivo como ignorado: são código executável — o exato vetor
+# que verify_custom_nodes_unchanged existe para detectar (injeção via Manager).
+# O fail-closed de modelos/imagens é intacto porque a auditoria de /kaggle/working
+# (_scan_working_violations / ALWAYS_BLOCKED_EXTENSIONS) NÃO usa esta carve-out.
+NODE_NEVER_IGNORED_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".pyc", ".pyo", ".pyd", ".js", ".mjs", ".cjs",
+    ".sh", ".bash", ".bat", ".exe", ".so", ".dll",
+})
+
+
+def _get_node_git_ignored_paths(node_dir: Path) -> Optional[frozenset[str]]:
+    """Paths que o .gitignore do PRÓPRIO node declara como fora do repositório.
+
+    Roda ``git status --porcelain --ignored`` no node e coleta só as linhas ``!!``
+    (untracked E ignorado). Git colapsa diretórios inteiros ignorados numa linha
+    só (ex.: ``!! Krea-2-controlnet/``) — o casamento por prefixo é feito em
+    _is_node_declared_ignored().
+
+    Por que isso é seguro: o .gitignore é versionado no repo do node, que já é
+    explicitamente autorizado em ALLOWED_CUSTOM_NODES. O autor do node está
+    declarando "isto aqui não é conteúdo meu". Um atacante que consiga escrever
+    no diretório do node ainda NÃO consegue se esconder de um .py — ver
+    NODE_NEVER_IGNORED_EXTENSIONS.
+
+    Retorna None se o node não for um repo git válido ou o git falhar →
+    fail-closed (o chamador não poupa nada, mantendo o arquivo no snapshot e
+    preservando o abort de NEW_FILE).
+    """
+    node_dir = Path(node_dir)
+    try:
+        key = node_dir.resolve()
+    except OSError:
+        return None
+    if key in _node_ignored_cache:
+        return _node_ignored_cache[key]
+
+    if not node_dir.is_dir() or not (node_dir / ".git").is_dir():
+        _node_ignored_cache[key] = None
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(node_dir), "status", "--porcelain", "--ignored"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        _node_ignored_cache[key] = None
+        return None
+    if proc.returncode != 0:
+        _node_ignored_cache[key] = None
+        return None
+
+    paths: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if len(line) < 4 or line[:2] != "!!":
+            continue
+        path = line[3:].strip()
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        if path:
+            paths.add(path.replace("\\", "/").rstrip("/"))
+    result = frozenset(paths)
+    _node_ignored_cache[key] = result
+    return result
+
+
+def _is_node_declared_ignored(rel_path: str, ignored: frozenset[str]) -> bool:
+    """True se rel_path está listado (ou dentro de) um path ignorado pelo node.
+
+    Caso real: RES4LYF declara ``*.config.json`` no seu .gitignore e escreve
+    ``res4lyf.config.json`` na raiz do node ao ser importado. Sem esta carve-out,
+    verify_custom_nodes_unchanged(strict=True) aborta com NEW_FILE na primeira
+    vez que o node roda.
+    """
+    normalized = rel_path.replace("\\", "/")
+    if Path(normalized).suffix.lower() in NODE_NEVER_IGNORED_EXTENSIONS:
+        return False
+    return _matches_git_changed_path(normalized, ignored)
+
 
 def _is_node_scaffolding_file(rel_path: str) -> bool:
     """True para templates que o próprio node gera ao ser importado.
@@ -1681,11 +1776,12 @@ def _is_node_scaffolding_file(rel_path: str) -> bool:
     return path.stem.lower() in NODE_SCAFFOLDING_STEMS
 
 
-def _should_ignore_node_file(rel_path: str) -> bool:
+def _should_ignore_node_file(rel_path: str, node_dir: Optional[Path] = None) -> bool:
     """Verifica se um arquivo relativo deve ser ignorado no snapshot do node.
 
     Reusa _is_ephemeral_internal_path (.git/ + __pycache__/bytecode), a checagem
-    de extensao compilada e a carve-out de scaffolding do node.
+    de extensao compilada, a carve-out de scaffolding do node e — quando node_dir
+    e informado — a carve-out de .gitignore do proprio node.
     """
     if _is_ephemeral_internal_path(rel_path):
         return True
@@ -1695,6 +1791,12 @@ def _should_ignore_node_file(rel_path: str) -> bool:
     # Template criado pelo próprio node no import (ver _is_node_scaffolding_file)
     if _is_node_scaffolding_file(rel_path):
         return True
+    # Arquivo que o proprio node declara no .gitignore dele como nao-repositorio
+    # (ex.: res4lyf.config.json). So consulta git se node_dir foi informado.
+    if node_dir is not None:
+        ignored = _get_node_git_ignored_paths(node_dir)
+        if ignored and _is_node_declared_ignored(rel_path, ignored):
+            return True
     return False
 
 
@@ -1710,12 +1812,12 @@ def compute_node_directory_hash(node_path: Path) -> str:
         if f.is_file() and not f.is_symlink():
             try:
                 rel = str(f.relative_to(node_path))
-                if _should_ignore_node_file(rel):
+                if _should_ignore_node_file(rel, node_path):
                     continue
                 files.append((rel, _hash_file(f)))
             except (OSError, PermissionError):
                 rel = str(f.relative_to(node_path))
-                if not _should_ignore_node_file(rel):
+                if not _should_ignore_node_file(rel, node_path):
                     files.append((rel, "UNREADABLE"))
     for rel, fhash in files:
         h.update(rel.encode("utf-8"))
@@ -1778,12 +1880,12 @@ def snapshot_custom_nodes(comfyui_dir: Path) -> Dict[str, Any]:
             if f.is_file():
                 try:
                     rel = str(f.relative_to(item))
-                    if _should_ignore_node_file(rel):
+                    if _should_ignore_node_file(rel, item):
                         continue
                     files[rel] = _hash_file(f)
                 except (OSError, PermissionError):
                     rel = str(f.relative_to(item))
-                    if not _should_ignore_node_file(rel):
+                    if not _should_ignore_node_file(rel, item):
                         files[rel] = "UNREADABLE"
         snapshot["nodes"][item.name] = {
             "path": str(item),
