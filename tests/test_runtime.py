@@ -2176,6 +2176,77 @@ class TestU_GitBasedAudit(unittest.TestCase):
                 comfyui_setup.PERSISTENT_AUDIT_PATHS = original
                 comfyui_setup._clear_git_cache()
 
+    def test_node_workflows_image_tracked_limpa_passa(self):
+        """custom_nodes/<node>/workflows/wf.png tracked-e-limpo → PASSA.
+
+        Caso real: RES4LYF versiona 30 screenshots (~60 MB) em workflows/.
+        Sem 'workflows' em NODE_DOC_IMAGE_DIR_NAMES a Camada 2 aborta a sessão.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            self._create_node_with_image(
+                tmp, node_name="RES4LYF", subdir="workflows", tracked=True
+            )
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                comfyui_setup.assert_no_persistent_images(label="TEST")
+                comfyui_setup.assert_working_policy()
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_workflows_image_untracked_reprova(self):
+        """workflows/leaked.png criado manualmente (untracked) → REPROVA.
+
+        Trava anti-brecha: adicionar 'workflows' NÃO pode transformar o
+        carve-out em um ponto cego — um PNGsolto no dir continua bloqueado.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            wf = Path(tmp) / "ComfyUI" / "custom_nodes" / "RES4LYF" / "workflows"
+            wf.mkdir(parents=True, exist_ok=True)
+            (wf / "leaked.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_node_workflows_image_modificada_reprova(self):
+        """workflows/x.png tracked mas MODIFICADA depois do commit → REPROVA."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._create_comfyui_git_repo(tmp)
+            img = self._create_node_with_image(
+                tmp, node_name="RES4LYF", subdir="workflows", tracked=True
+            )
+            img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"alterada")
+
+            original = comfyui_setup.PERSISTENT_AUDIT_PATHS
+            comfyui_setup.PERSISTENT_AUDIT_PATHS = (Path(tmp),)
+            try:
+                comfyui_setup._clear_git_cache()
+                with self.assertRaises(comfyui_setup.SecurityError):
+                    comfyui_setup.assert_no_persistent_images(label="TEST")
+            finally:
+                comfyui_setup.PERSISTENT_AUDIT_PATHS = original
+                comfyui_setup._clear_git_cache()
+
+    def test_res4lyf_autorizado_sem_tipo_proprio(self):
+        """RES4LYF na allowlist e NÃO exige entrada em custom_models.json."""
+        self.assertIn("RES4LYF", comfyui_setup.ALLOWED_CUSTOM_NODES)
+        # O node lê apenas categorias padrão expostas pelo Dataset — logo não
+        # há pasta/tipo customizado a declarar (ao contrário do SeedVR2).
+        for cat in ("checkpoints", "diffusion_models"):
+            self.assertIn(cat, comfyui_setup.MODEL_CATEGORIES, cat)
+
     def test_node_tests_image_tracked_limpa_passa(self):
         """custom_nodes/<node>/tests/test.png tracked-e-limpo → PASSA."""
         with tempfile.TemporaryDirectory() as tmp:

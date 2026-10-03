@@ -746,6 +746,19 @@ ALLOWED_CUSTOM_NODES: frozenset[str] = frozenset([
     # Dataset ser visível ao node, a pasta SEEDVR2/ precisa estar mapeada em
     # custom_models.json ({"seedvr2": "SEEDVR2"}) na raiz do Kaggle Dataset.
     "ComfyUI-SeedVR2_VideoUpscaler",
+    # ClownsharkBatwing/RES4LYF (samplers ODE/SDE RES para Diffusion). Diferente
+    # do SeedVR2, o node NÃO registra tipo próprio de modelo: loaders.py lê apenas
+    # as categorias padrão "checkpoints" e "diffusion_models" via
+    # folder_paths.get_filename_list — logo NÃO precisa de entrada no
+    # custom_models.json nem de pasta própria no Dataset.
+    # ATENÇÃO: o repo embarca 144 imagens de workflow (~222 MB) em
+    # example_workflows/ (114) e workflows/ (30). As de example_workflows/ já
+    # eram aceitas; as de workflows/ exigem "workflows" em
+    # NODE_DOC_IMAGE_DIR_NAMES — sem isso a auditoria aborta a sessão.
+    # requirements.txt: opencv-python (mesmo pacote do comfyui_controlnet_aux,
+    # sem conflito), matplotlib, pywavelets, numpy>=1.26.4 — instalados
+    # automaticamente por install_or_update_custom_node().
+    "RES4LYF",
     # "ComfyUI_QwenVL_PromptCaption" DESABILITADO (fallback B, WingeD123):
     # a pasta do node ficaria em ComfyUI/models/text_encoders/<FOLDER>/ e o README
     # exige renomear o peso para 'model.safetensors' + config HF dentro de uma pasta
@@ -814,6 +827,12 @@ PERSISTENT_AUDIT_PATHS: Tuple[Path, ...] = (
 NODE_DOC_IMAGE_DIR_NAMES: frozenset[str] = frozenset({
     "docs", "web", "src_web", "assets", "images",
     "examples", "example_workflows", "tests",
+    # "workflows": screenshots dos workflows de exemplo que o próprio node
+    # versiona. Caso real: RES4LYF traz 30 PNGs (~60 MB) em workflows/ — sem
+    # esta entrada, _is_packaged_node_doc_image() reprova o arquivo e a Camada 2
+    # bloqueia a sessão inteira, embora sejam imagens do clone aprovado.
+    # Igual às demais entradas, exige tracked E limpo no git do próprio node.
+    "workflows",
 })
 # Extensões de dados auxiliares empacotadas dentro dos repositórios dos custom
 # nodes (matrizes de adjacência/downsampling, pesos mínimos de LPIPS embutidos,
