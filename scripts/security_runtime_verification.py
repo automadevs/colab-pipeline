@@ -143,12 +143,11 @@ class VerificationReport:
             ("07_DOWNLOAD", "Download"),
             ("08_PROCESS", "Process"),
             ("09_REUSE", "Reuse Detection"),
-            ("10_NGROK", "ngrok"),
+            ("10_CLOUDFLARE", "Cloudflare Tunnel"),
             ("11_MANAGER_ACTIVE", "Manager Active"),
             ("11_NETWORK_TRAFFIC", "External Network Traffic"),
             ("12_CUSTOM_NODES", "Custom Node Hashing"),
             ("13_NODE_ALTERATION", "Node Alteration"),
-            ("14_DRIVE_CREDENTIALS", "Drive Credential Cleanup"),
             ("15_EXCEPTION_CLEANUP", "Exception Cleanup"),
             ("16_FINAL_SCAN", "Final Filesystem Scan"),
             ("17_PERSISTENCE", "Persistence Between Sessions"),
@@ -966,9 +965,9 @@ def test_09_reuse(report: VerificationReport,
         report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
 
 
-def test_10_ngrok(report: VerificationReport):
-    """Teste 10: ngrok em SECURE_MODE — deve estar ATIVO e funcional (após health check)."""
-    test_id = "10_NGROK"
+def test_10_cloudflare(report: VerificationReport):
+    """Teste 10: Cloudflare Tunnel em SECURE_MODE — deve estar ATIVO (após health check)."""
+    test_id = "10_CLOUDFLARE"
     try:
         scripts_dir = KAGGLE_WORKING / "colab-pipeline" / "scripts"
         if scripts_dir.exists() and str(scripts_dir) not in sys.path:
@@ -981,50 +980,63 @@ def test_10_ngrok(report: VerificationReport):
 
         if not get_secure_mode():
             report.record(test_id, "NOT VERIFIED",
-                          "SECURE_MODE não está ativo — teste ngrok não aplicável")
+                          "SECURE_MODE não está ativo — teste cloudflare não aplicável")
             return
 
-        # Em SECURE_MODE, ngrok é PERMITIDO.
-        # Verificar se há túneis ativos (pipeline já deve ter iniciado ngrok)
+        # Em SECURE_MODE, cloudflare tunnel é PERMITIDO.
+        # Verificar se há túnel ativo (pipeline já deve ter iniciado cloudflared)
         tunnels = []
         try:
-            from pyngrok import ngrok
-            tunnels = list(ngrok.get_tunnels())
+            from cloudflare_tunnel import get_active_tunnels
+            tunnels = list(get_active_tunnels())
         except Exception:
             pass
+        if not tunnels:
+            # Fallback: kernel pode ser outro processo — procura cloudflared no OS
+            try:
+                proc = subprocess.run(
+                    ["pgrep", "-f", "cloudflared tunnel"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                tunnels = proc.stdout.split() if proc.returncode == 0 else []
+            except Exception:
+                pass
 
-        # Verificar que o token não aparece em logs
+        # Verificar que credenciais de túnel nomeado (se presentes) não vazam em logs
         token_leaked = False
-        token_value = os.environ.get("NGROK_AUTHTOKEN", "")
-        if token_value:
-            log_path = SHM_LOGS / "comfyui.log" if SHM_LOGS.exists() else None
-            if log_path and log_path.exists():
-                try:
-                    log_content = log_path.read_text(encoding="utf-8", errors="replace")
-                    if token_value in log_content:
+        token_values = [
+            os.environ.get(name, "")
+            for name in ("TUNNEL_TOKEN", "CLOUDFLARE_TUNNEL_TOKEN")
+        ]
+        log_path = SHM_LOGS / "comfyui.log" if SHM_LOGS.exists() else None
+        if log_path and log_path.exists():
+            try:
+                log_content = log_path.read_text(encoding="utf-8", errors="replace")
+                for token_value in token_values:
+                    if token_value and token_value in log_content:
                         token_leaked = True
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
-        # Verificar que nenhum arquivo do ngrok foi gravado em /kaggle/working
-        ngrok_files_in_working = []
+        # Verificar que nenhum arquivo do cloudflared foi gravado em /kaggle/working
+        cloudflare_files_in_working = []
         if KAGGLE_WORKING.exists():
             for item in KAGGLE_WORKING.rglob("*"):
-                if item.is_file() and "ngrok" in item.name.lower():
-                    ngrok_files_in_working.append(str(item))
+                if item.is_file() and "cloudflared" in item.name.lower():
+                    cloudflare_files_in_working.append(str(item))
 
         details = (
-            f"Túneis ngrok ativos: {len(tunnels)} {'✓' if len(tunnels) > 0 else '✗ (ngrok pode não ter sido iniciado)'}\n"
+            f"Túneis cloudflare ativos: {len(tunnels)} {'✓' if len(tunnels) > 0 else '✗ (cloudflared pode não ter sido iniciado)'}\n"
             f"Token leaked nos logs: {'SIM ✗' if token_leaked else 'NÃO ✓'}\n"
-            f"Arquivos ngrok em /kaggle/working: {len(ngrok_files_in_working)} {'✓' if len(ngrok_files_in_working) == 0 else '✗'}\n"
+            f"Arquivos cloudflared em /kaggle/working: {len(cloudflare_files_in_working)} {'✓' if len(cloudflare_files_in_working) == 0 else '✗'}\n"
         )
 
-        if len(tunnels) > 0 and not token_leaked and len(ngrok_files_in_working) == 0:
+        if len(tunnels) > 0 and not token_leaked and len(cloudflare_files_in_working) == 0:
             report.record(test_id, "PASS", details)
         elif len(tunnels) == 0:
-            report.record(test_id, "NOT VERIFIED", f"ngrok não parece estar ativo.\n{details}")
+            report.record(test_id, "NOT VERIFIED", f"cloudflared não parece estar ativo.\n{details}")
         else:
-            report.record(test_id, "FAIL", f"Problema com ngrok detectado.\n{details}")
+            report.record(test_id, "FAIL", f"Problema com cloudflare tunnel detectado.\n{details}")
 
     except Exception as e:
         report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
@@ -1096,7 +1108,7 @@ def test_11_manager(report: VerificationReport,
         # 2. Network traffic verification
         checks_network.append("[EXTERNAL NETWORK TRAFFIC]")
         checks_network.append("  - custom nodes executam Python arbitrário e podem fazer requests externos")
-        checks_network.append("  - ngrok cria exposição externa (túnel público)")
+        checks_network.append("  - cloudflare tunnel cria exposição externa (túnel público)")
         checks_network.append("  - não há egress control no ambiente Kaggle")
         checks_network.append("  - RISCO RESIDUAL: exfiltração por código de terceiros não é bloqueada")
         checks_network.append("  - Resultado: NOT VERIFIED (risco residual documentado)")
@@ -1529,7 +1541,7 @@ def run_all_tests(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     test_07_download(report, observed_during_download=observed_during_download)
     test_08_process(report, host, port)
     test_09_reuse(report, port=port, real_incompatible_process_tested=real_incompatible_process_tested)
-    test_10_ngrok(report)
+    test_10_cloudflare(report)
     test_11_manager(report, port)
     test_12_custom_nodes(report)
     test_13_node_alteration(report)

@@ -24,8 +24,6 @@ build/
 .env.*
 *.env
 kaggle.json
-ngrok.yml
-ngrok.yaml
 service_account*.json
 *_credentials.json
 *_key.json

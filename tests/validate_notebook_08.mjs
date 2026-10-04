@@ -27,9 +27,9 @@ const requiredMarkers = [
   "verify_custom_nodes_unchanged",
   "secure_cleanup",
   "final_filesystem_check",
-  // Manager e ngrok ativos em SECURE_MODE
+  // Manager e cloudflare ativos em SECURE_MODE
   "enable_manager=True",
-  "ENABLE_NGROK = True",
+  "ENABLE_CLOUDFLARE = True",
   "reuse_existing=False",
   // Invariantes e guardrails
   "assert_invariants",
@@ -113,8 +113,8 @@ if (
 }
 
 const setupSource = fs.readFileSync("scripts/comfyui_setup.py", "utf8");
-if (setupSource.indexOf("health_check(") > setupSource.indexOf("start_ngrok_tunnel")) {
-  throw new Error("ComfyUI health check must precede ngrok startup");
+if (setupSource.indexOf("health_check(") > setupSource.indexOf("start_cloudflare_tunnel")) {
+  throw new Error("ComfyUI health check must precede cloudflare tunnel startup");
 }
 if (!setupSource.includes('"--output-directory"') || !setupSource.includes("/output")) {
   throw new Error("ComfyUI output directory contract is incomplete");

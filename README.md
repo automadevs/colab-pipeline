@@ -151,8 +151,8 @@ python scripts/kaggle_upload.py   --model-name "lustifyNSFWCheckpoint_v10Krea2.s
 # Sync seletivo Kaggle Dataset → SSD Local (apenas modelos desejados)
 python scripts/kaggle_sync.py   --dataset "automamermaid/comfydocs"   --target-dir /kaggle/working/ComfyUI/models   --categories checkpoints loras vae
 
-# Setup ComfyUI (SSD Local) + Manager integrado + ngrok após health check
-python scripts/comfyui_setup.py   --comfyui-dir /kaggle/working/ComfyUI   --output-dir /kaggle/working/ComfyUI/output   --custom-nodes "cubiq/ComfyUI_essentials" "lbouaraba/comfyui-krea2edit"   --start --health-check --ngrok
+# Setup ComfyUI (SSD Local) + Manager integrado + cloudflare após health check
+python scripts/comfyui_setup.py   --comfyui-dir /kaggle/working/ComfyUI   --output-dir /kaggle/working/ComfyUI/output   --custom-nodes "cubiq/ComfyUI_essentials" "lbouaraba/comfyui-krea2edit"   --start --health-check --cloudflare
 
 # Detectar GPU
 python scripts/gpu_detect.py --recommend
@@ -181,12 +181,11 @@ python scripts/gpu_detect.py --recommend
 2. Ative **GPU** (Settings → Accelerator → GPU T4 x2 ou P100)
 3. Configure **Secrets** (ícone de chave):
    - `KAGGLE_USERNAME` + `KAGGLE_KEY` (para listar e baixar modelos do dataset)
-  - `NGROK_AUTHTOKEN`: token do ngrok (opcional, para URL pública)
 4. Execute `08_master_pipeline.ipynb` (o repositório será clonado automaticamente)
 
-### Ngrok e GPU
+### Cloudflare Tunnel e GPU
 
-O runtime instala `pyngrok` quando necessário, lê `NGROK_AUTHTOKEN` pelos Secrets/env sem usar `getpass`, executa `ngrok.kill()` antes de criar um túnel e só o inicia depois do health check do ComfyUI. Sem o Secret, o ComfyUI continua funcionando localmente.
+O runtime baixa o binário `cloudflared` (versão pinada, sha256 verificado) para `/tmp` quando necessário e sobe um quick tunnel gratuito (`*.trycloudflare.com`) — sem conta e sem token. O túnel só inicia depois do health check do ComfyUI; se o cloudflared não puder ser baixado/iniciado, o ComfyUI continua funcionando localmente. Credenciais de túnel nomeado (`TUNNEL_TOKEN`/`CLOUDFLARE_TUNNEL_TOKEN`), se presentes no ambiente, nunca são impressas nos logs.
 
 O Manager é o integrado ao ComfyUI: o setup instala `ComfyUI/manager_requirements.txt` e inicia com `--enable-manager`. `ComfyUI-Manager` não é clonado como custom node. A lista padrão contém somente `cubiq/ComfyUI_essentials` e `lbouaraba/comfyui-krea2edit`, com atualização idempotente.
 
@@ -235,14 +234,14 @@ embeddings/            # Textual inversions / embeddings
 - Parser de todas as GPUs e VRAM individual
 - `COMFYUI_CUDA_DEVICE`, comando de start, Manager, nodes e output local
 - Instalação/atualização idempotente do krea2edit
-- Redação do token ngrok e ordem `health → ngrok`
+- Redação de credenciais do túnel e ordem `health → cloudflare`
 - JSON e metadata dos notebooks, `git diff --check` e scans de secrets/paths
 
 ### Precisa ser testado no Kaggle
 
 - GPU T4x2 real (`gpu_count=2`), CUDA/driver e VRAM disponível
 - Instalação real do ComfyUI e `manager_requirements.txt`
-- Túnel ngrok real com o Secret `NGROK_AUTHTOKEN`
+- Túnel Cloudflare real (quick tunnel, sem secret)
 - Sync do Dataset
 
 ---
