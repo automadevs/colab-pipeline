@@ -214,6 +214,50 @@ class MasterPipelineTransactionalDownloadTests(unittest.TestCase):
         hub.assert_not_called()
         self.assertIn("Nenhuma alteração no dataset foi publicada.", output)
 
+    def test_main_threads_custom_types_into_publish(self):
+        """custom_models.json: declared_folders vai p/ coleta e custom_types p/ publicação."""
+        import kaggle_dataset_manager
+        from kaggle_dataset_manager import DatasetFile, DownloadOutcome, ResolutionOutcome
+
+        outcome = ResolutionOutcome(artifacts=self._artifacts(1), failures=[])
+        download_outcome = DownloadOutcome(
+            items=[DatasetFile("SEEDVR2/f1.safetensors", 1, "h1")],
+            failures=[],
+            resolved_count=1,
+        )
+
+        collected_kwargs: dict = {}
+
+        def fake_collect(**kwargs):
+            collected_kwargs.update(kwargs)
+            kwargs["custom_types_out"]["seedvr2"] = "SEEDVR2"
+            return ["/makedir SEEDVR2 hf://org/repo/f1.safetensors"]
+
+        with patch.dict(os.environ, {"CIVITAI_TOKEN": "tok", "HF_TOKEN": "hf"}, clear=False), \
+             patch.object(master_pipeline, "setup_repo"), \
+             patch.object(master_pipeline, "inspect_environment"), \
+             patch.object(master_pipeline, "ensure_kaggle_auth", return_value=True), \
+             patch.object(kaggle_dataset_manager, "get_secret", return_value="tok"), \
+             patch.object(kaggle_dataset_manager, "fetch_custom_models", return_value={"llm": "LLM"}) as fetch, \
+             patch.object(kaggle_dataset_manager, "collect_input_queue", side_effect=fake_collect), \
+             patch.object(kaggle_dataset_manager, "resolve_queue_metadata", return_value=outcome), \
+             patch.object(kaggle_dataset_manager, "queue_contains_checkpoint", return_value=False), \
+             patch.object(kaggle_dataset_manager, "classify_resolved_artifacts"), \
+             patch.object(kaggle_dataset_manager, "print_resolution_summary"), \
+             patch.object(kaggle_dataset_manager, "collect_dataset_edits", return_value=[]), \
+             patch.object(kaggle_dataset_manager, "download_resolved_queue", return_value=download_outcome), \
+             patch.object(kaggle_dataset_manager, "write_manifest"), \
+             patch.object(kaggle_dataset_manager, "publish_staged_state", return_value="ok") as publish:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = master_pipeline.main(["--dataset", "owner/nome"])
+
+        self.assertEqual(code, 0)
+        fetch.assert_called_once()
+        self.assertEqual(collected_kwargs["declared_folders"], {"llm"})
+        publish.assert_called_once()
+        self.assertEqual(publish.call_args.kwargs["custom_types"], {"seedvr2": "SEEDVR2"})
+
 
 if __name__ == "__main__":
     unittest.main()
