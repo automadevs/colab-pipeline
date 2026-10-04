@@ -9,9 +9,9 @@ GARANTIAS (fail-closed, não absolutas):
   LOGS    → /dev/shm/comfy_ui_logs    (tmpfs volátil)
   ARCHIVE → /dev/shm/comfy_ui_archive (tmpfs volátil)
 
-Manager e ngrok são PERMITIDOS em SECURE_MODE:
+Manager e Cloudflare Tunnel são PERMITIDOS em SECURE_MODE:
   - Manager roda com state/downloads/custom nodes em /dev/shm
-  - ngrok roda após health check, token via Kaggle Secrets
+  - cloudflared roda após health check (quick tunnel, sem token)
   - A segurança vem do isolamento de filesystem, não do bloqueio de funcionalidade
 
 Nenhuma imagem controlada pelo pipeline toca /kaggle/working.
@@ -20,10 +20,10 @@ reuse_existing=False é obrigatório em SECURE_MODE.
 
 LIMITES EXPLÍCITOS (fora do controle deste código):
   - Infraestrutura Kaggle / acesso privilegiado do provedor ao host.
-  - Vulnerabilidades em dependências externas (pyzipper, pyngrok, ComfyUI).
+  - Vulnerabilidades em dependências externas (pyzipper, cloudflared, ComfyUI).
   - Snapshots automáticos da plataforma Kaggle do working directory.
   - Custom nodes e código instalado pelo Manager executam Python arbitrário.
-  - ngrok cria exposição externa — não é uma barreira de segurança.
+  - Cloudflare Tunnel cria exposição externa — não é uma barreira de segurança.
   - Custom nodes podem fazer requests externos e acessar dados em memória.
 
 NÃO DECLARAR "segurança absoluta". Objetivo: prevenir persistência acidental
@@ -47,7 +47,6 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 DEFAULT_COMFYUI_DIR = Path("/kaggle/working/ComfyUI")
 DEFAULT_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
-DEFAULT_DRIVE_BASE = "Automa/ComfyUI"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8188
 ENV_CUDA_DEVICE = "COMFYUI_CUDA_DEVICE"
@@ -58,7 +57,7 @@ DEFAULT_CUDA_DEVICE = 0
 # ---------------------------------------------------------------------------
 # Quando True (padrão no Kaggle Seguro):
 #   - enable_manager PERMITIDO (rodando com isolamento de filesystem)
-#   - enable_ngrok PERMITIDO (rodando após health check)
+#   - enable_cloudflare PERMITIDO (rodando após health check)
 #   - reuse_existing forçado para False
 #   - todos os paths mutáveis (input, output, temp, user, logs) redirecionados para /dev/shm
 #   - escrita em /kaggle/working bloqueada exceto via secure_persistent_write()
@@ -2067,11 +2066,10 @@ def secure_cleanup(
     1. Limpa todos os dirs em /dev/shm (tmpfs): input, output, temp, user, logs, archive.
        Verifica que cada dir é tmpfs antes de limpar (fail-closed).
     2. Remove ZIPs em /dev/shm/comfy_ui_archive (limpeza parcial).
-    3. Apaga credenciais (gdrive_sa.json, rclone.conf).
-    4. Mata processo conhecido (comfyui_pid ou known_pids) — NUNCA mata PIDs arbitrários.
-    5. Faz GC.
-    6. Verifica /kaggle/working via final_filesystem_check.
-    7. Se raise_on_persistent=True e encontrar violações, levanta SecurityError.
+    3. Mata processo conhecido (comfyui_pid ou known_pids) — NUNCA mata PIDs arbitrários.
+    4. Faz GC.
+    5. Verifica /kaggle/working via final_filesystem_check.
+    6. Se raise_on_persistent=True e encontrar violações, levanta SecurityError.
 
     Deve ser chamada em try/finally — garante limpeza mesmo em exceção ou KeyboardInterrupt.
     """
@@ -2127,13 +2125,7 @@ def secure_cleanup(
             pass
         print(f"[CLEANUP] ✓ {d} limpo")
 
-    # 3. Limpar credenciais
-    try:
-        cleanup_gdrive_credentials()
-    except Exception as e:
-        print(f"[CLEANUP] WARN: falha ao limpar credenciais: {e}")
-
-    # 4. Matar processo conhecido apenas (nunca PIDs arbitrários)
+    # 3. Matar processo conhecido apenas (nunca PIDs arbitrários)
     pids_to_kill = []
     if comfyui_pid is not None:
         pids_to_kill.append(comfyui_pid)
@@ -2312,20 +2304,6 @@ def final_filesystem_check(
         "symlinks": symlink_found,
         "report": report,
     }
-
-
-# ---------------------------------------------------------------------------
-# Credential cleanup
-# ---------------------------------------------------------------------------
-
-def cleanup_gdrive_credentials() -> None:
-    """Apaga service account JSON e rclone config. Idempotente."""
-    for p in (Path("/root/gdrive_sa.json"), Path("/root/.config/rclone/rclone.conf")):
-        if p.exists():
-            safe_remove(p)
-            print(f"[SECURITY] Credencial removida: {p}")
-        else:
-            print(f"[INFO] Credencial já não existe: {p}")
 
 
 # ---------------------------------------------------------------------------
@@ -2738,7 +2716,6 @@ def setup_comfyui(
     input_dir=None,
     temp_dir=None,
     user_dir=None,
-    drive_base=DEFAULT_DRIVE_BASE,
     enable_manager: bool = True,
     additional_model_roots: Optional[List[Tuple[str, Path]]] = None,
     strict_allowlist: bool = True,
@@ -2748,7 +2725,7 @@ def setup_comfyui(
     Instala/atualiza ComfyUI e configura custom nodes.
     
     SECURE_MODE (Hardened Architecture):
-      - Manager e ngrok são permitidos.
+      - Manager e Cloudflare Tunnel são permitidos.
       - I/O redirecionado para /dev/shm.
     """
     effective_secure = secure_mode if secure_mode is not None else get_secure_mode()
@@ -3030,24 +3007,24 @@ def start_comfyui_runtime(
     extra_args=None,
     cuda_device: Optional[int] = None,
     enable_manager: bool = False,
-    enable_ngrok: bool = False,
+    enable_cloudflare: bool = False,
     health_timeout: int = 90,
     health_host: str = "127.0.0.1",
     reuse_existing: bool = False,
     secure_mode: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
-    Ordem obrigatória: start → health → ngrok.
+    Ordem obrigatória: start → health → cloudflare.
     SECURE_MODE:
       - Manager PERMITIDO (com isolamento de filesystem — state/downloads em /dev/shm)
-      - ngrok PERMITIDO (após health check, token via Kaggle Secrets)
+      - Cloudflare Tunnel PERMITIDO (após health check; quick tunnel, sem token)
       - reuse_existing forçado False
       - todos os paths mutáveis em /dev/shm
     """
     effective_secure = secure_mode if secure_mode is not None else get_secure_mode()
 
     # SECURE_MODE: apenas reuse_existing é forçado False.
-    # Manager e ngrok são permitidos — a segurança vem do isolamento de filesystem,
+    # Manager e cloudflare são permitidos — a segurança vem do isolamento de filesystem,
     # não do bloqueio de funcionalidade.
     if effective_secure:
         if reuse_existing:
@@ -3073,7 +3050,7 @@ def start_comfyui_runtime(
         "ok": False, "proc": None, "public_url": None,
         "local_url": f"http://{health_host}:{port}",
         "log_path": str(log_path), "health": False,
-        "ngrok_started": False, "reused_existing": False, "pid": None,
+        "cloudflare_started": False, "reused_existing": False, "pid": None,
         "secure_mode": effective_secure,
     }
 
@@ -3124,26 +3101,26 @@ def start_comfyui_runtime(
             return result
         result["ok"] = True
 
-    if enable_ngrok:
+    if enable_cloudflare:
         try:
-            from ngrok_tunnel import start_ngrok_tunnel
-            public_url = start_ngrok_tunnel(port=port)
-            result.update({"public_url": public_url, "ngrok_started": True})
+            from cloudflare_tunnel import start_cloudflare_tunnel
+            public_url = start_cloudflare_tunnel(port=port)
+            result.update({"public_url": public_url, "cloudflare_started": True})
         except Exception as exc:
             msg = str(exc)
             try:
-                from ngrok_tunnel import redact_secrets
+                from cloudflare_tunnel import redact_secrets
                 msg = redact_secrets(msg)
             except Exception:
                 pass
-            print(f"[WARN] ngrok não iniciado: {msg}")
+            print(f"[WARN] cloudflare tunnel não iniciado: {msg}")
     else:
-        print("[INFO] ngrok desabilitado. Acesso local: 127.0.0.1")
+        print("[INFO] cloudflare tunnel desabilitado. Acesso local: 127.0.0.1")
 
     print("=" * 60)
     print(f"COMFYUI READY | SECURE_MODE={effective_secure}")
     print(f"Local  : {result['local_url']}")
-    print(f"Public : {result['public_url'] or '(ngrok OFF)'}")
+    print(f"Public : {result['public_url'] or '(cloudflare OFF)'}")
     print(f"INPUT  : {input_dir} | OUTPUT : {output_dir} | TEMP : {temp_dir}")
     print(f"PID    : {result['pid']}")
     print("=" * 60)
@@ -3312,12 +3289,11 @@ def main():
     parser.add_argument("--output-dir", help="Deve estar em /dev/shm/")
     parser.add_argument("--input-dir", help="Deve estar em /dev/shm/")
     parser.add_argument("--temp-dir", help="Deve estar em /dev/shm/")
-    parser.add_argument("--drive-base", default=DEFAULT_DRIVE_BASE)
     parser.add_argument("--start", action="store_true")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--health-check", action="store_true")
-    parser.add_argument("--ngrok", action="store_true")
+    parser.add_argument("--cloudflare", action="store_true")
     parser.add_argument("--cuda-device", type=int, default=None)
     parser.add_argument("--no-manager", action="store_true")
     parser.add_argument("--reuse-existing", action="store_true")
@@ -3339,14 +3315,14 @@ def main():
         Path(args.comfyui_dir), args.repo_url, nodes,
         Path(args.models_dir) if args.models_dir else None,
         output_dir=output_dir, input_dir=input_dir, temp_dir=temp_dir,
-        drive_base=args.drive_base, enable_manager=not args.no_manager,
+        enable_manager=not args.no_manager,
     )
     if args.start:
         runtime = start_comfyui_runtime(
             comfyui_dir=comfyui, host=args.host, port=args.port,
             output_dir=output_dir, input_dir=input_dir, temp_dir=temp_dir,
             enable_manager=not args.no_manager,
-            enable_ngrok=args.ngrok,
+            enable_cloudflare=args.cloudflare,
             health_timeout=90,
             reuse_existing=args.reuse_existing,
         )
@@ -3359,8 +3335,8 @@ def main():
             if runtime["proc"]:
                 runtime["proc"].terminate()
             try:
-                from ngrok_tunnel import stop_ngrok_tunnel
-                stop_ngrok_tunnel()
+                from cloudflare_tunnel import stop_cloudflare_tunnel
+                stop_cloudflare_tunnel()
             except Exception:
                 pass
 

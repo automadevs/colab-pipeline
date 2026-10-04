@@ -352,9 +352,28 @@ def validate_civitai_url(value: str) -> Optional[str]:
     return None
 
 
+# Prefixo de comando copiado da CLI/interface do Hugging Face
+# ("hf download hf://org/repo/arquivo"). Case-insensitive apenas no comando;
+# o case do restante da string é preservado.
+HF_DOWNLOAD_COMMAND = re.compile(r"^hf\s+download\s+", re.IGNORECASE)
+
+
+def strip_hf_download_command(value: str) -> str:
+    """Remove o prefixo ``hf download `` (CLI do HF) de uma entrada, se presente.
+
+    Entradas sem o prefixo são devolvidas intactas (com strip aplicado).
+    Idempotente: após a remoção o resultado não volta a casar com o padrão.
+    """
+    return HF_DOWNLOAD_COMMAND.sub("", str(value or "").strip(), count=1)
+
+
 def is_hf_input(value: str) -> bool:
-    """Detecta se a entrada é um Hugging Face repo/arquivo: 'hf:' prefixo ou URL huggingface.co."""
-    value = str(value or "").strip().lower()
+    """Detecta se a entrada é um Hugging Face repo/arquivo: 'hf:' prefixo ou URL huggingface.co.
+
+    O prefixo de comando "hf download " (copiado da CLI do HF) é normalizado
+    antes da detecção — ambos os formatos roteiam de forma idêntica.
+    """
+    value = strip_hf_download_command(value).lower()
     if value.startswith("hf:"):
         return True
     parsed = urllib.parse.urlparse(value)
@@ -425,6 +444,8 @@ def parse_hf_input(value: str) -> tuple[str, Optional[str], str]:
 
     Formatos (item 4; 'hf://NÃO' é scheme HTTP, só um atalho do prefixo 'hf:'):
     - hf:org/repo ou hf:org/repo/path/to/arquivo.safetensors (hf:// também aceito)
+    - hf download hf://org/repo[/path/to/arquivo] (prefixo de comando da CLI,
+      normalizado antes do parsing)
     - https://huggingface.co/org/repo/resolve/main/arquivo.safetensors
     - https://huggingface.co/org/repo/blob/main/arquivo.safetensors
 
@@ -432,7 +453,7 @@ def parse_hf_input(value: str) -> tuple[str, Optional[str], str]:
     arquivo, normaliza/valida o caminho (traversal/absoluto/extensão) via
     normalize_hf_file_path.
     """
-    value = str(value or "").strip()
+    value = strip_hf_download_command(value)
 
     if value.lower().startswith("hf:"):
         # hf:org/repo/path/... (também aceita hf://org/repo como atalho de URL)
@@ -1396,7 +1417,9 @@ def parse_input(value: str, index: int = 0) -> ParsedInput:
     (urn:air:/URL civitai.com). 'done' é exclusivamente o marcador de fim da
     coleta (nunca vira artefato); entradas não reconhecidas são erro. Um prefixo
     opcional "/makedir <PASTA>" define a categoria ad-hoc ANTES do roteamento e é
-    removido para a detecção (a pasta fica em ``custom_category``).
+    removido para a detecção (a pasta fica em ``custom_category``). O prefixo de
+    comando "hf download " (CLI do HF) é normalizado DEPOIS do /makedir e ANTES
+    do roteamento — "hf download hf://org/repo" equivale a "hf://org/repo".
     """
     value = str(value or "").strip()
     if not value:
@@ -1417,6 +1440,7 @@ def parse_input(value: str, index: int = 0) -> ParsedInput:
             )
         custom_category = validate_custom_category(folder)
         resource_input = remainder
+    resource_input = strip_hf_download_command(resource_input)
     if is_hf_input(resource_input):
         repo_id, file_path, revision = parse_hf_input(resource_input)
         return ParsedInput(

@@ -143,12 +143,11 @@ class VerificationReport:
             ("07_DOWNLOAD", "Download"),
             ("08_PROCESS", "Process"),
             ("09_REUSE", "Reuse Detection"),
-            ("10_NGROK", "ngrok"),
+            ("10_CLOUDFLARE", "Cloudflare Tunnel"),
             ("11_MANAGER_ACTIVE", "Manager Active"),
             ("11_NETWORK_TRAFFIC", "External Network Traffic"),
             ("12_CUSTOM_NODES", "Custom Node Hashing"),
             ("13_NODE_ALTERATION", "Node Alteration"),
-            ("14_DRIVE_CREDENTIALS", "Drive Credential Cleanup"),
             ("15_EXCEPTION_CLEANUP", "Exception Cleanup"),
             ("16_FINAL_SCAN", "Final Filesystem Scan"),
             ("17_PERSISTENCE", "Persistence Between Sessions"),
@@ -966,9 +965,9 @@ def test_09_reuse(report: VerificationReport,
         report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
 
 
-def test_10_ngrok(report: VerificationReport):
-    """Teste 10: ngrok em SECURE_MODE — deve estar ATIVO e funcional (após health check)."""
-    test_id = "10_NGROK"
+def test_10_cloudflare(report: VerificationReport):
+    """Teste 10: Cloudflare Tunnel em SECURE_MODE — deve estar ATIVO (após health check)."""
+    test_id = "10_CLOUDFLARE"
     try:
         scripts_dir = KAGGLE_WORKING / "colab-pipeline" / "scripts"
         if scripts_dir.exists() and str(scripts_dir) not in sys.path:
@@ -981,50 +980,63 @@ def test_10_ngrok(report: VerificationReport):
 
         if not get_secure_mode():
             report.record(test_id, "NOT VERIFIED",
-                          "SECURE_MODE não está ativo — teste ngrok não aplicável")
+                          "SECURE_MODE não está ativo — teste cloudflare não aplicável")
             return
 
-        # Em SECURE_MODE, ngrok é PERMITIDO.
-        # Verificar se há túneis ativos (pipeline já deve ter iniciado ngrok)
+        # Em SECURE_MODE, cloudflare tunnel é PERMITIDO.
+        # Verificar se há túnel ativo (pipeline já deve ter iniciado cloudflared)
         tunnels = []
         try:
-            from pyngrok import ngrok
-            tunnels = list(ngrok.get_tunnels())
+            from cloudflare_tunnel import get_active_tunnels
+            tunnels = list(get_active_tunnels())
         except Exception:
             pass
+        if not tunnels:
+            # Fallback: kernel pode ser outro processo — procura cloudflared no OS
+            try:
+                proc = subprocess.run(
+                    ["pgrep", "-f", "cloudflared tunnel"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                tunnels = proc.stdout.split() if proc.returncode == 0 else []
+            except Exception:
+                pass
 
-        # Verificar que o token não aparece em logs
+        # Verificar que credenciais de túnel nomeado (se presentes) não vazam em logs
         token_leaked = False
-        token_value = os.environ.get("NGROK_AUTHTOKEN", "")
-        if token_value:
-            log_path = SHM_LOGS / "comfyui.log" if SHM_LOGS.exists() else None
-            if log_path and log_path.exists():
-                try:
-                    log_content = log_path.read_text(encoding="utf-8", errors="replace")
-                    if token_value in log_content:
+        token_values = [
+            os.environ.get(name, "")
+            for name in ("TUNNEL_TOKEN", "CLOUDFLARE_TUNNEL_TOKEN")
+        ]
+        log_path = SHM_LOGS / "comfyui.log" if SHM_LOGS.exists() else None
+        if log_path and log_path.exists():
+            try:
+                log_content = log_path.read_text(encoding="utf-8", errors="replace")
+                for token_value in token_values:
+                    if token_value and token_value in log_content:
                         token_leaked = True
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
-        # Verificar que nenhum arquivo do ngrok foi gravado em /kaggle/working
-        ngrok_files_in_working = []
+        # Verificar que nenhum arquivo do cloudflared foi gravado em /kaggle/working
+        cloudflare_files_in_working = []
         if KAGGLE_WORKING.exists():
             for item in KAGGLE_WORKING.rglob("*"):
-                if item.is_file() and "ngrok" in item.name.lower():
-                    ngrok_files_in_working.append(str(item))
+                if item.is_file() and "cloudflared" in item.name.lower():
+                    cloudflare_files_in_working.append(str(item))
 
         details = (
-            f"Túneis ngrok ativos: {len(tunnels)} {'✓' if len(tunnels) > 0 else '✗ (ngrok pode não ter sido iniciado)'}\n"
+            f"Túneis cloudflare ativos: {len(tunnels)} {'✓' if len(tunnels) > 0 else '✗ (cloudflared pode não ter sido iniciado)'}\n"
             f"Token leaked nos logs: {'SIM ✗' if token_leaked else 'NÃO ✓'}\n"
-            f"Arquivos ngrok em /kaggle/working: {len(ngrok_files_in_working)} {'✓' if len(ngrok_files_in_working) == 0 else '✗'}\n"
+            f"Arquivos cloudflared em /kaggle/working: {len(cloudflare_files_in_working)} {'✓' if len(cloudflare_files_in_working) == 0 else '✗'}\n"
         )
 
-        if len(tunnels) > 0 and not token_leaked and len(ngrok_files_in_working) == 0:
+        if len(tunnels) > 0 and not token_leaked and len(cloudflare_files_in_working) == 0:
             report.record(test_id, "PASS", details)
         elif len(tunnels) == 0:
-            report.record(test_id, "NOT VERIFIED", f"ngrok não parece estar ativo.\n{details}")
+            report.record(test_id, "NOT VERIFIED", f"cloudflared não parece estar ativo.\n{details}")
         else:
-            report.record(test_id, "FAIL", f"Problema com ngrok detectado.\n{details}")
+            report.record(test_id, "FAIL", f"Problema com cloudflare tunnel detectado.\n{details}")
 
     except Exception as e:
         report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
@@ -1096,7 +1108,7 @@ def test_11_manager(report: VerificationReport,
         # 2. Network traffic verification
         checks_network.append("[EXTERNAL NETWORK TRAFFIC]")
         checks_network.append("  - custom nodes executam Python arbitrário e podem fazer requests externos")
-        checks_network.append("  - ngrok cria exposição externa (túnel público)")
+        checks_network.append("  - cloudflare tunnel cria exposição externa (túnel público)")
         checks_network.append("  - não há egress control no ambiente Kaggle")
         checks_network.append("  - RISCO RESIDUAL: exfiltração por código de terceiros não é bloqueada")
         checks_network.append("  - Resultado: NOT VERIFIED (risco residual documentado)")
@@ -1282,75 +1294,6 @@ def test_13_node_alteration(report: VerificationReport):
         test_node_dir = SHM_TEMP / "_security_test_node"
         if test_node_dir.exists():
             shutil.rmtree(test_node_dir, ignore_errors=True)
-        report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
-
-
-def test_14_drive_credentials(report: VerificationReport):
-    """Teste 14: Cleanup de credenciais do Drive."""
-    test_id = "14_DRIVE_CREDENTIALS"
-    try:
-        scripts_dir = KAGGLE_WORKING / "colab-pipeline" / "scripts"
-        if scripts_dir.exists() and str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
-        scripts_dir2 = KAGGLE_WORKING / "scripts"
-        if scripts_dir2.exists() and str(scripts_dir2) not in sys.path:
-            sys.path.insert(0, str(scripts_dir2))
-
-        from comfyui_setup import cleanup_gdrive_credentials
-
-        cred_paths = [
-            Path("/root/gdrive_sa.json"),
-            Path("/root/.config/rclone/rclone.conf"),
-        ]
-
-        # Verificar estado atual
-        checks = []
-        for p in cred_paths:
-            exists_before = p.exists()
-            checks.append(f"Antes cleanup — {p.name}: {'existe' if exists_before else 'ausente'}")
-
-        # Executar cleanup
-        cleanup_gdrive_credentials()
-
-        # Verificar após cleanup
-        any_remaining = False
-        for p in cred_paths:
-            exists_after = p.exists()
-            if exists_after:
-                any_remaining = True
-            checks.append(f"Após cleanup — {p.name}: {'EXISTE ✗' if exists_after else 'removido ✓'}")
-
-        # Testar cleanup após exceção
-        # Criar credencial temporária de teste para verificar
-        test_sa = Path("/root/gdrive_sa.json")
-        try:
-            test_sa.parent.mkdir(parents=True, exist_ok=True)
-            test_sa.write_text('{"type": "service_account", "test": true}')
-            os.chmod(test_sa, 0o600)
-            checks.append(f"Credencial teste criada: {test_sa}")
-
-            # Simular exceção e cleanup no finally
-            try:
-                raise RuntimeError("Exceção simulada para teste de cleanup")
-            except RuntimeError:
-                pass
-            finally:
-                cleanup_gdrive_credentials()
-
-            exists_after_exception = test_sa.exists()
-            checks.append(
-                f"Após exceção + cleanup — gdrive_sa.json: "
-                f"{'EXISTE ✗' if exists_after_exception else 'removido ✓'}"
-            )
-            if exists_after_exception:
-                any_remaining = True
-        except PermissionError:
-            checks.append("Sem permissão para criar credencial de teste em /root/")
-
-        details = "\n".join(checks)
-        report.record(test_id, "PASS" if not any_remaining else "FAIL", details)
-
-    except Exception as e:
         report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
 
 
@@ -1598,11 +1541,10 @@ def run_all_tests(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     test_07_download(report, observed_during_download=observed_during_download)
     test_08_process(report, host, port)
     test_09_reuse(report, port=port, real_incompatible_process_tested=real_incompatible_process_tested)
-    test_10_ngrok(report)
+    test_10_cloudflare(report)
     test_11_manager(report, port)
     test_12_custom_nodes(report)
     test_13_node_alteration(report)
-    test_14_drive_credentials(report)
     test_15_exception_cleanup(report)
     test_16_final_scan(report)
     test_17_persistence(report)

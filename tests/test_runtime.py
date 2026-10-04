@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 import comfyui_setup
 import gpu_detect
-import ngrok_tunnel
+import cloudflare_tunnel
 
 ON_LINUX = sys.platform.startswith("linux")
 HAS_DEV_SHM = ON_LINUX and Path("/dev/shm").exists()
@@ -107,11 +107,11 @@ class RuntimeContractTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 comfyui_setup.install_or_update_custom_node(Path(tmp), "lbouaraba/comfyui-krea2edit")
 
-    def test_runtime_starts_ngrok_only_after_health(self):
+    def test_runtime_starts_cloudflare_only_after_health(self):
         events = []
         process = MagicMock(pid=123)
-        fake_ngrok = types.ModuleType("ngrok_tunnel")
-        fake_ngrok.start_ngrok_tunnel = lambda port: events.append("ngrok") or "https://example.ngrok.app"
+        fake_cloud = types.ModuleType("cloudflare_tunnel")
+        fake_cloud.start_cloudflare_tunnel = lambda port: events.append("cloudflare") or "https://example.trycloudflare.com"
 
         comfyui_setup.set_secure_mode(False, _test_override=True)
         try:
@@ -121,59 +121,78 @@ class RuntimeContractTests(unittest.TestCase):
             def health_mock(*args, **kwargs):
                 events.append("health")
                 return health_results.pop(0)
-            
+
             with patch.object(comfyui_setup, "start_comfyui",
                                side_effect=lambda **_: events.append("start") or process), \
                  patch.object(comfyui_setup, "health_check", side_effect=health_mock), \
                  patch.object(comfyui_setup, "find_existing_comfyui_pid", return_value=None), \
-                 patch.dict(sys.modules, {"ngrok_tunnel": fake_ngrok}):
+                 patch.dict(sys.modules, {"cloudflare_tunnel": fake_cloud}):
                 result = comfyui_setup.start_comfyui_runtime(
                     comfyui_dir=Path(tempfile.mkdtemp()),
-                    enable_ngrok=True, reuse_existing=False, secure_mode=False,
+                    enable_cloudflare=True, reuse_existing=False, secure_mode=False,
                 )
         finally:
             comfyui_setup.set_secure_mode(True, _test_override=True)
 
-        # Ordem real: health_check (porta livre) -> start -> health_check (pós-start) -> ngrok
-        self.assertEqual(events, ["health", "start", "health", "ngrok"])
-        self.assertTrue(result["ngrok_started"])
+        # Ordem real: health_check (porta livre) -> start -> health_check (pós-start) -> cloudflare
+        self.assertEqual(events, ["health", "start", "health", "cloudflare"])
+        self.assertTrue(result["cloudflare_started"])
 
-    def test_failed_health_does_not_start_ngrok(self):
-        fake_ngrok = types.ModuleType("ngrok_tunnel")
-        fake_ngrok.start_ngrok_tunnel = MagicMock()
+    def test_failed_health_does_not_start_cloudflare(self):
+        fake_cloud = types.ModuleType("cloudflare_tunnel")
+        fake_cloud.start_cloudflare_tunnel = MagicMock()
         process = MagicMock(pid=123)
         comfyui_setup.set_secure_mode(False, _test_override=True)
         try:
             with patch.object(comfyui_setup, "start_comfyui", return_value=process), \
                  patch.object(comfyui_setup, "health_check", return_value=False), \
                  patch.object(comfyui_setup, "find_existing_comfyui_pid", return_value=None), \
-                 patch.dict(sys.modules, {"ngrok_tunnel": fake_ngrok}):
+                 patch.dict(sys.modules, {"cloudflare_tunnel": fake_cloud}):
                 result = comfyui_setup.start_comfyui_runtime(
                     comfyui_dir=Path(tempfile.mkdtemp()),
-                    enable_ngrok=True, health_timeout=1, reuse_existing=False, secure_mode=False,
+                    enable_cloudflare=True, health_timeout=1, reuse_existing=False, secure_mode=False,
                 )
         finally:
             comfyui_setup.set_secure_mode(True, _test_override=True)
 
         self.assertFalse(result["health"])
-        fake_ngrok.start_ngrok_tunnel.assert_not_called()
+        fake_cloud.start_cloudflare_tunnel.assert_not_called()
 
-    def test_ngrok_token_not_logged(self):
+    def test_cloudflare_token_not_logged(self):
         token = "secret-token-value"
-        calls = []
-        fake_ngrok_api = types.SimpleNamespace(
-            set_auth_token=lambda v: calls.append(("auth", v)),
-            kill=lambda: calls.append(("kill",)),
-            connect=lambda **kw: calls.append(("connect", kw))
-                or types.SimpleNamespace(public_url="http://x.ngrok.app"),
-        )
-        fake_pyngrok = types.ModuleType("pyngrok")
-        fake_pyngrok.ngrok = fake_ngrok_api
-        with patch.dict(sys.modules, {"pyngrok": fake_pyngrok}), \
+        fake_proc = MagicMock()
+        fake_proc.stderr = io.StringIO(f"2026 INF auth failed for {token}\n")
+        fake_proc.poll.return_value = 1
+        with patch.object(cloudflare_tunnel, "ensure_cloudflared_installed",
+                          return_value="/fake/cloudflared"), \
+             patch.object(cloudflare_tunnel.subprocess, "Popen", return_value=fake_proc), \
              patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            url = ngrok_tunnel.start_ngrok_tunnel(authtoken=token)
-        self.assertEqual(url, "https://x.ngrok.app")
+            with self.assertRaises(RuntimeError) as ctx:
+                cloudflare_tunnel.start_cloudflare_tunnel(authtoken=token)
+        self.assertNotIn(token, str(ctx.exception))
         self.assertNotIn(token, stdout.getvalue())
+        self.assertIn("***REDACTED***", str(ctx.exception))
+
+    def test_cloudflare_start_parses_public_url(self):
+        fake_proc = MagicMock()
+        fake_proc.stderr = io.StringIO(
+            "2026 INF Starting tunnel tunnelID=abc\n"
+            "2026 INF +-------------------------------------------------------------+\n"
+            "2026 INF |  https://foo-bar-baz.trycloudflare.com                     |\n"
+        )
+        fake_proc.poll.return_value = None
+        try:
+            with patch.object(cloudflare_tunnel, "ensure_cloudflared_installed",
+                              return_value="/fake/cloudflared"), \
+                 patch.object(cloudflare_tunnel.subprocess, "Popen",
+                              return_value=fake_proc) as popen_mock:
+                url = cloudflare_tunnel.start_cloudflare_tunnel(port=8188)
+            self.assertEqual(url, "https://foo-bar-baz.trycloudflare.com")
+            cmd = popen_mock.call_args.args[0]
+            self.assertIn("--no-autoupdate", cmd)
+            self.assertIn("http://127.0.0.1:8188", cmd)
+        finally:
+            cloudflare_tunnel._CLOUDFLARED_PROC = None
 
     def test_notebooks_have_language_metadata_and_ids(self):
         for nb in Path(__file__).parents[1].glob("**/*.ipynb"):
@@ -344,7 +363,7 @@ class TestD_ProcessReuseValidation(unittest.TestCase):
                  patch.object(comfyui_setup, "provision_shm_dirs"):
                 comfyui_setup.start_comfyui_runtime(
                     comfyui_dir=Path(tempfile.mkdtemp()),
-                    reuse_existing=True, enable_ngrok=False, secure_mode=False,
+                    reuse_existing=True, enable_cloudflare=False, secure_mode=False,
                 )
         finally:
             comfyui_setup.set_secure_mode(True, _test_override=True)
@@ -840,18 +859,18 @@ class TestK_CustomNodeAllowlist(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# L — ngrok desabilitado por padrão
+# L — cloudflare desabilitado por padrão
 # ---------------------------------------------------------------------------
 
-class TestL_NgrokDisabledByDefault(unittest.TestCase):
-    def test_enable_ngrok_false_by_default(self):
+class TestL_CloudflareDisabledByDefault(unittest.TestCase):
+    def test_enable_cloudflare_false_by_default(self):
         import inspect
         sig = inspect.signature(comfyui_setup.start_comfyui_runtime)
-        self.assertFalse(sig.parameters["enable_ngrok"].default)
+        self.assertFalse(sig.parameters["enable_cloudflare"].default)
 
-    def test_ngrok_not_started_when_disabled(self):
-        fake_ngrok = types.ModuleType("ngrok_tunnel")
-        fake_ngrok.start_ngrok_tunnel = MagicMock()
+    def test_cloudflare_not_started_when_disabled(self):
+        fake_cloud = types.ModuleType("cloudflare_tunnel")
+        fake_cloud.start_cloudflare_tunnel = MagicMock()
         process = MagicMock(pid=123)
         comfyui_setup.set_secure_mode(False, _test_override=True)
         try:
@@ -859,17 +878,17 @@ class TestL_NgrokDisabledByDefault(unittest.TestCase):
                  patch.object(comfyui_setup, "health_check", side_effect=[False, True]), \
                  patch.object(comfyui_setup, "find_existing_comfyui_pid", return_value=None), \
                  patch.object(comfyui_setup, "provision_shm_dirs"), \
-                 patch.dict(sys.modules, {"ngrok_tunnel": fake_ngrok}):
+                 patch.dict(sys.modules, {"cloudflare_tunnel": fake_cloud}):
                 result = comfyui_setup.start_comfyui_runtime(
                     comfyui_dir=Path(tempfile.mkdtemp()),
-                    enable_ngrok=False, reuse_existing=False, secure_mode=False,
+                    enable_cloudflare=False, reuse_existing=False, secure_mode=False,
                 )
         finally:
             comfyui_setup.set_secure_mode(True, _test_override=True)
 
-        self.assertFalse(result["ngrok_started"])
+        self.assertFalse(result["cloudflare_started"])
         self.assertIsNone(result["public_url"])
-        fake_ngrok.start_ngrok_tunnel.assert_not_called()
+        fake_cloud.start_cloudflare_tunnel.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -898,23 +917,23 @@ class TestSecureMode(unittest.TestCase):
         self.assertIn("--enable-manager", flat_cmd)
 
     @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
-    def test_secure_mode_allows_ngrok(self):
-        """Em SECURE_MODE, enable_ngrok=True NÃO deve levantar SecurityError."""
+    def test_secure_mode_allows_cloudflare(self):
+        """Em SECURE_MODE, enable_cloudflare=True NÃO deve levantar SecurityError."""
         process = MagicMock(pid=123)
-        fake_ngrok = types.ModuleType("ngrok_tunnel")
-        fake_ngrok.start_ngrok_tunnel = lambda port: "https://example.ngrok.app"
+        fake_cloud = types.ModuleType("cloudflare_tunnel")
+        fake_cloud.start_cloudflare_tunnel = lambda port: "https://example.trycloudflare.com"
         with patch.object(comfyui_setup, "start_comfyui", return_value=process), \
              patch.object(comfyui_setup, "health_check", return_value=True), \
              patch.object(comfyui_setup, "find_existing_comfyui_pid", return_value=None), \
              patch.object(comfyui_setup, "provision_shm_dirs"), \
-             patch.dict(sys.modules, {"ngrok_tunnel": fake_ngrok}):
+             patch.dict(sys.modules, {"cloudflare_tunnel": fake_cloud}):
             result = comfyui_setup.start_comfyui_runtime(
                 comfyui_dir=Path(tempfile.mkdtemp()),
-                enable_ngrok=True,
+                enable_cloudflare=True,
                 reuse_existing=False,
                 secure_mode=True,
             )
-        self.assertTrue(result["ngrok_started"])
+        self.assertTrue(result["cloudflare_started"])
         self.assertIsNotNone(result["public_url"])
 
     @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
@@ -929,7 +948,7 @@ class TestSecureMode(unittest.TestCase):
              patch.object(comfyui_setup, "provision_shm_dirs"):
             comfyui_setup.start_comfyui_runtime(
                 comfyui_dir=Path(tempfile.mkdtemp()),
-                enable_ngrok=False,
+                enable_cloudflare=False,
                 reuse_existing=True,  # deve ser ignorado
                 secure_mode=True,
             )
@@ -1087,10 +1106,10 @@ class TestM_FilesystemGuardrails(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# N — Teste de processo com Manager e ngrok ativos
+# N — Teste de processo com Manager e cloudflare ativos
 # ---------------------------------------------------------------------------
 
-class TestN_ManagerNgrokActive(unittest.TestCase):
+class TestN_ManagerCloudflareActive(unittest.TestCase):
     @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
     def test_manager_enabled_in_cmd_when_requested(self):
         """--enable-manager deve estar no cmd quando enable_manager=True"""
@@ -1111,12 +1130,12 @@ class TestN_ManagerNgrokActive(unittest.TestCase):
         self.assertIn("--enable-manager", flat_cmd)
 
     @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
-    def test_ngrok_starts_after_health_in_secure_mode(self):
-        """Em SECURE_MODE, ngrok deve iniciar após health check"""
+    def test_cloudflare_starts_after_health_in_secure_mode(self):
+        """Em SECURE_MODE, cloudflare deve iniciar após health check"""
         events = []
         process = MagicMock(pid=123)
-        fake_ngrok = types.ModuleType("ngrok_tunnel")
-        fake_ngrok.start_ngrok_tunnel = lambda port: events.append("ngrok") or "https://example.ngrok.app"
+        fake_cloud = types.ModuleType("cloudflare_tunnel")
+        fake_cloud.start_cloudflare_tunnel = lambda port: events.append("cloudflare") or "https://example.trycloudflare.com"
 
         health_results = [False, True]
         def health_mock(*args, **kwargs):
@@ -1128,34 +1147,34 @@ class TestN_ManagerNgrokActive(unittest.TestCase):
              patch.object(comfyui_setup, "health_check", side_effect=health_mock), \
              patch.object(comfyui_setup, "find_existing_comfyui_pid", return_value=None), \
              patch.object(comfyui_setup, "provision_shm_dirs"), \
-             patch.dict(sys.modules, {"ngrok_tunnel": fake_ngrok}):
+             patch.dict(sys.modules, {"cloudflare_tunnel": fake_cloud}):
             result = comfyui_setup.start_comfyui_runtime(
                 comfyui_dir=Path(tempfile.mkdtemp()),
-                enable_ngrok=True, reuse_existing=False, secure_mode=True,
+                enable_cloudflare=True, reuse_existing=False, secure_mode=True,
             )
 
-        self.assertEqual(events, ["health", "start", "health", "ngrok"])
-        self.assertTrue(result["ngrok_started"])
+        self.assertEqual(events, ["health", "start", "health", "cloudflare"])
+        self.assertTrue(result["cloudflare_started"])
         self.assertTrue(result["secure_mode"])
 
     @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
-    def test_failed_health_does_not_start_ngrok_in_secure_mode(self):
-        """Em SECURE_MODE, health check falhando não deve iniciar ngrok"""
-        fake_ngrok = types.ModuleType("ngrok_tunnel")
-        fake_ngrok.start_ngrok_tunnel = MagicMock()
+    def test_failed_health_does_not_start_cloudflare_in_secure_mode(self):
+        """Em SECURE_MODE, health check falhando não deve iniciar cloudflare"""
+        fake_cloud = types.ModuleType("cloudflare_tunnel")
+        fake_cloud.start_cloudflare_tunnel = MagicMock()
         process = MagicMock(pid=123)
         with patch.object(comfyui_setup, "start_comfyui", return_value=process), \
              patch.object(comfyui_setup, "health_check", return_value=False), \
              patch.object(comfyui_setup, "find_existing_comfyui_pid", return_value=None), \
              patch.object(comfyui_setup, "provision_shm_dirs"), \
-             patch.dict(sys.modules, {"ngrok_tunnel": fake_ngrok}):
+             patch.dict(sys.modules, {"cloudflare_tunnel": fake_cloud}):
             result = comfyui_setup.start_comfyui_runtime(
                 comfyui_dir=Path(tempfile.mkdtemp()),
-                enable_ngrok=True, health_timeout=1, reuse_existing=False, secure_mode=True,
+                enable_cloudflare=True, health_timeout=1, reuse_existing=False, secure_mode=True,
             )
 
         self.assertFalse(result["health"])
-        fake_ngrok.start_ngrok_tunnel.assert_not_called()
+        fake_cloud.start_cloudflare_tunnel.assert_not_called()
 
     @unittest.skipIf(sys.platform.startswith("win32"), "Requer /dev/shm Linux")
     def test_user_directory_in_shm(self):

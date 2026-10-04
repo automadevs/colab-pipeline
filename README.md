@@ -19,20 +19,20 @@ Arquitetura definitiva para transferência e execução de modelos ComfyUI.
                                                 └─────────────────────┘
                                                          │
                                                          ▼
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│   GOOGLE DRIVE  │◀───▶│  KAGGLE NOTEBOOK │◀───▶│    KAGGLE SSD       │
-│ (Persistência & │     │   (Compute/GPU)  │     │   (/kaggle/working/ │
-│  Backup Manual) │     └──────────────────┘     │   ComfyUI/models)   │
-└─────────────────┘               │              └─────────────────────┘
-                                  ▼
-                         ┌─────────────────┐
-                         │     COMFYUI     │
-                         │   (SSD Local)   │
-                         │  output:        │
-                         │  /kaggle/       │
-                         │  working/       │
-                         │  ComfyUI/output │
-                         └─────────────────┘
+┌──────────────────┐     ┌─────────────────────┐
+│  KAGGLE NOTEBOOK │◀───▶│    KAGGLE SSD       │
+│   (Compute/GPU)  │     │   (/kaggle/working/ │
+└──────────────────┘     │   ComfyUI/models)   │
+          │              └─────────────────────┘
+          ▼
+ ┌─────────────────┐
+ │     COMFYUI     │
+ │   (SSD Local)   │
+ │  output:        │
+ │  /kaggle/       │
+ │  working/       │
+ │  ComfyUI/output │
+ └─────────────────┘
 ```
 
 **Separação de responsabilidades:**
@@ -43,12 +43,6 @@ Arquitetura definitiva para transferência e execução de modelos ComfyUI.
 - **Kaggle Notebook (SSD Local)** → Runtime e geração:
   - Modelos selecionados manualmente vão para `/kaggle/working/ComfyUI/models`
   - Geração do ComfyUI ocorre **exclusivamente no SSD local**: `/kaggle/working/ComfyUI/output`
-- **Google Drive** → Camada de **persistência, backup e sincronização sob demanda**:
-  - `Automa/ComfyUI/outputs/`
-  - `Automa/ComfyUI/workflows/`
-  - `Automa/ComfyUI/logs/`
-  - `Automa/ComfyUI/metadata/`
-  - **O Google Drive NÃO fica no caminho crítico da geração e nunca é passado como `--output-directory` do ComfyUI.**
 
 ---
 
@@ -64,7 +58,6 @@ colab_pipeline/
 │   ├── 06_comfyui_setup.ipynb      # GitHub → ComfyUI local + custom nodes
 │   ├── 07_sync_robust.ipynb        # Sync seletivo Dataset → SSD (idempotente)
 │   ├── 08_master_pipeline.ipynb    # Orquestrador completo (clone, GPU, ComfyUI SSD local, seleção de modelos, health check)
-│   └── 09_sync_outputs.ipynb       # Painel de sincronização manual com Google Drive
 │
 ├── scripts/                  # Scripts Python compartilhados
 │   ├── master_pipeline.py    # Orquestrador Colab: setup repo, inspeção, download, publicação (exit 0/1)
@@ -72,7 +65,6 @@ colab_pipeline/
 │   ├── kaggle_upload.py      # Upload para Kaggle Dataset (CLI + kagglehub)
 │   ├── kaggle_dataset_manager.py # Helpers AIR/Hugging Face, staging, manifest, retry e publicação do Dataset
 │   ├── kaggle_sync.py        # Sync seletivo com exibição de tamanho formatado
-│   ├── kaggle_drive_sync.py  # Sincronização idempotente streaming SHA-256 com Drive
 │   ├── comfyui_setup.py      # Instalação ComfyUI e start com output local no SSD
 │   └── gpu_detect.py         # Detecção e validação de GPU NVIDIA
 │
@@ -119,11 +111,9 @@ kaggle_runtime/08_master_pipeline.ipynb
 O `08_master_pipeline.ipynb`:
 1. Clona/atualiza `automadevs/colab-pipeline` diretamente do GitHub.
 2. Detecta e valida GPU NVIDIA e VRAM disponível.
-3. Testa conexão com o Google Drive para persistência/backup.
-4. Instala ComfyUI e custom nodes com output configurado no SSD local (`/kaggle/working/ComfyUI/output`).
-5. Valida que o Dataset `montesinha/backstage` está anexado como Input do notebook (`/kaggle/input/<slug>`) e registra esse caminho no `extra_model_paths.yaml` do ComfyUI — sem download.
-6. Inicia ComfyUI em background gerando no SSD local e valida via health check (`:8188/system_stats`).
-7. Oferece push inicial condicional de outputs/logs se já existirem arquivos locais.
+3. Instala ComfyUI e custom nodes com output configurado no SSD local (`/kaggle/working/ComfyUI/output`).
+4. Valida que o Dataset `montesinha/backstage` está anexado como Input do notebook (`/kaggle/input/<slug>`) e registra esse caminho no `extra_model_paths.yaml` do ComfyUI — sem download.
+5. Inicia ComfyUI em background gerando no SSD local e valida via health check (`:8188/system_stats`).
 
 ## Administração integrada ao fluxo Colab
 
@@ -135,7 +125,7 @@ Não existe um notebook separado de Dataset Manager. O fluxo operacional é o or
 
 ### Fila com duas fontes: Civitai e Hugging Face
 
-- **Detecção da entrada**: `urn:air:...` e URLs `civitai.com` seguem o caminho Civitai; `hf:org/repo[/caminho/arquivo]` ou URLs `huggingface.co` (formato `/resolve/<revisão>/...` ou `/blob/<revisão>/...`) vão para o caminho Hugging Face. Qualquer outra entrada é rejeitada com aviso e a coleta continua.
+- **Detecção da entrada**: `urn:air:...` e URLs `civitai.com` seguem o caminho Civitai; `hf:org/repo[/caminho/arquivo]`, o comando `hf download hf://org/repo[/arquivo]` colado da CLI do Hugging Face (normalizado automaticamente) ou URLs `huggingface.co` (formato `/resolve/<revisão>/...` ou `/blob/<revisão>/...`) vão para o caminho Hugging Face. Qualquer outra entrada é rejeitada com aviso e a coleta continua.
 - **Fase 1 (coleta/resolução)**: todos os metadados e todas as perguntas acontecem aqui, sem baixar nada. Para Hugging Face a categoria **sempre** é perguntada (`classify_resource_type("")`), pois um repo genérico não permite inferência automática; o `base_model` também é perguntado. Se a entrada apontar só para o repositório (sem arquivo), os arquivos são listados e o usuário escolhe um — o repo inteiro nunca é baixado silenciosamente. O tamanho é obtido via `HfApi` e exibido no formato `Modelo: <repo> | arquivo: <arquivo> | tipo: <categoria> | base model: <base_model>`.
 - **Fase 2 (download)**: `download_hf_file()` usa `hf_hub_download(..., local_dir=<staging>/<categoria>)`, normaliza o destino, calcula SHA-256 com o mesmo `sha256_file()` do Civitai e devolve um `DatasetFile` no mesmo formato, então a checagem de duplicata (`path` + `size` + `sha256`) e a resiliência por item são compartilhadas pelas duas fontes. Erros de `huggingface_hub` (`RepositoryNotFoundError`, `EntryNotFoundError`, `GatedRepoError`) são traduzidos em mensagens claras — `GatedRepoError` indica que o `HF_TOKEN` precisa ter acesso liberado ao repositório.
 - **Autenticação HF**: `HF_TOKEN` vem de variável de ambiente ou Secret do Colab. Sem token o pipeline segue apenas para repositórios públicos e avisa no console que repos privados/gated vão falhar.
@@ -144,27 +134,6 @@ Não existe um notebook separado de Dataset Manager. O fluxo operacional é o or
 - `collect_dataset_edits()` + `publish_staged_state()`: as edições `remove`/`move` sobre o estado atual do dataset são coletadas antes dos downloads; `publish_staged_state()` aplica as edições coletadas, monta o estado completo, mostra o preview e publica somente após confirmação. Se a CLI falhar, o orquestrador faz fallback automático para `kagglehub.dataset_upload`.
 
 `scripts/kaggle_dataset_manager.py` fornece somente os helpers compartilhados de AIR, Civitai, SHA256, manifest, preview e publicação. Ele não é importado por nenhum runtime Kaggle.
-
----
-
-## Fluxo 3: Sincronização Manual com Google Drive
-
-Para fazer backup ou restaurar arquivos entre o SSD local e o Google Drive, abra o painel manual:
-
-```bash
-kaggle_runtime/09_sync_outputs.ipynb
-```
-
-O notebook disponibiliza células independentes para:
-- **Testar Conexão** com o Drive
-- **Push Outputs**: `/kaggle/working/ComfyUI/output` → Drive `outputs/`
-- **Push Workflows**: Workflows `.json` locais → Drive `workflows/`
-- **Push Logs**: Logs locais (`comfyui.log`) → Drive `logs/`
-- **Push Metadata**: Metadados (se existirem) → Drive `metadata/`
-- **Pull Workflows**: Drive `workflows/` → local
-- **Pull Outputs** (opcional): Drive `outputs/` → local
-- **Pull Logs** (opcional): Drive `logs/` → local
-- **Pull Metadata** (opcional): Drive `metadata/` → local
 
 ---
 
@@ -182,17 +151,11 @@ python scripts/kaggle_upload.py   --model-name "lustifyNSFWCheckpoint_v10Krea2.s
 # Sync seletivo Kaggle Dataset → SSD Local (apenas modelos desejados)
 python scripts/kaggle_sync.py   --dataset "automamermaid/comfydocs"   --target-dir /kaggle/working/ComfyUI/models   --categories checkpoints loras vae
 
-# Setup ComfyUI (SSD Local) + Manager integrado + ngrok após health check
-python scripts/comfyui_setup.py   --comfyui-dir /kaggle/working/ComfyUI   --output-dir /kaggle/working/ComfyUI/output   --custom-nodes "cubiq/ComfyUI_essentials" "lbouaraba/comfyui-krea2edit"   --start --health-check --ngrok
+# Setup ComfyUI (SSD Local) + Manager integrado + cloudflare após health check
+python scripts/comfyui_setup.py   --comfyui-dir /kaggle/working/ComfyUI   --output-dir /kaggle/working/ComfyUI/output   --custom-nodes "cubiq/ComfyUI_essentials" "lbouaraba/comfyui-krea2edit"   --start --health-check --cloudflare
 
 # Detectar GPU
 python scripts/gpu_detect.py --recommend
-
-# Sync com Google Drive (idempotente via streaming SHA-256)
-python scripts/kaggle_drive_sync.py   --action push   --categories outputs workflows logs   --drive-base "Automa/ComfyUI"   --env kaggle
-
-# Pull workflows do Drive
-python scripts/kaggle_drive_sync.py   --action pull   --categories workflows   --drive-base "Automa/ComfyUI"   --env kaggle
 ```
 
 ---
@@ -218,35 +181,15 @@ python scripts/kaggle_drive_sync.py   --action pull   --categories workflows   -
 2. Ative **GPU** (Settings → Accelerator → GPU T4 x2 ou P100)
 3. Configure **Secrets** (ícone de chave):
    - `KAGGLE_USERNAME` + `KAGGLE_KEY` (para listar e baixar modelos do dataset)
-  - `GDRIVE_SERVICE_ACCOUNT_JSON`: Service Account JSON com acesso ao Google Drive (opcional, para sync e backup)
-  - `NGROK_AUTHTOKEN`: token do ngrok (opcional, para URL pública)
 4. Execute `08_master_pipeline.ipynb` (o repositório será clonado automaticamente)
 
-### Google Drive (Persistência & Backup)
+### Cloudflare Tunnel e GPU
 
-**Estrutura no Drive:**
-```
-/Meu Drive/Automa/ComfyUI/
-├── outputs/          # Imagens e vídeos gerados (sincronizados sob demanda)
-├── workflows/        # Workflows salvos (.json)
-├── logs/             # Logs de execução do ComfyUI
-└── metadata/         # Metadados e registros estruturados
-```
-
-**Configuração do Service Account (Kaggle):**
-1. No Google Cloud Console: crie Service Account → Role: Editor → Create Key (JSON)
-2. Compartilhe a pasta `Automa/ComfyUI` no Google Drive com o email do Service Account (Editor)
-3. No Kaggle: Secrets → `GDRIVE_SERVICE_ACCOUNT_JSON` = conteúdo do JSON
-
-### Ngrok e GPU
-
-O runtime instala `pyngrok` quando necessário, lê `NGROK_AUTHTOKEN` pelos Secrets/env sem usar `getpass`, executa `ngrok.kill()` antes de criar um túnel e só o inicia depois do health check do ComfyUI. Sem o Secret, o Drive e o ComfyUI continuam funcionando localmente.
+O runtime baixa o binário `cloudflared` (versão pinada, sha256 verificado) para `/tmp` quando necessário e sobe um quick tunnel gratuito (`*.trycloudflare.com`) — sem conta e sem token. O túnel só inicia depois do health check do ComfyUI; se o cloudflared não puder ser baixado/iniciado, o ComfyUI continua funcionando localmente. Credenciais de túnel nomeado (`TUNNEL_TOKEN`/`CLOUDFLARE_TUNNEL_TOKEN`), se presentes no ambiente, nunca são impressas nos logs.
 
 O Manager é o integrado ao ComfyUI: o setup instala `ComfyUI/manager_requirements.txt` e inicia com `--enable-manager`. `ComfyUI-Manager` não é clonado como custom node. A lista padrão contém somente `cubiq/ComfyUI_essentials` e `lbouaraba/comfyui-krea2edit`, com atualização idempotente.
 
 `COMFYUI_CUDA_DEVICE=0` é o padrão; altere para `1` para escolher a segunda GPU. Em Kaggle T4x2, cada placa mantém sua própria VRAM: ela não é somada e a GPU 1 fica disponível para workflows especializados. Nodes como `SelectModelDevice`, `SelectCLIPDevice`, `SelectVAEDevice` e `MultiGPU CFG Split`, quando fornecidos pelo ComfyUI, não são adicionados automaticamente ao pipeline básico.
-
-**No Colab:** Usa `google.colab.drive.mount()` nativo (sem service account).
 
 ---
 
@@ -283,10 +226,6 @@ embeddings/            # Textual inversions / embeddings
 | Tamanho divergente | Download parcial | Delete staging e rebaixe |
 | ComfyUI não inicia | Dependências faltando | Execute `06_comfyui_setup.ipynb` novamente |
 | VRAM insuficiente | Modelo muito grande | O padrão usa DynamicVRAM e offload assíncrono; selecione `COMFYUI_CUDA_DEVICE=1` ou ajuste o workflow |
-| Drive não monta (Kaggle) | Service Account inválido | Verifique `GDRIVE_SERVICE_ACCOUNT_JSON` nos Secrets |
-| Drive permission denied | Pasta não compartilhada | Compartilhe `Automa/ComfyUI` com o email do Service Account (Editor) |
-| rclone não encontrado | Pacote ausente | Instale via apt ou pip |
-| Sync Drive pulou arquivo | Arquivo já idêntico | Comportamento correto: mesmo tamanho e hash SHA-256 são preservados |
 
 ## Validação
 
@@ -295,15 +234,15 @@ embeddings/            # Textual inversions / embeddings
 - Parser de todas as GPUs e VRAM individual
 - `COMFYUI_CUDA_DEVICE`, comando de start, Manager, nodes e output local
 - Instalação/atualização idempotente do krea2edit
-- Redação do token ngrok e ordem `health → ngrok`
+- Redação de credenciais do túnel e ordem `health → cloudflare`
 - JSON e metadata dos notebooks, `git diff --check` e scans de secrets/paths
 
 ### Precisa ser testado no Kaggle
 
 - GPU T4x2 real (`gpu_count=2`), CUDA/driver e VRAM disponível
 - Instalação real do ComfyUI e `manager_requirements.txt`
-- Túnel ngrok real com o Secret `NGROK_AUTHTOKEN`
-- Sync do Dataset e sincronização opcional com Google Drive
+- Túnel Cloudflare real (quick tunnel, sem secret)
+- Sync do Dataset
 
 ---
 
@@ -323,13 +262,11 @@ embeddings/            # Textual inversions / embeddings
 ### Kaggle Runtime
 - [ ] GPU ativada (T4, P100, ou A100)
 - [ ] `kaggle.json` nos Secrets
-- [ ] `GDRIVE_SERVICE_ACCOUNT_JSON` nos Secrets
 - [ ] Repositório clonado e scripts atualizados
 - [ ] ComfyUI instalado no SSD local
 - [ ] Modelos selecionados sincronizados do Dataset → SSD
 - [ ] ComfyUI inicia gerando em `/kaggle/working/ComfyUI/output`
 - [ ] ComfyUI responde em `:8188` ao health check
-- [ ] Sync com Google Drive executado sob demanda via `09_sync_outputs.ipynb`
 
 ---
 
