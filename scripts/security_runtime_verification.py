@@ -1285,75 +1285,6 @@ def test_13_node_alteration(report: VerificationReport):
         report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
 
 
-def test_14_drive_credentials(report: VerificationReport):
-    """Teste 14: Cleanup de credenciais do Drive."""
-    test_id = "14_DRIVE_CREDENTIALS"
-    try:
-        scripts_dir = KAGGLE_WORKING / "colab-pipeline" / "scripts"
-        if scripts_dir.exists() and str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
-        scripts_dir2 = KAGGLE_WORKING / "scripts"
-        if scripts_dir2.exists() and str(scripts_dir2) not in sys.path:
-            sys.path.insert(0, str(scripts_dir2))
-
-        from comfyui_setup import cleanup_gdrive_credentials
-
-        cred_paths = [
-            Path("/root/gdrive_sa.json"),
-            Path("/root/.config/rclone/rclone.conf"),
-        ]
-
-        # Verificar estado atual
-        checks = []
-        for p in cred_paths:
-            exists_before = p.exists()
-            checks.append(f"Antes cleanup — {p.name}: {'existe' if exists_before else 'ausente'}")
-
-        # Executar cleanup
-        cleanup_gdrive_credentials()
-
-        # Verificar após cleanup
-        any_remaining = False
-        for p in cred_paths:
-            exists_after = p.exists()
-            if exists_after:
-                any_remaining = True
-            checks.append(f"Após cleanup — {p.name}: {'EXISTE ✗' if exists_after else 'removido ✓'}")
-
-        # Testar cleanup após exceção
-        # Criar credencial temporária de teste para verificar
-        test_sa = Path("/root/gdrive_sa.json")
-        try:
-            test_sa.parent.mkdir(parents=True, exist_ok=True)
-            test_sa.write_text('{"type": "service_account", "test": true}')
-            os.chmod(test_sa, 0o600)
-            checks.append(f"Credencial teste criada: {test_sa}")
-
-            # Simular exceção e cleanup no finally
-            try:
-                raise RuntimeError("Exceção simulada para teste de cleanup")
-            except RuntimeError:
-                pass
-            finally:
-                cleanup_gdrive_credentials()
-
-            exists_after_exception = test_sa.exists()
-            checks.append(
-                f"Após exceção + cleanup — gdrive_sa.json: "
-                f"{'EXISTE ✗' if exists_after_exception else 'removido ✓'}"
-            )
-            if exists_after_exception:
-                any_remaining = True
-        except PermissionError:
-            checks.append("Sem permissão para criar credencial de teste em /root/")
-
-        details = "\n".join(checks)
-        report.record(test_id, "PASS" if not any_remaining else "FAIL", details)
-
-    except Exception as e:
-        report.record(test_id, "NOT VERIFIED", f"Exceção: {e}\n{traceback.format_exc()}")
-
-
 def test_15_exception_cleanup(report: VerificationReport):
     """Teste 15: Cleanup após exceção — artefatos devem ser removidos."""
     test_id = "15_EXCEPTION_CLEANUP"
@@ -1602,7 +1533,6 @@ def run_all_tests(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     test_11_manager(report, port)
     test_12_custom_nodes(report)
     test_13_node_alteration(report)
-    test_14_drive_credentials(report)
     test_15_exception_cleanup(report)
     test_16_final_scan(report)
     test_17_persistence(report)

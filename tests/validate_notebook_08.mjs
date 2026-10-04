@@ -11,7 +11,6 @@ const requiredMarkers = [
   'git", "clone"',
   'shutil.copytree(REPO_DIR / "scripts", SCRIPTS_DIR)',
   "from gpu_detect import detect_gpu",
-  "test_drive_connection",
   "CUSTOM_NODES = [",
   "setup_comfyui(",
   "start_comfyui_runtime(",

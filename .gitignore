@@ -24,8 +24,6 @@ build/
 .env.*
 *.env
 kaggle.json
-gdrive_sa.json
-rclone.conf
 ngrok.yml
 ngrok.yaml
 service_account*.json

@@ -47,7 +47,6 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 DEFAULT_COMFYUI_DIR = Path("/kaggle/working/ComfyUI")
 DEFAULT_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
-DEFAULT_DRIVE_BASE = "Automa/ComfyUI"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8188
 ENV_CUDA_DEVICE = "COMFYUI_CUDA_DEVICE"
@@ -2067,11 +2066,10 @@ def secure_cleanup(
     1. Limpa todos os dirs em /dev/shm (tmpfs): input, output, temp, user, logs, archive.
        Verifica que cada dir é tmpfs antes de limpar (fail-closed).
     2. Remove ZIPs em /dev/shm/comfy_ui_archive (limpeza parcial).
-    3. Apaga credenciais (gdrive_sa.json, rclone.conf).
-    4. Mata processo conhecido (comfyui_pid ou known_pids) — NUNCA mata PIDs arbitrários.
-    5. Faz GC.
-    6. Verifica /kaggle/working via final_filesystem_check.
-    7. Se raise_on_persistent=True e encontrar violações, levanta SecurityError.
+    3. Mata processo conhecido (comfyui_pid ou known_pids) — NUNCA mata PIDs arbitrários.
+    4. Faz GC.
+    5. Verifica /kaggle/working via final_filesystem_check.
+    6. Se raise_on_persistent=True e encontrar violações, levanta SecurityError.
 
     Deve ser chamada em try/finally — garante limpeza mesmo em exceção ou KeyboardInterrupt.
     """
@@ -2127,13 +2125,7 @@ def secure_cleanup(
             pass
         print(f"[CLEANUP] ✓ {d} limpo")
 
-    # 3. Limpar credenciais
-    try:
-        cleanup_gdrive_credentials()
-    except Exception as e:
-        print(f"[CLEANUP] WARN: falha ao limpar credenciais: {e}")
-
-    # 4. Matar processo conhecido apenas (nunca PIDs arbitrários)
+    # 3. Matar processo conhecido apenas (nunca PIDs arbitrários)
     pids_to_kill = []
     if comfyui_pid is not None:
         pids_to_kill.append(comfyui_pid)
@@ -2312,20 +2304,6 @@ def final_filesystem_check(
         "symlinks": symlink_found,
         "report": report,
     }
-
-
-# ---------------------------------------------------------------------------
-# Credential cleanup
-# ---------------------------------------------------------------------------
-
-def cleanup_gdrive_credentials() -> None:
-    """Apaga service account JSON e rclone config. Idempotente."""
-    for p in (Path("/root/gdrive_sa.json"), Path("/root/.config/rclone/rclone.conf")):
-        if p.exists():
-            safe_remove(p)
-            print(f"[SECURITY] Credencial removida: {p}")
-        else:
-            print(f"[INFO] Credencial já não existe: {p}")
 
 
 # ---------------------------------------------------------------------------
@@ -2738,7 +2716,6 @@ def setup_comfyui(
     input_dir=None,
     temp_dir=None,
     user_dir=None,
-    drive_base=DEFAULT_DRIVE_BASE,
     enable_manager: bool = True,
     additional_model_roots: Optional[List[Tuple[str, Path]]] = None,
     strict_allowlist: bool = True,
@@ -3312,7 +3289,6 @@ def main():
     parser.add_argument("--output-dir", help="Deve estar em /dev/shm/")
     parser.add_argument("--input-dir", help="Deve estar em /dev/shm/")
     parser.add_argument("--temp-dir", help="Deve estar em /dev/shm/")
-    parser.add_argument("--drive-base", default=DEFAULT_DRIVE_BASE)
     parser.add_argument("--start", action="store_true")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -3339,7 +3315,7 @@ def main():
         Path(args.comfyui_dir), args.repo_url, nodes,
         Path(args.models_dir) if args.models_dir else None,
         output_dir=output_dir, input_dir=input_dir, temp_dir=temp_dir,
-        drive_base=args.drive_base, enable_manager=not args.no_manager,
+        enable_manager=not args.no_manager,
     )
     if args.start:
         runtime = start_comfyui_runtime(
