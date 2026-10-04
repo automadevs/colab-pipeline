@@ -65,6 +65,7 @@ from kaggle_dataset_manager import (
     custom_category_warnings,
     parse_hf_input,
     split_makedir_command,
+    strip_hf_download_command,
     undeclared_custom_folders,
     validate_custom_category,
     validate_hf_input,
@@ -632,6 +633,83 @@ class DatasetManagerTests(unittest.TestCase):
         inputs = iter(entries)
         queue = collect_input_queue(input_fn=lambda prompt="": next(inputs))
         self.assertEqual(queue, ["hf:org/repo/arquivo.safetensors"])
+
+    # =========================================================================
+    # TESTES HUGGING FACE - PREFIXO DE COMANDO "hf download "
+    # =========================================================================
+
+    def test_parse_hf_input_accepts_hf_download_command(self):
+        """'hf download hf://org/repo/arquivo' parseia igual a 'hf://org/repo/arquivo'"""
+        expected = parse_hf_input("hf://org/repo/arquivo.safetensors")
+        self.assertEqual(parse_hf_input("hf download hf://org/repo/arquivo.safetensors"), expected)
+        self.assertEqual(parse_hf_input("hf download hf:org/repo/arquivo.safetensors"), expected)
+
+    def test_parse_hf_input_hf_download_command_repo_only(self):
+        """'hf download hf://org/repo' (sem arquivo) segue o fluxo de repo inteiro"""
+        repo_id, file_path, revision = parse_hf_input("hf download hf://org/repo")
+        self.assertEqual(repo_id, "org/repo")
+        self.assertIsNone(file_path)
+        self.assertEqual(revision, "main")
+
+    def test_hf_download_command_case_insensitive_on_command_only(self):
+        """Comando 'hf download' é case-insensitive; o case do resto é preservado"""
+        for variant in ("HF Download hf://org/repo/arquivo.safetensors",
+                        "Hf DOWNLOAD hf://org/repo/arquivo.safetensors"):
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    parse_hf_input(variant),
+                    ("org/repo", "arquivo.safetensors", "main"),
+                )
+        repo_id, file_path, _ = parse_hf_input(
+            "hf download hf://MermaidStudios/velmira-1500/velmira_krea2_v1_1500.safetensors"
+        )
+        self.assertEqual(repo_id, "MermaidStudios/velmira-1500")
+        self.assertEqual(file_path, "velmira_krea2_v1_1500.safetensors")
+
+    def test_is_hf_input_accepts_hf_download_command(self):
+        """Detecção roteia 'hf download ...' para HF (inclusive URL huggingface.co)"""
+        self.assertTrue(is_hf_input("hf download hf://org/repo/arquivo.safetensors"))
+        self.assertTrue(is_hf_input("hf download hf://org/repo"))
+        self.assertTrue(is_hf_input("hf download https://huggingface.co/org/repo/resolve/main/f.safetensors"))
+        # Sem o prefixo de comando: comportamento inalterado (guarda de não-regressão)
+        self.assertTrue(is_hf_input("hf://org/repo/arquivo.safetensors"))
+
+    def test_parse_input_hf_download_command_routing_and_makedir(self):
+        """parse_input roteia 'hf download' como HF; /makedir isola a pasta antes"""
+        parsed = parse_input("hf download hf://org/repo/arquivo.safetensors", 1)
+        self.assertEqual(parsed.provider, "huggingface")
+        self.assertIsNone(parsed.custom_category)
+        self.assertEqual(parsed.repo_id, "org/repo")
+        self.assertEqual(parsed.file_path, "arquivo.safetensors")
+        self.assertEqual(parsed.resource_input, "hf://org/repo/arquivo.safetensors")
+
+        mk = parse_input("/makedir SEEDVR2 hf download hf://org/repo/arquivo.safetensors", 2)
+        self.assertEqual(mk.provider, "huggingface")
+        self.assertEqual(mk.custom_category, "SEEDVR2")
+        self.assertEqual(mk.repo_id, "org/repo")
+        self.assertEqual(mk.file_path, "arquivo.safetensors")
+        self.assertEqual(mk.resource_input, "hf://org/repo/arquivo.safetensors")
+        self.assertEqual(mk.original_input, "/makedir SEEDVR2 hf download hf://org/repo/arquivo.safetensors")
+
+    def test_hf_download_command_does_not_interfere_with_civitai(self):
+        """Entradas Civitai seguem o roteamento antigo, sem interferência da normalização"""
+        air = parse_input("urn:air:krea2:lora:civitai:2761113@3139172+3019297", 1)
+        self.assertEqual(air.provider, "civitai")
+        url = parse_input("https://civitai.com/models/123", 2)
+        self.assertEqual(url.provider, "civitai")
+        # A normalização só dispara quando a entrada começa com "hf download "
+        self.assertEqual(
+            strip_hf_download_command("urn:air:krea2:lora:civitai:1@2"),
+            "urn:air:krea2:lora:civitai:1@2",
+        )
+        self.assertEqual(strip_hf_download_command("hf://org/repo"), "hf://org/repo")
+
+    def test_collect_input_queue_accepts_hf_download_command(self):
+        """Entrada 'hf download hf://...' colada da CLI é aceita na coleta"""
+        entries = ["hf download hf://myorg/myrepo/model.safetensors", "done"]
+        inputs = iter(entries)
+        queue = collect_input_queue(input_fn=lambda prompt="": next(inputs))
+        self.assertEqual(queue, ["hf download hf://myorg/myrepo/model.safetensors"])
 
     # =========================================================================
     # TESTES HUGGING FACE - CLASSIFICAÇÃO E COLETA
