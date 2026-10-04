@@ -58,7 +58,6 @@ colab_pipeline/
 │   ├── 06_comfyui_setup.ipynb      # GitHub → ComfyUI local + custom nodes
 │   ├── 07_sync_robust.ipynb        # Sync seletivo Dataset → SSD (idempotente)
 │   ├── 08_master_pipeline.ipynb    # Orquestrador completo (clone, GPU, ComfyUI SSD local, seleção de modelos, health check)
-│   └── 09_sync_outputs.ipynb       # (legado) Painel de sync com Google Drive — backend removido, remoção pendente
 │
 ├── scripts/                  # Scripts Python compartilhados
 │   ├── master_pipeline.py    # Orquestrador Colab: setup repo, inspeção, download, publicação (exit 0/1)
