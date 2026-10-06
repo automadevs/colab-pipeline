@@ -15,6 +15,10 @@ const requiredMarkers = [
   "setup_comfyui(",
   "start_comfyui_runtime(",
   'if not runtime["health"]:',
+  // Detecção dinâmica dos datasets genéricos (subconjunto não-vazio de A/B/C)
+  "CANDIDATE_DATASETS",
+  "select_attached_dataset_roots(",
+  "additional_model_roots=additional_model_roots",
   // Segurança hardening
   'os.environ["COMFYUI_SECURE_MODE"] = "1"',
   "assert_no_persistent_images",

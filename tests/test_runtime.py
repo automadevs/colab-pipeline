@@ -2853,5 +2853,216 @@ class TestV_NodeScaffoldingIsNotTampering(unittest.TestCase):
             with self.assertRaises(comfyui_setup.SecurityError):
                 comfyui_setup.verify_custom_nodes_unchanged(comfyui, snapshot, strict=True)
 
+    def _git_env(self):
+        env = os.environ.copy()
+        env.update({
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@test.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@test.com",
+        })
+        return env
+
+    def _make_git_comfyui_with_node(self, tmp, node_name="Comfyui-Easy-Use"):
+        """ComfyUI como repo git + custom node como repo git aninhado (como no Kaggle)."""
+        comfyui = Path(tmp) / "ComfyUI"
+        node = comfyui / "custom_nodes" / node_name
+        node.mkdir(parents=True)
+        (comfyui / "main.py").write_text("# ComfyUI main", encoding="utf-8")
+        (comfyui / ".gitignore").write_text("custom_nodes/\n__pycache__/\n", encoding="utf-8")
+        (node / "__init__.py").write_text("# node original", encoding="utf-8")
+        env = self._git_env()
+        for repo in (comfyui, node):
+            subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=str(repo), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, env=env, check=True)
+        return comfyui, node
+
+    def _snapshot_working(self, tmp):
+        """Aponta PERSISTENT_WORKING para tmp e tira o baseline do working dir."""
+        original = (comfyui_setup._WORKING_SNAPSHOT, comfyui_setup.PERSISTENT_WORKING)
+        comfyui_setup.PERSISTENT_WORKING = Path(tmp)
+        comfyui_setup.record_working_snapshot()
+        return original
+
+    def _restore_snapshot_working(self, original):
+        comfyui_setup._WORKING_SNAPSHOT, comfyui_setup.PERSISTENT_WORKING = original
+
+    def test_scaffolding_nao_e_artefato_persistente_novo(self):
+        """Caso real (PRE-ZIP): your_styles.json.example + wildcards/example.txt nao abortam."""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_git_comfyui_with_node(tmp)
+            original = self._snapshot_working(tmp)
+            try:
+                (node / "styles").mkdir()
+                (node / "styles" / "your_styles.json.example").write_text("{}", encoding="utf-8")
+                (node / "wildcards").mkdir()
+                (node / "wildcards" / "example.txt").write_text("texto", encoding="utf-8")
+                self.assertEqual(
+                    comfyui_setup._scan_unauthorized_persistent_files(Path(tmp)), []
+                )
+            finally:
+                self._restore_snapshot_working(original)
+
+    def test_scaffolding_fora_da_allowlist_de_nodes_segue_reprovando(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_git_comfyui_with_node(tmp, node_name="NodeNaoAutorizado")
+            original = self._snapshot_working(tmp)
+            try:
+                (node / "styles").mkdir()
+                (node / "styles" / "your_styles.json.example").write_text("{}", encoding="utf-8")
+                violations = comfyui_setup._scan_unauthorized_persistent_files(Path(tmp))
+                self.assertEqual(len(violations), 1)
+                self.assertIn("NodeNaoAutorizado", violations[0]["rel"])
+            finally:
+                self._restore_snapshot_working(original)
+
+    def test_scaffolding_de_imagem_segue_reprovando(self):
+        """A carve-out nao pode virar brecha para persistir imagem gerada em runtime."""
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_git_comfyui_with_node(tmp)
+            original = self._snapshot_working(tmp)
+            try:
+                (node / "samples").mkdir()
+                (node / "samples" / "sample.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                violations = comfyui_setup._scan_unauthorized_persistent_files(Path(tmp))
+                self.assertEqual(len(violations), 1)
+                self.assertTrue(violations[0]["rel"].endswith("samples/sample.png"))
+            finally:
+                self._restore_snapshot_working(original)
+
+    def test_scaffolding_nunca_cobre_codigo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_git_comfyui_with_node(tmp)
+            rel_base = "ComfyUI/custom_nodes/Comfyui-Easy-Use/"
+            for rel in ("plugins/example.py", "bin/sample.exe", "models/template.safetensors"):
+                with self.subTest(rel=rel):
+                    self.assertFalse(
+                        comfyui_setup._is_runtime_node_scaffolding(rel_base + rel, Path(tmp))
+                    )
+
+    def test_scaffolding_tracked_e_modificado_segue_reprovando(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_git_comfyui_with_node(tmp)
+            rel = "ComfyUI/custom_nodes/Comfyui-Easy-Use/styles/your_styles.json.example"
+            (node / "styles").mkdir()
+            template = node / "styles" / "your_styles.json.example"
+            template.write_text("{}", encoding="utf-8")
+            env = self._git_env()
+            subprocess.run(["git", "add", "-A"], cwd=str(node), capture_output=True, env=env, check=True)
+            subprocess.run(["git", "commit", "-m", "template"], cwd=str(node), capture_output=True, env=env, check=True)
+            comfyui_setup._nested_node_git_cache.clear()
+            self.assertTrue(comfyui_setup._is_runtime_node_scaffolding(rel, Path(tmp)))
+            template.write_text('{"injetado": true}', encoding="utf-8")
+            comfyui_setup._nested_node_git_cache.clear()
+            self.assertFalse(comfyui_setup._is_runtime_node_scaffolding(rel, Path(tmp)))
+
+    def test_scaffolding_sem_repo_git_do_node_e_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            comfyui, node = self._make_comfyui(tmp)
+            self.assertFalse(comfyui_setup._is_runtime_node_scaffolding(
+                "ComfyUI/custom_nodes/Comfyui-Easy-Use/styles/your_styles.json.example",
+                Path(tmp),
+            ))
+
+
+class TestW_MultiDatasetRoots(unittest.TestCase):
+    """3 datasets genericos (nextlevel_a/b/c): qualquer subconjunto nao-vazio.
+
+    Nenhum dos 3 nomes e obrigatorio individualmente; o papel de cada dataset
+    (checkpoint vs lora vs seedvr2...) e decidido pelo CONTEUDO (subpastas),
+    nunca pelo nome. O merge por categoria e nativo do ComfyUI: uma secao YAML
+    por dataset, e categorias iguais somam no mesmo dropdown — o teste verifica
+    a estrutura do YAML gerado, nao simula o ComfyUI.
+    """
+
+    CANDIDATE_NAMES = ("nextlevel_a", "nextlevel_b", "nextlevel_c")
+
+    def _candidates(self, tmp):
+        return [(name, Path(tmp) / name) for name in self.CANDIDATE_NAMES]
+
+    def _attach(self, tmp, names):
+        for name in names:
+            (Path(tmp) / name).mkdir(parents=True)
+
+    def _write_custom_models(self, root, payload):
+        (root / "custom_models.json").write_text(payload, encoding="utf-8")
+
+    def test_um_dataset_presente(self):
+        """Guarda de nao-regressao: comportamento identico ao dataset unico."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._attach(tmp, ("nextlevel_a",))
+            roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
+            self.assertEqual(roots, [("nextlevel_a", Path(tmp) / "nextlevel_a")])
+            yaml_text = comfyui_setup.build_extra_model_paths_yaml(
+                Path("/kaggle/working/ComfyUI/models"), roots, {}
+            )
+            self.assertIn("nextlevel_a:", yaml_text)
+            self.assertNotIn("nextlevel_b:", yaml_text)
+            # kaggle_models + 1 dataset: cada categoria aparece exatamente 2x
+            self.assertEqual(yaml_text.count("  diffusion_models: diffusion_models\n"), 2)
+            self.assertEqual(yaml_text.count("  base_path: "), 2)
+
+    def test_dois_datasets_mesclam_por_categoria(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._attach(tmp, ("nextlevel_a", "nextlevel_c"))
+            roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
+            self.assertEqual([name for name, _ in roots], ["nextlevel_a", "nextlevel_c"])
+            yaml_text = comfyui_setup.build_extra_model_paths_yaml(
+                Path("/kaggle/working/ComfyUI/models"), roots, {}
+            )
+            # Uma secao por dataset, cada uma com seu proprio base_path...
+            self.assertIn(f"nextlevel_a:\n  base_path: {Path(tmp) / 'nextlevel_a'}", yaml_text)
+            self.assertIn(f"nextlevel_c:\n  base_path: {Path(tmp) / 'nextlevel_c'}", yaml_text)
+            self.assertNotIn("nextlevel_b:", yaml_text)
+            # ...e a mesma categoria sob bases diferentes (merge nativo do ComfyUI)
+            self.assertEqual(yaml_text.count("  diffusion_models: diffusion_models\n"), 3)
+            self.assertEqual(yaml_text.count("  base_path: "), 3)
+
+    def test_tres_datasets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._attach(tmp, self.CANDIDATE_NAMES)
+            roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
+            self.assertEqual([name for name, _ in roots], list(self.CANDIDATE_NAMES))
+            yaml_text = comfyui_setup.build_extra_model_paths_yaml(
+                Path("/kaggle/working/ComfyUI/models"), roots, {}
+            )
+            self.assertEqual(yaml_text.count("  diffusion_models: diffusion_models\n"), 4)
+            self.assertEqual(yaml_text.count("  base_path: "), 4)
+
+    def test_nenhum_dataset_anexado_aborta_listando_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError) as ctx:
+                comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
+        msg = str(ctx.exception)
+        self.assertIn("anexad", msg)
+        for name in self.CANDIDATE_NAMES:
+            self.assertIn(str(Path(tmp) / name), msg)
+
+    def test_custom_models_mescla_e_ausente_nao_quebra(self):
+        """custom_models.json em 2 dos 3 (o terceiro nem anexado): mescla sem erro."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._attach(tmp, ("nextlevel_a", "nextlevel_c"))
+            self._write_custom_models(Path(tmp) / "nextlevel_a", '{"seedvr2": "SEEDVR2"}')
+            self._write_custom_models(Path(tmp) / "nextlevel_c", '{"llm": "LLM"}')
+            roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
+            merged = comfyui_setup.collect_custom_model_types(roots)
+            self.assertEqual(merged, {"seedvr2": "SEEDVR2", "llm": "LLM"})
+            yaml_text = comfyui_setup.build_extra_model_paths_yaml(
+                Path("/kaggle/working/ComfyUI/models"), roots, merged
+            )
+            self.assertEqual(yaml_text.count("  seedvr2: SEEDVR2\n"), 3)
+            self.assertEqual(yaml_text.count("  llm: LLM\n"), 3)
+
+    def test_colisao_de_chave_ultima_vence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._attach(tmp, ("nextlevel_a", "nextlevel_c"))
+            self._write_custom_models(Path(tmp) / "nextlevel_a", '{"seedvr2": "SEEDVR2_A"}')
+            self._write_custom_models(Path(tmp) / "nextlevel_c", '{"seedvr2": "SEEDVR2_C"}')
+            roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
+            merged = comfyui_setup.collect_custom_model_types(roots)
+            self.assertEqual(merged, {"seedvr2": "SEEDVR2_C"})
+
+
 if __name__ == "__main__":
     unittest.main()
