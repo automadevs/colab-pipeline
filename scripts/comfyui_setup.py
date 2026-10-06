@@ -1096,8 +1096,18 @@ def _is_file_allowed(rel_path: str, scan_root: Path) -> bool:
     Exceção: extensões de IMAGEM (.png, .jpg, etc.) passam se forem arquivo
     de fábrica conhecido (_is_allowed_static_file) ou doc empacotada de
     custom node tracked-e-limpa (_is_packaged_node_doc_image) — ver Camada 1.
+    Exceção NARROW adicional: templates que o próprio node cria ao ser
+    importado (ex.: ``styles/your_styles.json.example`` do Comfyui-Easy-Use)
+    passam via _is_runtime_node_scaffolding — eles nascem DEPOIS do rebaseline
+    POST-SETUP, então o diff de snapshot os veria como arquivo novo.
     """
     normalized = rel_path.replace("\\", "/")
+
+    # Passo 0: scaffolding gerado em runtime por custom node autorizado.
+    # Válido com ou sem git disponível no scan_root (a função consulta o repo
+    # aninhado do próprio node e é fail-closed).
+    if _is_runtime_node_scaffolding(normalized, scan_root):
+        return True
 
     # Passo 1: checagem baseada em git. Quando o clone existe, ele é a fonte
     # primária: arquivos tracked e limpos são permitidos; untracked/modified não.
@@ -1271,6 +1281,73 @@ def _is_tracked_node_data_asset(rel_path: str, scan_root: Path) -> bool:
     if rel_inside_node not in tracked:
         return False
     return not _matches_git_changed_path(rel_inside_node, changed)
+
+
+def _is_runtime_node_scaffolding(rel_path: str, scan_root: Path) -> bool:
+    """Exceção NARROW para templates que o próprio node cria ao ser importado.
+
+    Caso real (Kaggle, notebook 08): Comfyui-Easy-Use escreve
+    ``styles/your_styles.json.example`` e ``wildcards/example.txt`` durante o
+    import — ou seja, DEPOIS do rebaseline POST-SETUP, feito antes de o ComfyUI
+    subir. O diff de snapshot os vê como arquivo persistente novo e a auditoria
+    PRE-ZIP aborta. ``verify_custom_nodes_unchanged`` já tolera isso via
+    ``_is_node_scaffolding_file``; aqui a MESMA carve-out é aplicada ao diff de
+    snapshot, com guardas extras. Retorna True SOMENTE quando:
+
+    1. O path está em ComfyUI/custom_nodes/<node>/... (mínimo 4 segmentos).
+    2. <node> está em ALLOWED_CUSTOM_NODES.
+    3. O path relativo DENTRO do node casa com _is_node_scaffolding_file
+       (sufixo .example ou stem example/sample/template).
+    4. A extensão é inofensiva: nada de código/binário
+       (NODE_NEVER_IGNORED_EXTENSIONS), imagem (SENSITIVE_EXTENSIONS), arquivo
+       compactado (SENSITIVE_ARCHIVES) ou modelo (ALWAYS_BLOCKED_EXTENSIONS) —
+       esses continuam sob as camadas de bloqueio existentes.
+    5. O repo git DO PRÓPRIO node é legível e o arquivo não é um tracked
+       modificado ali: sobrescrever template que já era do repo continua
+       reprovando. Untracked é o caso permitido — é o template recém-gerado.
+
+    Fail-closed: repo ausente/ilegível, git indisponível ou node fora da
+    allowlist → False.
+    """
+    normalized = rel_path.replace("\\", "/")
+    parts = Path(normalized).parts
+    # Condicao 1: dentro de ComfyUI/custom_nodes/<node>/ (minimo 4 segmentos)
+    if (
+        len(parts) < 4
+        or parts[0] != "ComfyUI"
+        or parts[1] != "custom_nodes"
+        or parts[2] in ("", ".", "..")
+    ):
+        return False
+    # Condicao 2: apenas nodes explicitamente autorizados
+    if parts[2] not in ALLOWED_CUSTOM_NODES:
+        return False
+    # Condicao 3: template de scaffolding do proprio node
+    rel_inside_node = "/".join(parts[3:])
+    if not _is_node_scaffolding_file(rel_inside_node):
+        return False
+    # Condicao 4: extensao inofensiva (nunca codigo, imagem, archive ou modelo)
+    ext = Path(normalized).suffix.lower()
+    if (
+        ext in NODE_NEVER_IGNORED_EXTENSIONS
+        or ext in SENSITIVE_EXTENSIONS
+        or ext in SENSITIVE_ARCHIVES
+        or ext in ALWAYS_BLOCKED_EXTENSIONS
+    ):
+        return False
+    # Condicao 5: sobrescrever template que ja era tracked no repo do node reprova.
+    # O caso permitido e justamente o arquivo UNTRACKED (gerado agora no import),
+    # e o git reporta o DIRETORIO pai como untracked (ex.: "?? styles/"), nao o
+    # arquivo — por isso a checagem e pelo path exato em tracked, e nao por
+    # prefixo de diretorio em changed.
+    node_dir = scan_root / "ComfyUI" / "custom_nodes" / parts[2]
+    sets = _get_nested_node_git_sets(scan_root, node_dir)
+    if sets is None:
+        return False
+    tracked, changed = sets
+    if rel_inside_node in tracked and _matches_git_changed_path(rel_inside_node, changed):
+        return False
+    return True
 
 
 # Extensões de modelo que são SEMPRE bloqueadas, mesmo se tracked pelo git
@@ -2645,13 +2722,55 @@ def load_custom_model_types(root: Path) -> Dict[str, str]:
     return resolved
 
 
+def select_attached_dataset_roots(
+    candidates: List[Tuple[str, Path]],
+) -> List[Tuple[str, Path]]:
+    """Filtra os datasets candidatos para os efetivamente anexados à sessão.
+
+    Os Kaggle Datasets genéricos (ex.: nextlevel_a/b/c) são montados read-only
+    em ``/kaggle/input/<slug>`` quando anexados ao notebook. Nenhum nome é
+    obrigatório individualmente: qualquer subconjunto não-vazio funciona, e o
+    papel de cada dataset (checkpoint, lora, seedvr2...) é decidido pelo
+    CONTEÚDO (suas subpastas), nunca pelo nome. A mesclagem por categoria é
+    nativa do loader de extra_model_paths do ComfyUI: com uma seção YAML por
+    dataset (ver build_extra_model_paths_yaml), um ``diffusion_models/`` do
+    dataset A e um do B aparecem juntos no mesmo dropdown.
+
+    Levanta RuntimeError se NENHUM candidato estiver montado, listando os
+    paths verificados — ajuda a distinguir "dataset não anexado" de "slug
+    diferente do esperado".
+    """
+    attached = [(name, Path(path)) for name, path in candidates if Path(path).is_dir()]
+    if not attached:
+        checked = "\n".join(f"  - {path}" for _, path in candidates)
+        raise RuntimeError(
+            "Nenhum dos datasets candidatos está anexado a esta sessão — "
+            "anexe ao menos um antes de continuar "
+            "(Add Input → Datasets → busque o dataset → Add).\n"
+            f"Paths verificados:\n{checked}"
+        )
+    print(f"[INFO] Datasets anexados (somente leitura): {[name for name, _ in attached]}")
+    return attached
+
+
 def collect_custom_model_types(
     roots: Optional[List[Tuple[str, Path]]],
 ) -> Dict[str, str]:
-    """Une os custom_models.json de várias raízes (fail-soft; a última vence)."""
+    """Une os custom_models.json de várias raízes.
+
+    Fail-soft (ausente/ilegível/inválido em uma raiz não quebra as demais).
+    Em colisão de chave apontando pastas diferentes, a última raiz vence com
+    warning explícito — mesma chave e mesma pasta não é colisão.
+    """
     merged: Dict[str, str] = {}
-    for _, root in roots or []:
-        merged.update(load_custom_model_types(root))
+    for name, root in roots or []:
+        for key, folder in load_custom_model_types(root).items():
+            if key in merged and merged[key] != folder:
+                print(
+                    f"[WARN] Tipo customizado {key!r} declarado em mais de um dataset: "
+                    f"'{merged[key]}' x '{folder}' (raiz '{name}'). Usando a última."
+                )
+            merged[key] = folder
     return merged
 
 
