@@ -2727,8 +2727,9 @@ def select_attached_dataset_roots(
 ) -> List[Tuple[str, Path]]:
     """Filtra os datasets candidatos para os efetivamente anexados à sessão.
 
-    Os Kaggle Datasets genéricos (ex.: nextlevel_a/b/c) são montados read-only
-    em ``/kaggle/input/<slug>`` quando anexados ao notebook. Nenhum nome é
+    Os Kaggle Datasets genéricos (ex.: nextlevel-a/b/c; o Kaggle não aceita
+    underscore no slug) são montados read-only em ``/kaggle/input/<slug>``
+    quando anexados ao notebook. Nenhum nome é
     obrigatório individualmente: qualquer subconjunto não-vazio funciona, e o
     papel de cada dataset (checkpoint, lora, seedvr2...) é decidido pelo
     CONTEÚDO (suas subpastas), nunca pelo nome. A mesclagem por categoria é
