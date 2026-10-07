@@ -2967,7 +2967,7 @@ class TestV_NodeScaffoldingIsNotTampering(unittest.TestCase):
 
 
 class TestW_MultiDatasetRoots(unittest.TestCase):
-    """3 datasets genericos (nextlevel_a/b/c): qualquer subconjunto nao-vazio.
+    """3 datasets genericos (nextlevel-a/b/c): qualquer subconjunto nao-vazio.
 
     Nenhum dos 3 nomes e obrigatorio individualmente; o papel de cada dataset
     (checkpoint vs lora vs seedvr2...) e decidido pelo CONTEUDO (subpastas),
@@ -2976,7 +2976,7 @@ class TestW_MultiDatasetRoots(unittest.TestCase):
     a estrutura do YAML gerado, nao simula o ComfyUI.
     """
 
-    CANDIDATE_NAMES = ("nextlevel_a", "nextlevel_b", "nextlevel_c")
+    CANDIDATE_NAMES = ("nextlevel-a", "nextlevel-b", "nextlevel-c")
 
     def _candidates(self, tmp):
         return [(name, Path(tmp) / name) for name in self.CANDIDATE_NAMES]
@@ -2991,30 +2991,30 @@ class TestW_MultiDatasetRoots(unittest.TestCase):
     def test_um_dataset_presente(self):
         """Guarda de nao-regressao: comportamento identico ao dataset unico."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._attach(tmp, ("nextlevel_a",))
+            self._attach(tmp, ("nextlevel-a",))
             roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
-            self.assertEqual(roots, [("nextlevel_a", Path(tmp) / "nextlevel_a")])
+            self.assertEqual(roots, [("nextlevel-a", Path(tmp) / "nextlevel-a")])
             yaml_text = comfyui_setup.build_extra_model_paths_yaml(
                 Path("/kaggle/working/ComfyUI/models"), roots, {}
             )
-            self.assertIn("nextlevel_a:", yaml_text)
-            self.assertNotIn("nextlevel_b:", yaml_text)
+            self.assertIn("nextlevel-a:", yaml_text)
+            self.assertNotIn("nextlevel-b:", yaml_text)
             # kaggle_models + 1 dataset: cada categoria aparece exatamente 2x
             self.assertEqual(yaml_text.count("  diffusion_models: diffusion_models\n"), 2)
             self.assertEqual(yaml_text.count("  base_path: "), 2)
 
     def test_dois_datasets_mesclam_por_categoria(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._attach(tmp, ("nextlevel_a", "nextlevel_c"))
+            self._attach(tmp, ("nextlevel-a", "nextlevel-c"))
             roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
-            self.assertEqual([name for name, _ in roots], ["nextlevel_a", "nextlevel_c"])
+            self.assertEqual([name for name, _ in roots], ["nextlevel-a", "nextlevel-c"])
             yaml_text = comfyui_setup.build_extra_model_paths_yaml(
                 Path("/kaggle/working/ComfyUI/models"), roots, {}
             )
             # Uma secao por dataset, cada uma com seu proprio base_path...
-            self.assertIn(f"nextlevel_a:\n  base_path: {Path(tmp) / 'nextlevel_a'}", yaml_text)
-            self.assertIn(f"nextlevel_c:\n  base_path: {Path(tmp) / 'nextlevel_c'}", yaml_text)
-            self.assertNotIn("nextlevel_b:", yaml_text)
+            self.assertIn(f"nextlevel-a:\n  base_path: {Path(tmp) / 'nextlevel-a'}", yaml_text)
+            self.assertIn(f"nextlevel-c:\n  base_path: {Path(tmp) / 'nextlevel-c'}", yaml_text)
+            self.assertNotIn("nextlevel-b:", yaml_text)
             # ...e a mesma categoria sob bases diferentes (merge nativo do ComfyUI)
             self.assertEqual(yaml_text.count("  diffusion_models: diffusion_models\n"), 3)
             self.assertEqual(yaml_text.count("  base_path: "), 3)
@@ -3042,9 +3042,9 @@ class TestW_MultiDatasetRoots(unittest.TestCase):
     def test_custom_models_mescla_e_ausente_nao_quebra(self):
         """custom_models.json em 2 dos 3 (o terceiro nem anexado): mescla sem erro."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._attach(tmp, ("nextlevel_a", "nextlevel_c"))
-            self._write_custom_models(Path(tmp) / "nextlevel_a", '{"seedvr2": "SEEDVR2"}')
-            self._write_custom_models(Path(tmp) / "nextlevel_c", '{"llm": "LLM"}')
+            self._attach(tmp, ("nextlevel-a", "nextlevel-c"))
+            self._write_custom_models(Path(tmp) / "nextlevel-a", '{"seedvr2": "SEEDVR2"}')
+            self._write_custom_models(Path(tmp) / "nextlevel-c", '{"llm": "LLM"}')
             roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
             merged = comfyui_setup.collect_custom_model_types(roots)
             self.assertEqual(merged, {"seedvr2": "SEEDVR2", "llm": "LLM"})
@@ -3056,9 +3056,9 @@ class TestW_MultiDatasetRoots(unittest.TestCase):
 
     def test_colisao_de_chave_ultima_vence(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._attach(tmp, ("nextlevel_a", "nextlevel_c"))
-            self._write_custom_models(Path(tmp) / "nextlevel_a", '{"seedvr2": "SEEDVR2_A"}')
-            self._write_custom_models(Path(tmp) / "nextlevel_c", '{"seedvr2": "SEEDVR2_C"}')
+            self._attach(tmp, ("nextlevel-a", "nextlevel-c"))
+            self._write_custom_models(Path(tmp) / "nextlevel-a", '{"seedvr2": "SEEDVR2_A"}')
+            self._write_custom_models(Path(tmp) / "nextlevel-c", '{"seedvr2": "SEEDVR2_C"}')
             roots = comfyui_setup.select_attached_dataset_roots(self._candidates(tmp))
             merged = comfyui_setup.collect_custom_model_types(roots)
             self.assertEqual(merged, {"seedvr2": "SEEDVR2_C"})
